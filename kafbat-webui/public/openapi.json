@@ -1,0 +1,5383 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Hyper CDC Orchestrator API",
+    "version": "0.2.0",
+    "license": {
+      "name": "Proprietary"
+    },
+    "description": "Unified CDC control-plane API for Debezium engine lifecycle, Kafka Connect,\ngoverned pipelines (replica, stream, and lakehouse landing), logs, notifications,\nand metrics. Canonical prefix: `/cdc/*`.\nSee docs/architecture/hyper-cdc-orchestrator-design.html (Ch.12) for the datalake contract.\n"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:9788",
+      "description": "Direct orchestrator API"
+    }
+  ],
+  "tags": [
+    {
+      "name": "System",
+      "description": "Health and runtime capability discovery."
+    },
+    {
+      "name": "Engine",
+      "description": "Managed Docker engine lifecycle and status."
+    },
+    {
+      "name": "Connectors",
+      "description": "Kafka Connect CRUD, validation, actions, tasks, and history."
+    },
+    {
+      "name": "Kafka",
+      "description": "Topic, broker, consumer-group, schema, ACL, ksqlDB, and lag observability."
+    },
+    {
+      "name": "Profiles",
+      "description": "Persisted CDC profiles and reconciliation workflows."
+    },
+    {
+      "name": "Processing",
+      "description": "Kafka-native transform, filter, and enrichment pipeline definitions."
+    },
+    {
+      "name": "Logs",
+      "description": "Runtime logs, streams, and Connect logger levels."
+    },
+    {
+      "name": "Notifications",
+      "description": "Alert rules, history, WebSocket events, and webhooks."
+    },
+    {
+      "name": "Observability",
+      "description": "Prometheus metrics and operational signals."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness endpoint",
+        "operationId": "health",
+        "tags": [
+          "System"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/capability": {
+      "get": {
+        "summary": "Feature capability flags for UI/MCP",
+        "operationId": "capability",
+        "tags": [
+          "System"
+        ],
+        "responses": {
+          "200": {
+            "description": "Capability document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/cdc/engine/status": {
+      "get": {
+        "summary": "List container engine service states",
+        "operationId": "engineStatus",
+        "tags": [
+          "Engine"
+        ],
+        "responses": {
+          "200": {
+            "description": "Engine status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EngineStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/engine/up": {
+      "post": {
+        "summary": "Start managed containers",
+        "operationId": "engineUp",
+        "tags": [
+          "Engine"
+        ],
+        "responses": {
+          "200": {
+            "description": "Engine action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/engine/down": {
+      "post": {
+        "summary": "Stop managed containers",
+        "operationId": "engineDown",
+        "tags": [
+          "Engine"
+        ],
+        "responses": {
+          "200": {
+            "description": "Engine action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/engine/restart": {
+      "post": {
+        "summary": "Restart managed containers",
+        "operationId": "engineRestart",
+        "tags": [
+          "Engine"
+        ],
+        "responses": {
+          "200": {
+            "description": "Engine action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/cluster": {
+      "get": {
+        "summary": "Kafka Connect cluster root metadata",
+        "operationId": "clusterInfo",
+        "tags": [
+          "Connectors"
+        ],
+        "responses": {
+          "200": {
+            "description": "Connect cluster info"
+          }
+        }
+      }
+    },
+    "/cdc/connectors": {
+      "get": {
+        "summary": "List connectors (expanded status)",
+        "operationId": "listConnectors",
+        "tags": [
+          "Connectors"
+        ],
+        "responses": {
+          "200": {
+            "description": "Connectors map",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorsResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create connector",
+        "operationId": "createConnector",
+        "tags": [
+          "Connectors"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/templates": {
+      "get": {
+        "summary": "Built-in connector config templates for UI quick start",
+        "operationId": "connectorTemplates",
+        "tags": [
+          "Connectors"
+        ],
+        "responses": {
+          "200": {
+            "description": "Connector templates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorTemplatesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/validate": {
+      "post": {
+        "summary": "Validate connector config (local checks + Connect plugin validate best-effort)",
+        "operationId": "validateConnector",
+        "tags": [
+          "Connectors"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorValidateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Connector validation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorValidateResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/probe": {
+      "post": {
+        "summary": "Test database connectivity from a connector name or config",
+        "operationId": "probeConnector",
+        "tags": [
+          "Connectors"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Connectivity probe result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorProbeResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/catalog": {
+      "post": {
+        "summary": "Browse schemas and tables for a source or sink connector",
+        "operationId": "catalogConnector",
+        "tags": [
+          "Connectors"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Schema and table catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorCatalogResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}/status": {
+      "get": {
+        "summary": "Get connector status",
+        "operationId": "connectorStatus",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connector status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}/timeline": {
+      "get": {
+        "summary": "Recent connector state history from watcher transitions",
+        "operationId": "connectorTimeline",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connector timeline entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorTimelineResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}/config": {
+      "get": {
+        "summary": "Get connector config",
+        "operationId": "getConnectorConfig",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connector config",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorConfigResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replace connector config",
+        "operationId": "updateConnectorConfig",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}/tasks/{task}/restart": {
+      "post": {
+        "summary": "Restart a specific connector task",
+        "operationId": "restartConnectorTask",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}/{action}": {
+      "post": {
+        "summary": "pause | resume | restart connector",
+        "operationId": "connectorAction",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pause",
+                "resume",
+                "restart"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/connectors/{name}": {
+      "delete": {
+        "summary": "Delete connector",
+        "operationId": "deleteConnector",
+        "tags": [
+          "Connectors"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/kafka/topics": {
+      "get": {
+        "summary": "List Redpanda/Kafka topics",
+        "operationId": "kafkaTopics",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "Topics"
+          }
+        }
+      }
+    },
+    "/cdc/topics": {
+      "get": {
+        "summary": "List topics with pagination, search, sort, and Kafka metadata",
+        "operationId": "listTopics",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "hide_internal",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "name",
+                "partitions",
+                "out_of_sync_replicas",
+                "replication_factor",
+                "messages_count",
+                "size"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "asc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paged topic list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagedTopicsResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a Kafka topic",
+        "operationId": "createTopic",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTopicRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Topic created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}": {
+      "delete": {
+        "summary": "Delete a Kafka topic",
+        "operationId": "deleteTopic",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Topic deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/recreate": {
+      "post": {
+        "summary": "Recreate a Kafka topic with the same partitions, replication, and core configs",
+        "operationId": "recreateTopic",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Topic recreated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/clear-messages": {
+      "post": {
+        "summary": "Clear all messages from a topic (DELETE cleanup policy only)",
+        "operationId": "clearTopicMessages",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Messages cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/messages": {
+      "get": {
+        "summary": "Sample messages from a topic (bounded)",
+        "operationId": "topicMessages",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "string",
+              "default": "end"
+            }
+          },
+          {
+            "in": "query",
+            "name": "partition",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_meta",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "latest",
+                "earliest"
+              ],
+              "default": "latest"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter sampled messages by key or payload substring"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Topic message sample",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicMessagesResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Produce a message to a topic",
+        "operationId": "produceTopicMessage",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  },
+                  "key": {
+                    "type": "string"
+                  },
+                  "partition": {
+                    "type": "integer"
+                  },
+                  "headers": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "name",
+                        "value"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/copy": {
+      "post": {
+        "summary": "Copy topic configuration to a new topic",
+        "operationId": "copyTopic",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/configs": {
+      "put": {
+        "summary": "Alter topic configs",
+        "operationId": "updateTopicConfigs",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "configs"
+                ],
+                "properties": {
+                  "configs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/topics/{topic}/metadata": {
+      "get": {
+        "summary": "Topic metadata, partition summary, and configs",
+        "operationId": "topicMetadata",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Topic metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicMetadataResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/kafka/groups": {
+      "get": {
+        "summary": "List consumer groups",
+        "operationId": "kafkaGroups",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "Groups"
+          }
+        }
+      }
+    },
+    "/cdc/consumer-groups": {
+      "get": {
+        "summary": "List consumer groups with pagination and optional search",
+        "operationId": "listConsumerGroups",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paged consumer groups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagedGroupsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/kafka/groups/{group}/lag": {
+      "get": {
+        "summary": "Describe consumer group lag",
+        "operationId": "consumerGroupLag",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lag details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupLagResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/consumer-groups/{group}": {
+      "get": {
+        "summary": "Describe a consumer group (state, members, per-partition lag)",
+        "operationId": "getConsumerGroup",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Consumer group details"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a consumer group",
+        "operationId": "deleteConsumerGroup",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/consumer-groups/{group}/reset": {
+      "post": {
+        "summary": "Reset consumer group offsets (earliest, latest, or timestamp)",
+        "operationId": "resetConsumerGroup",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reset_type"
+                ],
+                "properties": {
+                  "reset_type": {
+                    "type": "string",
+                    "enum": [
+                      "earliest",
+                      "latest",
+                      "timestamp"
+                    ]
+                  },
+                  "topic": {
+                    "type": "string"
+                  },
+                  "partitions": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  },
+                  "timestamp_ms": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/brokers": {
+      "get": {
+        "summary": "List Kafka/Redpanda brokers",
+        "operationId": "listBrokers",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "Brokers"
+          }
+        }
+      }
+    },
+    "/cdc/brokers/{id}": {
+      "get": {
+        "summary": "Broker detail with disk usage, log directories, and cluster configs",
+        "operationId": "getBroker",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Broker detail"
+          }
+        }
+      }
+    },
+    "/cdc/brokers/{id}/logdirs": {
+      "get": {
+        "summary": "Broker log directories (name, error, topics, partitions)",
+        "operationId": "getBrokerLogdirs",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Log directories"
+          }
+        }
+      }
+    },
+    "/cdc/brokers/{id}/configs": {
+      "get": {
+        "summary": "Broker / cluster configuration entries",
+        "description": "Returns Redpanda cluster/node config with Kafka-style aliases.\n`name` is the Redpanda key (underscores) used by PUT.\n`display_name` is the Kafka dotted name shown in Kafbat (for example\n`auto_create_topics_enabled` → `auto.create.topics.enable`).\nSearch and PUT accept either form.\n",
+        "operationId": "getBrokerConfigs",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Config list"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update a cluster configuration property",
+        "description": "Sets a Redpanda cluster config key. `name` may be the Redpanda underscore\nkey (`auto_create_topics_enabled`) or the Kafka dotted alias\n(`auto.create.topics.enable`).\n",
+        "operationId": "updateBrokerConfig",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  },
+                  "configs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Config updated"
+          }
+        }
+      }
+    },
+    "/cdc/brokers/{id}/metrics": {
+      "get": {
+        "summary": "Broker metrics from Redpanda public_metrics",
+        "operationId": "getBrokerMetrics",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Broker metrics"
+          }
+        }
+      }
+    },
+    "/cdc/acls": {
+      "get": {
+        "summary": "List Kafka ACLs",
+        "operationId": "listAcls",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ACL list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a Kafka ACL",
+        "operationId": "createAcl",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AclUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a Kafka ACL",
+        "operationId": "deleteAcl",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AclUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/schemas": {
+      "get": {
+        "summary": "List Schema Registry subjects",
+        "operationId": "listSchemas",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "Schema subjects"
+          }
+        }
+      },
+      "post": {
+        "summary": "Publish a schema (Avro, JSON Schema, or Protobuf)",
+        "operationId": "createSchema",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SchemaCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/schemas/{subject}": {
+      "get": {
+        "summary": "Get a schema subject version",
+        "operationId": "getSchema",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string",
+              "default": "latest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schema detail"
+          }
+        }
+      },
+      "put": {
+        "summary": "Add a new schema version",
+        "operationId": "updateSchema",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a schema subject",
+        "operationId": "deleteSchema",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Action response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/tables": {
+      "get": {
+        "summary": "List ksqlDB tables",
+        "operationId": "ksqlTables",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "ksqlDB tables"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/streams": {
+      "get": {
+        "summary": "List ksqlDB streams",
+        "operationId": "ksqlStreams",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "ksqlDB streams"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/queries": {
+      "get": {
+        "summary": "List ksqlDB persistent queries",
+        "operationId": "ksqlQueries",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "ksqlDB queries"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/info": {
+      "get": {
+        "summary": "ksqlDB server info",
+        "operationId": "ksqlInfo",
+        "tags": [
+          "Kafka"
+        ],
+        "responses": {
+          "200": {
+            "description": "ksqlDB /info payload"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/query": {
+      "post": {
+        "summary": "Execute a ksqlDB statement or query",
+        "operationId": "ksqlQuery",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ksql"
+                ],
+                "properties": {
+                  "ksql": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ksqlDB result"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/terminate": {
+      "post": {
+        "summary": "Terminate a persistent ksqlDB query",
+        "operationId": "ksqlTerminate",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "query_id"
+                ],
+                "properties": {
+                  "query_id": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "terminated"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/drop": {
+      "post": {
+        "summary": "Drop a ksqlDB stream or table",
+        "operationId": "ksqlDrop",
+        "tags": [
+          "Kafka"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "entity_type",
+                  "name"
+                ],
+                "properties": {
+                  "entity_type": {
+                    "type": "string",
+                    "enum": [
+                      "STREAM",
+                      "TABLE"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "delete_topic": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "dropped"
+          }
+        }
+      }
+    },
+    "/cdc/ksqldb/explain/{query_id}": {
+      "get": {
+        "summary": "Explain a persistent ksqlDB query",
+        "operationId": "ksqlExplain",
+        "tags": [
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "query_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "EXPLAIN result"
+          }
+        }
+      }
+    },
+    "/cdc/profiles": {
+      "get": {
+        "summary": "List CDC profiles",
+        "operationId": "listProfiles",
+        "tags": [
+          "Profiles"
+        ],
+        "responses": {
+          "200": {
+            "description": "Profiles",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfilesResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create CDC profile",
+        "operationId": "createProfile",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/cases": {
+      "post": {
+        "summary": "Create profile from case template",
+        "operationId": "createProfileFromCase",
+        "tags": [
+          "Profiles"
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile"
+          }
+        }
+      }
+    },
+    "/cdc/profiles/validate/source": {
+      "post": {
+        "summary": "Validate source connection",
+        "operationId": "validateProfileSource",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/source": {
+      "post": {
+        "summary": "Browse live schemas and tables from a source connection",
+        "operationId": "browseProfileSourceCatalog",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Live source catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceCatalogResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/source/table": {
+      "post": {
+        "summary": "Inspect source table structure, keys, and sample rows",
+        "operationId": "inspectProfileSourceTable",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceTableInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Table structure and preview rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceTableInspectResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/source/triggers/preview": {
+      "post": {
+        "summary": "Preview changelog CREATE TRIGGER SQL without installing",
+        "operationId": "previewProfileSourceTriggers",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerInstallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Trigger SQL preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerPreviewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/source/triggers": {
+      "post": {
+        "summary": "Create changelog triggers on selected source tables",
+        "operationId": "installProfileSourceTriggers",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerInstallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Trigger install result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerInstallResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/source/triggers/status": {
+      "post": {
+        "summary": "List changelog triggers on a PostgreSQL source",
+        "operationId": "sourceTriggerStatus",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerInstallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Trigger status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/target": {
+      "post": {
+        "summary": "Browse live schemas and tables from a target connection",
+        "operationId": "browseProfileTargetCatalog",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Live target catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceCatalogResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/catalog/target/table": {
+      "post": {
+        "summary": "Inspect target table structure, keys, and sample rows",
+        "operationId": "inspectProfileTargetTable",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetTableInspectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Table structure and preview rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceTableInspectResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/validate/target": {
+      "post": {
+        "summary": "Validate target connection",
+        "operationId": "validateProfileTarget",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/validate/lake": {
+      "post": {
+        "summary": "Validate a lakehouse destination (object storage + catalog)",
+        "operationId": "validateProfileLake",
+        "tags": [
+          "Profiles"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LakeDestination"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/{id}": {
+      "get": {
+        "summary": "Get profile",
+        "operationId": "getProfile",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update profile",
+        "operationId": "updateProfile",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete profile",
+        "operationId": "deleteProfile",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Profile deleted"
+          },
+          "404": {
+            "description": "Profile not found"
+          }
+        }
+      }
+    },
+    "/cdc/profiles/{id}/dlq": {
+      "get": {
+        "summary": "Get the managed sink DLQ topic and current message count",
+        "operationId": "getProfileDlqStatus",
+        "tags": [
+          "Profiles",
+          "Kafka"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile DLQ status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDlqStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found"
+          }
+        }
+      }
+    },
+    "/cdc/profiles/{id}/enable": {
+      "post": {
+        "summary": "Enable/disable profile (enable reconciles Connect)",
+        "operationId": "setProfileEnabled",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/profiles/{id}/actions/{action}": {
+      "post": {
+        "summary": "start | pause | resume | restart | stop (reconciles Kafka Connect)",
+        "operationId": "profileAction",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "start",
+                "pause",
+                "resume",
+                "restart",
+                "stop"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/processing-pipelines": {
+      "get": {
+        "summary": "List Kafka-native processing pipelines",
+        "operationId": "listProcessingPipelines",
+        "tags": [
+          "Processing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Processing pipelines",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProcessingPipeline"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Register a processing pipeline",
+        "operationId": "createProcessingPipeline",
+        "tags": [
+          "Processing"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingPipeline"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Registered pipeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingPipeline"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/cdc/processing-pipelines/validate": {
+      "post": {
+        "summary": "Validate a processing pipeline without saving it",
+        "operationId": "validateProcessingPipeline",
+        "tags": [
+          "Processing"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingPipeline"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingValidationResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/processing-pipelines/{id}": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get a processing pipeline",
+        "operationId": "getProcessingPipeline",
+        "tags": [
+          "Processing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Processing pipeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingPipeline"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update a processing pipeline",
+        "operationId": "updateProcessingPipeline",
+        "tags": [
+          "Processing"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessingPipeline"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated pipeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingPipeline"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a processing pipeline",
+        "operationId": "deleteProcessingPipeline",
+        "tags": [
+          "Processing"
+        ],
+        "responses": {
+          "204": {
+            "description": "Pipeline deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/cdc/logs": {
+      "get": {
+        "summary": "List logical log services → containers",
+        "operationId": "listLogServices",
+        "tags": [
+          "Logs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Service map"
+          }
+        }
+      }
+    },
+    "/cdc/logs/loggers": {
+      "get": {
+        "summary": "List Kafka Connect runtime loggers",
+        "operationId": "getLoggers",
+        "tags": [
+          "Logs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Logger levels"
+          }
+        }
+      }
+    },
+    "/cdc/logs/loggers/{logger}": {
+      "put": {
+        "summary": "Update a Kafka Connect runtime logger level",
+        "operationId": "putLogger",
+        "tags": [
+          "Logs"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "logger",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "level"
+                ],
+                "properties": {
+                  "level": {
+                    "type": "string",
+                    "example": "DEBUG"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated logger result"
+          }
+        }
+      }
+    },
+    "/cdc/logs/{service}": {
+      "get": {
+        "summary": "Snapshot container logs",
+        "operationId": "snapshotLogs",
+        "tags": [
+          "Logs"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tail",
+            "schema": {
+              "type": "integer",
+              "default": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Log lines"
+          }
+        }
+      }
+    },
+    "/cdc/logs/{service}/stream": {
+      "get": {
+        "summary": "SSE stream of container logs",
+        "operationId": "streamLogs",
+        "tags": [
+          "Logs"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "text/event-stream"
+          }
+        }
+      }
+    },
+    "/cdc/notifications/rules": {
+      "get": {
+        "summary": "List alert rules (DataService keystore)",
+        "operationId": "listNotificationRules",
+        "tags": [
+          "Notifications"
+        ],
+        "responses": {
+          "200": {
+            "description": "Rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AlertRule"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create alert rule",
+        "operationId": "createNotificationRule",
+        "tags": [
+          "Notifications"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertRule"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/cdc/notifications/rules/{id}": {
+      "get": {
+        "summary": "Get alert rule",
+        "operationId": "getNotificationRule",
+        "tags": [
+          "Notifications"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlertRule"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Upsert alert rule",
+        "operationId": "updateNotificationRule",
+        "tags": [
+          "Notifications"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertRule"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete alert rule",
+        "operationId": "deleteNotificationRule",
+        "tags": [
+          "Notifications"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/cdc/notifications/history": {
+      "get": {
+        "summary": "Recent in-memory alert history",
+        "operationId": "notificationHistory",
+        "tags": [
+          "Notifications"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "default": 500
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "History entries"
+          }
+        }
+      }
+    },
+    "/cdc/ws/alerts": {
+      "get": {
+        "summary": "WebSocket live alerts",
+        "operationId": "alertWebSocket",
+        "tags": [
+          "Notifications"
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching Protocols"
+          }
+        }
+      }
+    },
+    "/cdc/metrics": {
+      "get": {
+        "summary": "Prometheus metrics",
+        "operationId": "metrics",
+        "tags": [
+          "Observability"
+        ],
+        "responses": {
+          "200": {
+            "description": "text/plain Prometheus exposition"
+          }
+        }
+      }
+    },
+    "/engine/status": {
+      "get": {
+        "summary": "Legacy alias of /cdc/engine/status",
+        "responses": {
+          "200": {
+            "description": "Engine status"
+          }
+        }
+      }
+    },
+    "/connect/connectors": {
+      "get": {
+        "summary": "Legacy alias of /cdc/connectors",
+        "responses": {
+          "200": {
+            "description": "Connectors"
+          }
+        }
+      }
+    },
+    "/profiles": {
+      "get": {
+        "summary": "Legacy alias of /cdc/profiles",
+        "responses": {
+          "200": {
+            "description": "Profiles"
+          }
+        }
+      }
+    },
+    "/kafka/topics": {
+      "get": {
+        "summary": "Legacy alias of /cdc/kafka/topics",
+        "responses": {
+          "200": {
+            "description": "Topics"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "Invalid request or processing configuration",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Requested resource was not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "service",
+          "status",
+          "enabled",
+          "timestamp"
+        ],
+        "properties": {
+          "service": {
+            "type": "string",
+            "example": "hyper-cdc-orchestrator"
+          },
+          "status": {
+            "type": "string",
+            "example": "ok"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CapabilityResponse": {
+        "type": "object",
+        "required": [
+          "service",
+          "version",
+          "api_prefix",
+          "features",
+          "timestamp"
+        ],
+        "properties": {
+          "service": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.2.0"
+          },
+          "api_prefix": {
+            "type": "string",
+            "example": "/cdc"
+          },
+          "features": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ServiceStatus": {
+        "type": "object",
+        "required": [
+          "name",
+          "state"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "health": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "EngineStatusResponse": {
+        "type": "object",
+        "required": [
+          "engine_target",
+          "services",
+          "timestamp"
+        ],
+        "properties": {
+          "engine_target": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceStatus"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ActionResponse": {
+        "type": "object",
+        "required": [
+          "action",
+          "status",
+          "message",
+          "audit_id",
+          "timestamp"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "example": "connect.restart"
+          },
+          "status": {
+            "type": "string",
+            "example": "success"
+          },
+          "message": {
+            "type": "string"
+          },
+          "audit_id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorCreateRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "config"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConnectorUpdateRequest": {
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConnectorValidateRequest": {
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConnectorValidationIssue": {
+        "type": "object",
+        "required": [
+          "field",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ConnectorValidateResponse": {
+        "type": "object",
+        "required": [
+          "valid",
+          "errors",
+          "warnings",
+          "timestamp"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "normalized_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorValidationIssue"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "upstream": {
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorsResponse": {
+        "type": "object",
+        "required": [
+          "connectors",
+          "timestamp"
+        ],
+        "properties": {
+          "connectors": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorStatusResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "status",
+          "timestamp"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorTemplate": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "kind",
+          "database_type",
+          "config"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "source",
+              "sink"
+            ]
+          },
+          "database_type": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConnectorInspectRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "schema": {
+            "type": "string",
+            "nullable": true,
+            "description": "Optional schema filter for catalog"
+          }
+        }
+      },
+      "ConnectorConnectionPublic": {
+        "type": "object",
+        "required": [
+          "host",
+          "port",
+          "database",
+          "username"
+        ],
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "jdbc_url": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ConnectorProbeResponse": {
+        "type": "object",
+        "required": [
+          "valid",
+          "reachable",
+          "kind",
+          "database_type",
+          "database_label",
+          "class_name",
+          "connection",
+          "configured_schemas",
+          "configured_tables",
+          "message",
+          "timestamp"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "reachable": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "source",
+              "sink"
+            ]
+          },
+          "database_type": {
+            "type": "string"
+          },
+          "database_label": {
+            "type": "string"
+          },
+          "class_name": {
+            "type": "string"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/ConnectorConnectionPublic"
+          },
+          "configured_schemas": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "configured_tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorCatalogSchema": {
+        "type": "object",
+        "required": [
+          "name",
+          "table_count",
+          "captured"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "table_count": {
+            "type": "integer"
+          },
+          "captured": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ConnectorCatalogTable": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name",
+          "captured"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "captured": {
+            "type": "boolean"
+          },
+          "row_count": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Total rows in the table when the live catalog can count them."
+          },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Primary key columns in ordinal order. Empty when the table has no primary key."
+          }
+        }
+      },
+      "ConnectorCatalogResponse": {
+        "type": "object",
+        "required": [
+          "kind",
+          "database_type",
+          "database_label",
+          "class_name",
+          "connection",
+          "reachable",
+          "live",
+          "message",
+          "configured_schemas",
+          "configured_tables",
+          "schemas",
+          "tables",
+          "timestamp"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "source",
+              "sink"
+            ]
+          },
+          "database_type": {
+            "type": "string"
+          },
+          "database_label": {
+            "type": "string"
+          },
+          "class_name": {
+            "type": "string"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/ConnectorConnectionPublic"
+          },
+          "reachable": {
+            "type": "boolean"
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "configured_schemas": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "configured_tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "schemas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorCatalogSchema"
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorCatalogTable"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorConfigResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "config",
+          "timestamp"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConnectorTemplatesResponse": {
+        "type": "object",
+        "required": [
+          "templates",
+          "timestamp"
+        ],
+        "properties": {
+          "templates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorTemplate"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TaskErrorBrief": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "trace"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "trace": {
+            "type": "string"
+          }
+        }
+      },
+      "ConnectorTimelineEntry": {
+        "type": "object",
+        "required": [
+          "ts",
+          "connector",
+          "to",
+          "task_errors"
+        ],
+        "properties": {
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "connector": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string",
+            "nullable": true
+          },
+          "to": {
+            "type": "string"
+          },
+          "rule": {
+            "type": "string",
+            "nullable": true
+          },
+          "task_errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskErrorBrief"
+            }
+          },
+          "resolved": {
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "ConnectorTimelineResponse": {
+        "type": "object",
+        "required": [
+          "connector",
+          "total",
+          "items",
+          "timestamp"
+        ],
+        "properties": {
+          "connector": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorTimelineEntry"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TopicItem": {
+        "type": "object",
+        "required": [
+          "name",
+          "internal",
+          "partition_count",
+          "replication_factor",
+          "out_of_sync_replicas"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "internal": {
+            "type": "boolean"
+          },
+          "partition_count": {
+            "type": "integer"
+          },
+          "replication_factor": {
+            "type": "integer"
+          },
+          "out_of_sync_replicas": {
+            "type": "integer"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "segment_size": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "cleanup_policy": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreateTopicRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "integer",
+            "default": 1
+          },
+          "replication_factor": {
+            "type": "integer",
+            "default": 1
+          },
+          "cleanup_policy": {
+            "type": "string",
+            "enum": [
+              "delete",
+              "compact",
+              "compact,delete"
+            ]
+          },
+          "min_insync_replicas": {
+            "type": "integer"
+          },
+          "retention_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retention_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_message_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "custom_params": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "value"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PagedTopicsResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "timestamp"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopicItem"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TopicMessageItem": {
+        "type": "object",
+        "required": [
+          "payload"
+        ],
+        "properties": {
+          "partition": {
+            "type": "integer",
+            "nullable": true
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "nullable": true
+          },
+          "key": {
+            "type": "string",
+            "nullable": true
+          },
+          "payload": {
+            "type": "string"
+          }
+        }
+      },
+      "TopicMessagesResponse": {
+        "type": "object",
+        "required": [
+          "topic",
+          "items",
+          "total",
+          "limit",
+          "offset",
+          "mode",
+          "timestamp"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopicMessageItem"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "offset": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "latest",
+              "earliest"
+            ]
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TopicPartitionMetadata": {
+        "type": "object",
+        "required": [
+          "partition",
+          "replicas"
+        ],
+        "properties": {
+          "partition": {
+            "type": "integer"
+          },
+          "leader": {
+            "type": "integer",
+            "nullable": true
+          },
+          "replicas": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "high_watermark": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          }
+        }
+      },
+      "TopicMetadataResponse": {
+        "type": "object",
+        "required": [
+          "topic",
+          "partition_count",
+          "partitions",
+          "configs",
+          "raw",
+          "timestamp"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "partition_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopicPartitionMetadata"
+            }
+          },
+          "configs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "raw": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ConsumerGroupItem": {
+        "type": "object",
+        "required": [
+          "group"
+        ],
+        "properties": {
+          "group": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "nullable": true
+          },
+          "members": {
+            "type": "integer",
+            "nullable": true
+          },
+          "coordinator": {
+            "type": "string",
+            "nullable": true
+          },
+          "total_lag": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          }
+        }
+      },
+      "AclUpsertRequest": {
+        "type": "object",
+        "required": [
+          "principal",
+          "resource_type",
+          "resource_name",
+          "operation",
+          "permission"
+        ],
+        "properties": {
+          "principal": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string",
+            "default": "*"
+          },
+          "resource_type": {
+            "type": "string",
+            "enum": [
+              "topic",
+              "group",
+              "cluster",
+              "transactional_id"
+            ]
+          },
+          "resource_name": {
+            "type": "string"
+          },
+          "pattern_type": {
+            "type": "string",
+            "enum": [
+              "literal",
+              "prefixed"
+            ],
+            "default": "literal"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny"
+            ]
+          }
+        }
+      },
+      "SchemaCreateRequest": {
+        "type": "object",
+        "required": [
+          "subject",
+          "schema"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "schema_type": {
+            "type": "string",
+            "enum": [
+              "avro",
+              "json",
+              "protobuf"
+            ],
+            "default": "avro"
+          },
+          "compatibility": {
+            "type": "string"
+          }
+        }
+      },
+      "PagedGroupsResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "timestamp"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerGroupItem"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "GroupLagItem": {
+        "type": "object",
+        "required": [
+          "topic",
+          "partition",
+          "current_offset",
+          "log_end_offset",
+          "lag"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "partition": {
+            "type": "integer"
+          },
+          "current_offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "log_end_offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "GroupLagResponse": {
+        "type": "object",
+        "required": [
+          "group",
+          "total_lag",
+          "entries",
+          "timestamp"
+        ],
+        "properties": {
+          "group": {
+            "type": "string"
+          },
+          "total_lag": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GroupLagItem"
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SourceConfig": {
+        "type": "object",
+        "required": [
+          "source_type",
+          "connection",
+          "schema_mode",
+          "schemas",
+          "tables"
+        ],
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "enum": [
+              "postgres",
+              "mysql",
+              "mariadb",
+              "sqlserver",
+              "oracle"
+            ]
+          },
+          "connection": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "schema_mode": {
+            "type": "string",
+            "enum": [
+              "all_schemas",
+              "specific_schemas"
+            ]
+          },
+          "table_mode": {
+            "type": "string",
+            "enum": [
+              "all_tables",
+              "specific_tables"
+            ],
+            "default": "all_tables"
+          },
+          "schemas": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "capture_mode": {
+            "type": "string",
+            "enum": [
+              "logical",
+              "trigger",
+              "sync_once",
+              "incremental"
+            ],
+            "default": "logical",
+            "description": "logical = ongoing WAL CDC; trigger = table triggers when WAL is unavailable; sync_once = copy current rows once then stop; incremental = JDBC poll on a timestamp/id watermark (no WAL, no triggers; hard deletes are not captured)"
+          },
+          "changelog_retention_hours": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Trigger capture only. Prune source changelog rows older than this many hours. Omit or 0 disables pruning. Choose a window larger than expected replication lag so unconsumed rows are not dropped."
+          },
+          "timestamp_column": {
+            "type": "string",
+            "description": "Incremental capture. Timestamp/watermark column such as updated_at. Combined with incrementing_column this uses JDBC timestamp+incrementing mode."
+          },
+          "incrementing_column": {
+            "type": "string",
+            "description": "Incremental capture. Strictly incrementing column, usually the primary key (e.g. id). Required for replica upsert. Append-only tables can use this without a timestamp column."
+          }
+        }
+      },
+      "TargetConfig": {
+        "type": "object",
+        "required": [
+          "target_type",
+          "connection"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "User-defined name for this destination"
+          },
+          "target_type": {
+            "type": "string",
+            "enum": [
+              "postgres",
+              "mysql",
+              "mariadb",
+              "sqlserver",
+              "oracle"
+            ]
+          },
+          "connection": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "LakeDestination": {
+        "type": "object",
+        "required": [
+          "table_format",
+          "zone",
+          "change_mode",
+          "catalog_type",
+          "connection"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "table_format": {
+            "type": "string",
+            "enum": [
+              "iceberg",
+              "parquet",
+              "delta"
+            ],
+            "default": "iceberg"
+          },
+          "zone": {
+            "type": "string",
+            "enum": [
+              "bronze",
+              "silver",
+              "gold"
+            ],
+            "default": "bronze",
+            "description": "CDC lands bronze or silver. Gold is derived, not captured."
+          },
+          "change_mode": {
+            "type": "string",
+            "enum": [
+              "changelog",
+              "upsert",
+              "scd2"
+            ],
+            "default": "changelog"
+          },
+          "catalog_type": {
+            "type": "string",
+            "enum": [
+              "jdbc",
+              "rest",
+              "hadoop",
+              "glue",
+              "nessie"
+            ],
+            "default": "jdbc"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "warehouse": {
+            "type": "string",
+            "description": "Warehouse URI such as s3://lake/warehouse"
+          },
+          "connection": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "S3-compatible endpoint, bucket, keys, and catalog_uri"
+          }
+        }
+      },
+      "GovernanceConfig": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Industry-agnostic bounded context (commerce, clinical, grid)"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "sensitivity": {
+            "type": "string",
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "default": "internal"
+          },
+          "industry_pack": {
+            "type": "string",
+            "nullable": true,
+            "description": "Optional overlay (retail, banking, healthcare, …)"
+          },
+          "pii_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ColumnMapping": {
+        "type": "object",
+        "required": [
+          "source",
+          "target"
+        ],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "data_type": {
+            "type": "string",
+            "description": "Shared SQL type; source and target column types must match"
+          }
+        }
+      },
+      "TableMapping": {
+        "type": "object",
+        "required": [
+          "source_schema",
+          "source_table",
+          "target_schema",
+          "target_table"
+        ],
+        "properties": {
+          "source_schema": {
+            "type": "string"
+          },
+          "source_table": {
+            "type": "string"
+          },
+          "target_schema": {
+            "type": "string"
+          },
+          "target_table": {
+            "type": "string"
+          },
+          "identical": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, source and target table/column names match and no remap is applied"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnMapping"
+            }
+          }
+        }
+      },
+      "ProfileUpsertRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "source",
+          "flow"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string",
+            "enum": [
+              "source_to_stream",
+              "source_to_target",
+              "source_to_lake",
+              "source_to_olake"
+            ],
+            "description": "source_to_target is database replica (current product). source_to_stream is Event-first (Kafka topics). source_to_lake is Event-first plus Iceberg from Kafka. source_to_olake is Analytics-first (OLake; draft only until Phase 3)."
+          },
+          "stream_platform": {
+            "type": "string",
+            "enum": [
+              "kafka",
+              "redpanda"
+            ],
+            "nullable": true
+          },
+          "transform_strategy": {
+            "type": "string",
+            "enum": [
+              "none",
+              "predefined",
+              "custom"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceConfig"
+          },
+          "target": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TargetConfig"
+              }
+            ],
+            "nullable": true
+          },
+          "lake": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LakeDestination"
+              }
+            ],
+            "nullable": true
+          },
+          "governance": {
+            "$ref": "#/components/schemas/GovernanceConfig"
+          },
+          "sink_error_policy": {
+            "type": "string",
+            "enum": [
+              "fail_fast",
+              "dlq"
+            ],
+            "default": "fail_fast",
+            "description": "Source-to-target sink record handling. fail_fast stops logical and incremental sinks on rejected records. dlq continues and writes rejected records with error-context headers. Trigger sinks retain their existing DLQ behavior for backward compatibility."
+          },
+          "flow": {
+            "type": "object",
+            "required": [
+              "transforms",
+              "schedule"
+            ],
+            "properties": {
+              "transforms": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "schedule": {
+                "type": "object",
+                "required": [
+                  "delivery_mode"
+                ],
+                "properties": {
+                  "delivery_mode": {
+                    "type": "string",
+                    "enum": [
+                      "realtime",
+                      "micro_batch"
+                    ]
+                  },
+                  "interval_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "nullable": true
+                  }
+                }
+              },
+              "mappings": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TableMapping"
+                }
+              }
+            }
+          }
+        }
+      },
+      "ProfileResponse": {
+        "type": "object",
+        "required": [
+          "profile",
+          "timestamp"
+        ],
+        "properties": {
+          "profile": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ProfilesResponse": {
+        "type": "object",
+        "required": [
+          "profiles",
+          "timestamp"
+        ],
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ProfileDlqStatus": {
+        "type": "object",
+        "required": [
+          "profile_id",
+          "configured_policy",
+          "effective_policy",
+          "enabled",
+          "exists",
+          "messages_count",
+          "high_watermark",
+          "timestamp"
+        ],
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "configured_policy": {
+            "type": "string",
+            "enum": [
+              "fail_fast",
+              "dlq"
+            ]
+          },
+          "effective_policy": {
+            "type": "string",
+            "enum": [
+              "fail_fast",
+              "dlq"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "topic": {
+            "type": "string",
+            "nullable": true
+          },
+          "exists": {
+            "type": "boolean"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "high_watermark": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ValidationResponse": {
+        "type": "object",
+        "required": [
+          "valid",
+          "message",
+          "timestamp"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SourceCatalogResponse": {
+        "type": "object",
+        "required": [
+          "reachable",
+          "message",
+          "schemas",
+          "tables",
+          "timestamp"
+        ],
+        "properties": {
+          "reachable": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "schemas": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "table_count",
+                "captured"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "table_count": {
+                  "type": "integer"
+                },
+                "captured": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "schema",
+                "name",
+                "captured"
+              ],
+              "properties": {
+                "schema": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "captured": {
+                  "type": "boolean"
+                },
+                "row_count": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "primary_key": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SourceTableInspectRequest": {
+        "type": "object",
+        "required": [
+          "source",
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SourceConfig"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      },
+      "TriggerInstallRequest": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SourceConfig"
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Qualified schema.table names. Defaults to source.tables."
+          }
+        }
+      },
+      "TriggerInstallResponse": {
+        "type": "object",
+        "required": [
+          "installed",
+          "already_present",
+          "change_log",
+          "message",
+          "timestamp"
+        ],
+        "properties": {
+          "installed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "already_present": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "change_log": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "executed": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TriggerPreviewResponse": {
+        "type": "object",
+        "required": [
+          "tables",
+          "change_log",
+          "sql",
+          "will_execute",
+          "vendor",
+          "message",
+          "timestamp"
+        ],
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "change_log": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "will_execute": {
+            "type": "boolean"
+          },
+          "vendor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TriggerStatusResponse": {
+        "type": "object",
+        "required": [
+          "change_log_present",
+          "tables",
+          "timestamp"
+        ],
+        "properties": {
+          "change_log_present": {
+            "type": "boolean"
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "schema",
+                "name",
+                "installed"
+              ],
+              "properties": {
+                "schema": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "installed": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TargetTableInspectRequest": {
+        "type": "object",
+        "required": [
+          "target",
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/TargetConfig"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      },
+      "SourceTableInspectResponse": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name",
+          "primary_key",
+          "columns",
+          "rows",
+          "limit",
+          "timestamp"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "row_count": {
+            "type": "integer",
+            "nullable": true
+          },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "data_type",
+                "nullable",
+                "position",
+                "primary_key",
+                "unique"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "data_type": {
+                  "type": "string"
+                },
+                "nullable": {
+                  "type": "boolean"
+                },
+                "position": {
+                  "type": "integer"
+                },
+                "primary_key": {
+                  "type": "boolean"
+                },
+                "pk_position": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "unique": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ProcessingValidationResponse": {
+        "type": "object",
+        "required": [
+          "valid",
+          "errors"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProcessingBatchPolicy": {
+        "type": "object",
+        "required": [
+          "max_records",
+          "max_bytes",
+          "max_wait_ms"
+        ],
+        "properties": {
+          "max_records": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "default": 500
+          },
+          "max_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 67108864,
+            "default": 4194304
+          },
+          "max_wait_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 25
+          }
+        }
+      },
+      "ProcessingRetryPolicy": {
+        "type": "object",
+        "required": [
+          "max_attempts",
+          "initial_backoff_ms",
+          "max_backoff_ms"
+        ],
+        "properties": {
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 3
+          },
+          "initial_backoff_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 100
+          },
+          "max_backoff_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 5000
+          }
+        }
+      },
+      "DataServiceEnrichment": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "datasource",
+          "mapper",
+          "api_key_env",
+          "lookup_field",
+          "lookup_parameter",
+          "result_key_field"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "datasource": {
+            "type": "string"
+          },
+          "mapper": {
+            "type": "string"
+          },
+          "api_key_env": {
+            "type": "string"
+          },
+          "lookup_field": {
+            "type": "string"
+          },
+          "lookup_parameter": {
+            "type": "string",
+            "default": "list"
+          },
+          "result_key_field": {
+            "type": "string"
+          },
+          "output_field": {
+            "type": "string",
+            "nullable": true
+          },
+          "static_parameters": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "ProcessingStage": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "execution",
+          "timeout_ms",
+          "retry",
+          "failure_policy",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "transform",
+              "filter",
+              "enrich"
+            ]
+          },
+          "execution": {
+            "type": "string",
+            "enum": [
+              "grpc"
+            ]
+          },
+          "endpoint": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "dataservice": {
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DataServiceEnrichment"
+              }
+            ],
+            "nullable": true
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 10000
+          },
+          "retry": {
+            "$ref": "#/components/schemas/ProcessingRetryPolicy"
+          },
+          "failure_policy": {
+            "type": "string",
+            "enum": [
+              "fail_pipeline",
+              "emit_unchanged",
+              "drop",
+              "dead_letter"
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProcessingPipeline": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "input_topic",
+          "output_topic",
+          "dead_letter_topic",
+          "consumer_group",
+          "batch",
+          "stages",
+          "preserve_partition_order",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input_topic": {
+            "type": "string",
+            "minLength": 1
+          },
+          "output_topic": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dead_letter_topic": {
+            "type": "string",
+            "minLength": 1
+          },
+          "consumer_group": {
+            "type": "string",
+            "minLength": 1
+          },
+          "batch": {
+            "$ref": "#/components/schemas/ProcessingBatchPolicy"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcessingStage"
+            }
+          },
+          "preserve_partition_order": {
+            "type": "boolean",
+            "default": true
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "AlertRule": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "conditionType",
+          "connectorFilter",
+          "channels",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "conditionType": {
+            "type": "string"
+          },
+          "conditionValue": {
+            "type": "object",
+            "additionalProperties": true,
+            "nullable": true
+          },
+          "connectorFilter": {
+            "type": "string"
+          },
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "webhookUrl": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "webhookSecret": {
+            "type": "string",
+            "nullable": true,
+            "writeOnly": true
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+**/target/
+*/mcp/target/
+*/kafka-connect-jdbc/target/
+.cargo-home/
+.DS_Store
+samples/*.sql.gz
+.scannerwork/
+**/node_modules/

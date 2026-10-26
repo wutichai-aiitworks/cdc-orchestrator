@@ -1,0 +1,76 @@
+---
+description: Efficient coding with minimal context and token usage
+alwaysApply: true
+---
+
+# Context Efficiency
+
+- Minimize context and token usage while maintaining correctness.
+- Inspect only files relevant to the current task.
+- Start with the explicitly mentioned or currently active files.
+- Expand context only when necessary to understand dependencies or fix the issue.
+- Do not scan the entire repository unless targeted investigation is insufficient.
+- Avoid generated files, dependencies, build artifacts, lock files, large logs,
+  and large data files unless they are directly relevant.
+
+# Code Changes
+
+- Make the smallest correct change necessary.
+- Follow existing architecture, conventions, and coding patterns.
+- Do not refactor unrelated code.
+- Do not create new files unless necessary.
+- Reuse existing functions, components, utilities, types, and abstractions.
+- Do not rewrite working code unnecessarily.
+
+# Investigation
+
+When debugging:
+
+1. Inspect the affected file first.
+2. Inspect direct dependencies when necessary.
+3. Identify the root cause before modifying code.
+4. Expand to related modules only when needed.
+5. Use repository-wide search only when targeted investigation is insufficient.
+6. Do not repeatedly inspect unchanged files.
+
+Preferred investigation order:
+
+specific file → direct dependency → related module → targeted search → repository-wide search
+
+# Commands
+
+- Run only commands relevant to the current task.
+- Prefer targeted tests, builds, linting, and type checks.
+- Do not run full-project builds or test suites when a targeted command is sufficient.
+- Avoid repeating commands unless code or relevant state has changed.
+
+# Responses
+
+- Keep explanations concise and actionable.
+- Do not repeat unchanged code.
+- Do not explain obvious implementation details.
+- Do not generate documentation unless requested.
+- Do not provide long summaries after changes.
+- Report only important changes, affected files, test results, and relevant warnings.
+
+# Token Efficiency
+
+- Prefer targeted searches over broad repository exploration.
+- Prefer editing existing files over generating unnecessary new files.
+- Do not load large files into context when a targeted search can locate the relevant section.
+- Do not re-read large files unnecessarily.
+- Preserve correctness over token savings.
+
+# Documentation Updates
+
+When updating documentation from code:
+
+- Inspect only files changed since the last documentation update.
+- Read existing documentation before generating new content.
+- Preserve the existing HTML structure and styling.
+- Modify only sections affected by code changes.
+- Do not regenerate the entire HTML document unless necessary.
+- Do not scan the entire repository.
+- Use git diff to identify relevant changes first.
+- Follow dependencies only when required to understand a changed API.
+- Keep generated documentation concise.

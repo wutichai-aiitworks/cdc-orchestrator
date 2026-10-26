@@ -1,0 +1,41 @@
+# Overlay for docker/docker-compose.yaml — relative paths resolve against docker/,
+# because Compose takes the project directory from the first -f file.
+#   cd docker && docker compose -f docker-compose.yaml \
+#     -f ../examples/docker-compose.faas.yml --profile processing up -d --build
+services:
+  cdc-function-sample:
+    image: ${CDC_SAMPLE_FUNCTION_IMAGE:-hyper-cdc-sample-function:local}
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile.sample-function
+    container_name: cdc-function-sample
+    profiles: ["processing"]
+    environment:
+      CDC_FUNCTION_ADDRESS: 0.0.0.0:50051
+      RUST_LOG: ${CDC_FUNCTION_LOG:-sample_function=info}
+    ports:
+      - "${CDC_FUNCTION_HOST_PORT:-25051}:50051"
+    networks: [server_zone]
+    restart: unless-stopped
+
+  cdc-processor-sample:
+    image: ${CDC_ORCHESTRATOR_IMAGE:-cdc-orchestrator:local}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: cdc-processor-sample
+    profiles: ["processing"]
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+      cdc-function-sample:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/cdc-processor"]
+    command: ["/config/customer-pipeline.json"]
+    environment:
+      CDC_BOOTSTRAP_SERVERS: cdc-message:9092
+      RUST_LOG: ${CDC_PROCESSOR_LOG:-cdc_processor=info,hyper_cdc_orchestrator=info}
+    volumes:
+      - ../examples/customer-pipeline-faas.docker.json:/config/customer-pipeline.json:ro
+    networks: [server_zone]
+    restart: unless-stopped

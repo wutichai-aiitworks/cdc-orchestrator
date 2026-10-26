@@ -1,0 +1,58 @@
+# Kafka demo consumer (stdout) plus Copy & Sync job logs → OpenObserve.
+# Set O2_USER / O2_PASSWORD in docker/.env to match openobserve-stack.
+
+[sources.cdc_kafka]
+type = "kafka"
+bootstrap_servers = "cdc-message:9092"
+group_id = "vector-cdc-consumer"
+topics = [".*"]
+auto_offset_reset = "earliest"
+decoding.codec = "json"
+
+[sinks.console]
+type = "console"
+inputs = ["cdc_kafka"]
+encoding.codec = "json"
+
+[sources.copy_job_logs]
+type = "file"
+include = [
+  "/var/lib/pgcopydb/jobs/*/clone.log",
+  "/var/lib/redisshake/jobs/*/sync.log",
+  "/var/lib/pgloader/jobs/*/load.log",
+  "/var/lib/mongocopy/jobs/*/copy.log",
+]
+read_from = "beginning"
+
+[transforms.copy_enrich]
+type = "remap"
+inputs = ["copy_job_logs"]
+source = '''
+file = to_string(.file) ?? ""
+.service = "cdc-copy"
+.tool = if contains(file, "pgcopydb") {
+  "pgcopy"
+} else if contains(file, "redisshake") {
+  "redisshake"
+} else if contains(file, "pgloader") {
+  "pgloader"
+} else if contains(file, "mongocopy") {
+  "mongocopy"
+} else {
+  "copy"
+}
+msg = to_string(.message) ?? ""
+.message = replace(msg, r'://[^/\s:]+:[^@/\s]+@', "://***:***@")
+'''
+
+[sinks.openobserve]
+type = "http"
+inputs = ["copy_enrich"]
+uri = "${O2_URL}/api/${O2_ORG}/${O2_STREAM}/_json"
+method = "post"
+auth.strategy = "basic"
+auth.user = "${O2_USER}"
+auth.password = "${O2_PASSWORD}"
+compression = "gzip"
+encoding.codec = "json"
+healthcheck.enabled = false

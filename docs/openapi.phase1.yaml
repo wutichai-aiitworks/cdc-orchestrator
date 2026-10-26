@@ -1,0 +1,16 @@
+openapi: 3.0.3
+info:
+  title: Hyper CDC Orchestrator API (legacy Phase 1 index)
+  version: 0.1.0
+  description: |
+    Superseded by docs/openapi.yaml (v0.2 unified /cdc API).
+    Legacy `/engine`, `/connect`, `/profiles`, `/kafka` paths remain available.
+servers:
+  - url: http://localhost:9788
+paths:
+  /health:
+    get:
+      summary: See docs/openapi.yaml
+      responses:
+        "200":
+          description: OK

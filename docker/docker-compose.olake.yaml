@@ -1,0 +1,179 @@
+# OLake Go UI stack for analytics-first source-to-Iceberg pipelines.
+#
+# Based on the official OLake docker-compose-v1.yml:
+# https://github.com/datazip-inc/olake-ui/blob/master/docker-compose-v1.yml
+#
+# Run from this directory:
+#   docker compose -f docker-compose.yaml -f docker-compose.olake.yaml \
+#     --profile olake up -d
+#
+# OLake launches ingestion driver containers through the Docker socket. For
+# databases in docker-compose.yaml on macOS/Windows, use host.docker.internal
+# and the published host port (for example 25432 for the demo source).
+
+x-olake-app-defaults:
+  host_persistence_path: &olakeHostPersistencePath ${OLAKE_DATA_DIR:-${PWD}/olake-data}
+  worker_config_volume_details: &olakeWorkerConfigVolumeDetails
+    type: bind
+    source: *olakeHostPersistencePath
+    target: /tmp/olake-config
+
+x-olake-signup-defaults:
+  username: &olakeDefaultUsername ${OLAKE_ADMIN_USERNAME:-admin}
+  password: &olakeDefaultPassword ${OLAKE_ADMIN_PASSWORD:-password}
+  email: &olakeDefaultEmail ${OLAKE_ADMIN_EMAIL:-admin@example.com}
+
+x-olake-encryption:
+  key: &olakeEncryptionKey ${OLAKE_SECRET_KEY:-}
+
+x-olake-envs:
+  shared: &olakeSharedEnvs
+    CONTAINER_REGISTRY_BASE: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}
+    OLAKE_SECRET_KEY: *olakeEncryptionKey
+    PERSISTENT_DIR: *olakeHostPersistencePath
+    ENABLE_OPTIMIZATION: "false"
+
+services:
+  olake-ui:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/olakego/ui:${OLAKE_VERSION:-latest}
+    pull_policy: always
+    container_name: cdc-olake-ui
+    profiles: ["olake"]
+    environment:
+      <<: *olakeSharedEnvs
+      MAX_MEMORY: "67108864"
+      MAX_UPLOAD_SIZE: "67108864"
+      HTTP_READ_HEADER_TIMEOUT: 10s
+      HTTP_READ_TIMEOUT: 600s
+      HTTP_WRITE_TIMEOUT: 600s
+      HTTP_IDLE_TIMEOUT: 600s
+      USERNAME: *olakeDefaultUsername
+      PASSWORD: *olakeDefaultPassword
+    ports:
+      - "${OLAKE_UI_BIND:-127.0.0.1}:${OLAKE_UI_PORT:-8000}:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - <<: *olakeWorkerConfigVolumeDetails
+    networks: 
+      - server_zone
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  signup-init:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/curlimages/curl:latest
+    container_name: cdc-olake-signup-init
+    profiles: ["olake"]
+    networks:
+      - server_zone
+    depends_on:
+      olake-ui:
+        condition: service_healthy
+    environment:
+      USERNAME: *olakeDefaultUsername
+      PASSWORD: *olakeDefaultPassword
+      EMAIL: *olakeDefaultEmail
+      OLAKE_APP_URL: http://olake-ui:8000/signup
+    command: >
+      sh -c '
+        JSON_PAYLOAD=$$(printf "{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"%s\"}" "$${USERNAME}" "$${PASSWORD}" "$${EMAIL}");
+        HTTP_CODE=$$(curl -sS -o /tmp/signup-response -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$${JSON_PAYLOAD}" "$${OLAKE_APP_URL}");
+        cat /tmp/signup-response;
+        if [ "$${HTTP_CODE}" -ge 200 ] && [ "$${HTTP_CODE}" -lt 300 ]; then exit 0; fi;
+        if [ "$${HTTP_CODE}" -eq 409 ]; then exit 0; fi;
+        exit 1
+      '
+    restart: "no"
+
+  temporal-worker:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/olakego/ui-worker:${OLAKE_VERSION:-latest}
+    pull_policy: always
+    container_name: cdc-olake-temporal-worker
+    profiles: ["olake"]
+    networks: 
+      - server_zone
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - <<: *olakeWorkerConfigVolumeDetails
+    environment:
+      <<: *olakeSharedEnvs
+      OLAKE_CALLBACK_URL: http://olake-ui:8000/internal/worker/callback
+      OLAKE_INDEX_DB_DIR: /index-db
+      OLAKE_INDEX_DB_CACHE_SIZE: "512"
+      OLAKE_INDEX_DB_MAX_OPEN_FILES: "1000"
+    depends_on:
+      temporal:
+        condition: service_started
+      olake-ui:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgresql:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/library/postgres:13
+    container_name: cdc-olake-postgresql
+    profiles: ["olake"]
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${OLAKE_POSTGRES_PASSWORD:-temporal}
+    networks: 
+      - server_zone
+    volumes:
+      - olake-temporal-postgresql-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -h localhost -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/temporalio/auto-setup:1.23.1
+    container_name: cdc-olake-temporal
+    profiles: ["olake"]
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${OLAKE_POSTGRES_PASSWORD:-temporal}
+      POSTGRES_SEEDS: postgresql
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    networks:
+      - server_zone
+    restart: unless-stopped
+
+  temporal-ui:
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/temporalio/ui:${TEMPORAL_UI_VERSION:-2.53.3}
+    container_name: cdc-olake-temporal-ui
+    profiles: ["olake"]
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "${TEMPORAL_UI_BIND:-127.0.0.1}:${TEMPORAL_UI_PORT:-8081}:8080"
+    networks:
+      - server_zone
+    restart: unless-stopped
+
+networks:
+  server_zone:
+    external: true
+    name: server_zone
+
+volumes:
+  olake-temporal-postgresql-data:
+    driver: local

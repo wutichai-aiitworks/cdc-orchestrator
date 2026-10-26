@@ -1,0 +1,589 @@
+# Complete single-host CDC install package.
+# Project name must stay `cdc-stack` (orchestrator filters compose labels).
+#
+# Relative paths resolve against this directory (docker/), so the repo root is `..`.
+# `.env` sits next to this file, so Compose loads it automatically for ${VAR}
+# interpolation — run `docker compose` from docker/, or use ./install.sh.
+name: cdc-stack
+
+networks:
+  server_zone:
+    external: true
+    name: server_zone
+
+volumes:
+  cdc-redpanda-data:
+  cdc-redis-data:
+  cdc-rqlite-data:
+  cdc-postgres-data:
+  cdc-postgres-target-data:
+  cdc-lake-data:
+  cdc-pgcopydb-data:
+  cdc-redisshake-data:
+  cdc-pgloader-data:
+  cdc-mongocopy-data:
+
+services:
+  # ── Message bus (Redpanda) ─────────────────────────────────────
+  cdc-message:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    container_name: cdc-message
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://cdc-message:9092,external://127.0.0.1:${CDC_KAFKA_HOST_PORT:-19092}
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://cdc-message:8082,external://127.0.0.1:18082
+      - --schema-registry-addr
+      - 0.0.0.0:8081
+    ports:
+      - "${CDC_KAFKA_HOST_PORT:-19092}:19092"
+      - "${CDC_SCHEMA_REGISTRY_HOST_PORT:-18081}:8081"
+    volumes:
+      - cdc-redpanda-data:/var/lib/redpanda/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy'"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Debezium Kafka Connect ─────────────────────────────────────
+  cdc-connect:
+    image: ${CDC_CONNECT_IMAGE:-cdc-connect:local}
+    build:
+      context: ..
+      dockerfile: docker/connect/Dockerfile
+    container_name: cdc-connect
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    ports:
+      - "${CDC_CONNECT_HOST_PORT:-28083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: cdc-message:9092
+      GROUP_ID: cdc-connect-cluster
+      CONFIG_STORAGE_TOPIC: _cdc_connect_configs
+      OFFSET_STORAGE_TOPIC: _cdc_connect_offsets
+      STATUS_STORAGE_TOPIC: _cdc_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      CONNECT_KEY_CONVERTER_AUTO_REGISTER_SCHEMAS: "true"
+      CONNECT_VALUE_CONVERTER_AUTO_REGISTER_SCHEMAS: "true"
+      CONNECT_KEY_CONVERTER_ENHANCED_AVRO_SCHEMA_SUPPORT: "true"
+      CONNECT_VALUE_CONVERTER_ENHANCED_AVRO_SCHEMA_SUPPORT: "true"
+      CONNECT_REST_ADVERTISED_HOST_NAME: cdc-connect
+      CONNECT_REST_PORT: "8083"
+      # Let source connectors apply their topic.creation.default.* retention policy.
+      CONNECT_TOPIC_CREATION_ENABLE: "true"
+      HEAP_OPTS: "-Xms512m -Xmx1024m"
+      # Prevent ORA-01882 "timezone region not found" for all Oracle JDBC connections.
+      # The Oracle thin driver maps the JVM timezone to a named region; UTC is not in
+      # that table in many environments. Setting this to false uses the UTC offset instead.
+      KAFKA_OPTS: "-Doracle.jdbc.timezoneAsRegion=false"
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+
+  # ── JDBC Type 4 control-plane admin (catalog / DDL / preview) ──
+  cdc-jdbc-admin:
+    image: ${CDC_JDBC_ADMIN_IMAGE:-cdc-jdbc-admin:local}
+    build:
+      context: ./jdbc-admin
+      dockerfile: Dockerfile
+    container_name: cdc-jdbc-admin
+    environment:
+      JDBC_ADMIN_HOST: 0.0.0.0
+      JDBC_ADMIN_PORT: "8084"
+      ORCH_JDBC_ADMIN_TOKEN: ${ORCH_JDBC_ADMIN_TOKEN:-}
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8084/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── pgcopydb sidecar (Postgres → Postgres bulk copy) ───────────
+  cdc-pgcopydb:
+    image: ${CDC_PGCOPY_IMAGE:-cdc-pgcopydb:local}
+    build:
+      context: ./pgcopydb
+      dockerfile: Dockerfile
+    container_name: cdc-pgcopydb
+    environment:
+      PGCOPY_API_HOST: 0.0.0.0
+      PGCOPY_API_PORT: "8085"
+      PGCOPY_API_TOKEN: ${ORCH_PGCOPY_TOKEN:-}
+      PGCOPY_WORK_ROOT: /var/lib/pgcopydb
+    volumes:
+      - cdc-pgcopydb-data:/var/lib/pgcopydb
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8085/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── RedisShake sidecar (Redis → Redis sync) ────────────────────
+  cdc-redisshake:
+    image: ${CDC_REDIS_SHAKE_IMAGE:-cdc-redisshake:local}
+    build:
+      context: ./redisshake
+      dockerfile: Dockerfile
+    container_name: cdc-redisshake
+    environment:
+      REDIS_SHAKE_API_HOST: 0.0.0.0
+      REDIS_SHAKE_API_PORT: "8086"
+      REDIS_SHAKE_API_TOKEN: ${ORCH_REDIS_SHAKE_TOKEN:-}
+      REDIS_SHAKE_WORK_ROOT: /var/lib/redisshake
+      REDIS_SHAKE_MAX_CONCURRENT_JOBS: ${REDIS_SHAKE_MAX_CONCURRENT_JOBS:-1}
+      REDIS_SHAKE_RETAIN_JOBS: ${REDIS_SHAKE_RETAIN_JOBS:-15}
+      REDIS_SHAKE_CLEANUP_STAGING: ${REDIS_SHAKE_CLEANUP_STAGING:-true}
+    volumes:
+      - cdc-redisshake-data:/var/lib/redisshake
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8086/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── pgloader sidecar (MySQL/SQL Server/SQLite/CSV → Postgres) ──
+  cdc-pgloader:
+    image: ${CDC_PGLOADER_IMAGE:-cdc-pgloader:local}
+    build:
+      context: ./pgloader
+      dockerfile: Dockerfile
+    container_name: cdc-pgloader
+    environment:
+      PGLOADER_API_HOST: 0.0.0.0
+      PGLOADER_API_PORT: "8087"
+      PGLOADER_API_TOKEN: ${ORCH_PGLOADER_TOKEN:-}
+      PGLOADER_WORK_ROOT: /var/lib/pgloader
+    volumes:
+      - cdc-pgloader-data:/var/lib/pgloader
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8087/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── mongocopy sidecar (Mongo → Mongo) ──────────────────────────
+  cdc-mongocopy:
+    image: ${CDC_MONGOCOPY_IMAGE:-cdc-mongocopy:local}
+    build:
+      context: ./mongocopy
+      dockerfile: Dockerfile
+    container_name: cdc-mongocopy
+    environment:
+      MONGOCOPY_API_HOST: 0.0.0.0
+      MONGOCOPY_API_PORT: "8088"
+      MONGOCOPY_API_TOKEN: ${ORCH_MONGOCOPY_TOKEN:-}
+      MONGOCOPY_WORK_ROOT: /var/lib/mongocopy
+    volumes:
+      - cdc-mongocopy-data:/var/lib/mongocopy
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8088/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── ksqlDB (Avro + Schema Registry) ────────────────────────────
+  cdc-ksqldb:
+    image: ${CDC_KSQL_IMAGE:-confluentinc/ksqldb-server:0.29.0}
+    # Official image is amd64-only; pin so Compose does not warn about an implicit platform.
+    platform: ${CDC_KSQL_PLATFORM:-linux/amd64}
+    container_name: cdc-ksqldb
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    ports:
+      - "${CDC_KSQL_HOST_PORT:-28088}:8088"
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: cdc-message:9092
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_KSQL_SERVICE_ID: cdc_
+      KSQL_KSQL_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_INTERNAL_TOPIC_REPLICAS: "1"
+      KSQL_KSQL_SINK_REPLICAS: "1"
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_STREAMS_CACHE_MAX_BYTES_BUFFERING: "0"
+      KSQL_KSQL_STREAMS_AUTO_OFFSET_RESET: earliest
+      KSQL_KSQL_STREAMS_PROCESSING_GUARANTEE: at_least_once
+      KSQL_KSQL_PERSISTENCE_DEFAULT_FORMAT_VALUE: AVRO
+      KSQL_KSQL_PERSISTENCE_DEFAULT_FORMAT_KEY: KAFKA
+      KSQL_KSQL_HIDDEN_TOPICS: "^_.*"
+      KSQL_HEAP_OPTS: "-Xms256m -Xmx768m"
+    networks:
+      server_zone:
+        aliases: [ksqldb]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'echo > /dev/tcp/127.0.0.1/8088' || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── Kafbat / Kafka UI ──────────────────────────────────────────
+  cdc-admin:
+    image: ${CDC_ADMIN_IMAGE:-ghcr.io/kafbat/kafka-ui:latest}
+    container_name: cdc-admin
+    depends_on:
+      cdc-connect:
+        condition: service_healthy
+    ports:
+      - "${CDC_ADMIN_HOST_PORT:-4321}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: cdc-message:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://cdc-connect:8083
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://cdc-message:8081
+      KAFKA_CLUSTERS_0_KSQLDBSERVER: http://cdc-ksqldb:8088
+      DYNAMIC_CONFIG_ENABLED: "true"
+      AUTH_TYPE: disabled
+    networks: [server_zone]
+    restart: unless-stopped
+
+  # ── Native Level-3 WebUI (optional) ───────────────────────────
+  cdc-native-ui:
+    image: ${CDC_NATIVE_UI_IMAGE:-kafbat-webui:local}
+    build:
+      context: ../kafbat-webui
+      dockerfile: Dockerfile
+    container_name: cdc-native-ui
+    profiles: ["native-ui"]
+    depends_on:
+      cdc-orchestrator:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${CDC_NATIVE_UI_HOST_PORT:-4320}:3000"
+    environment:
+      APP_NAME: CDC WebUI
+      ORCHESTRATOR_URL: http://cdc-orchestrator:9788
+      PUBLIC_ORCHESTRATOR_URL: http://127.0.0.1:${CDC_ORCHESTRATOR_PORT:-9788}
+      ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
+      AUTH_MODE: ${AUTH_MODE:-none}
+      ALLOW_OPEN_AUTH: ${ALLOW_OPEN_AUTH:-true}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SSO_PROVIDER: ${SSO_PROVIDER:-supertokens_gateway}
+      SSO_APP_ID: ${SSO_APP_ID:-}
+      SSO_LOGIN_URL: ${SSO_LOGIN_URL:-}
+      SSO_CALLBACK_URL: ${SSO_CALLBACK_URL:-}
+      SSO_EXCHANGE_URL: ${SSO_EXCHANGE_URL:-}
+      SSO_APP_SECRET: ${SSO_APP_SECRET:-}
+      SSO_EXCHANGE_TIMEOUT_MS: ${SSO_EXCHANGE_TIMEOUT_MS:-12000}
+      SSO_EXCHANGE_DEBUG: ${SSO_EXCHANGE_DEBUG:-}
+      AUTHELIA_AUTHORIZE_URL: ${AUTHELIA_AUTHORIZE_URL:-}
+      AUTHELIA_CLIENT_ID: ${AUTHELIA_CLIENT_ID:-}
+      AUTHELIA_SCOPES: ${AUTHELIA_SCOPES:-openid profile email groups}
+      AUTHELIA_TOKEN_URL: ${AUTHELIA_TOKEN_URL:-}
+      AUTHELIA_USERINFO_URL: ${AUTHELIA_USERINFO_URL:-}
+      AUTHELIA_CLIENT_SECRET: ${AUTHELIA_CLIENT_SECRET:-}
+    networks: [server_zone]
+    restart: unless-stopped
+
+  # ── Configuration store (rqlite) ───────────────────────────────
+  cdc-rqlite:
+    image: ${CDC_RQLITE_IMAGE:-rqlite/rqlite:8.36.16}
+    container_name: cdc-rqlite
+    ports:
+      - "${CDC_RQLITE_HOST_PORT:-14001}:4001"
+    volumes:
+      - cdc-rqlite-data:/rqlite/file
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD", "rqlite", "-H", "127.0.0.1", "-p", "4001", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Redis (offsets / cache helpers) ────────────────────────────
+  cdc-redis:
+    image: redis:7-alpine
+    container_name: cdc-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${CDC_REDIS_HOST_PORT:-26379}:6379"
+    volumes:
+      - cdc-redis-data:/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Vector (optional sink / pipeline) ──────────────────────────
+  cdc-vector:
+    image: timberio/vector:0.41.1-alpine
+    container_name: cdc-vector
+    profiles: ["vector"]
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    command: ["--config", "/etc/vector/vector.toml"]
+    environment:
+      O2_URL: ${O2_URL:-http://openobserve-core:5080}
+      O2_ORG: ${O2_ORG:-default}
+      O2_STREAM: ${O2_STREAM:-cdc-copy}
+      O2_USER: ${O2_USER:-}
+      O2_PASSWORD: ${O2_PASSWORD:-}
+    volumes:
+      - ./config/vector.toml:/etc/vector/vector.toml:ro
+      - cdc-pgcopydb-data:/var/lib/pgcopydb:ro
+      - cdc-redisshake-data:/var/lib/redisshake:ro
+      - cdc-pgloader-data:/var/lib/pgloader:ro
+      - cdc-mongocopy-data:/var/lib/mongocopy:ro
+    networks: [server_zone]
+    restart: unless-stopped
+
+  # ── Example Postgres source (demo only) ────────────────────────
+  # Dumps are PG 17 (transaction_timeout). Init runs only on an empty volume.
+  cdc-postgres-source:
+    image: postgres:17
+    container_name: cdc-postgres-source
+    profiles: ["demo"]
+    ports:
+      - "${CDC_POSTGRES_HOST_PORT:-25432}:5432"
+    environment:
+      POSTGRES_USER: ${CDC_DEMO_PG_USER:-demo}
+      POSTGRES_PASSWORD: ${CDC_DEMO_PG_PASSWORD:-demo}
+      POSTGRES_DB: ${CDC_DEMO_PG_DB:-demo}
+      CDC_DEMO_DUMP_SIZE: ${CDC_DEMO_DUMP_SIZE:-3m}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+    volumes:
+      - cdc-postgres-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ../samples:/samples:ro
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30m
+    restart: unless-stopped
+
+  # ── Example Postgres target (demo only) ────────────────────────
+  # Empty demo database. CDC JDBC sink auto-creates tables here.
+  cdc-postgres-target:
+    image: postgres:17
+    container_name: cdc-postgres-target
+    profiles: ["demo"]
+    ports:
+      - "${CDC_POSTGRES_TARGET_HOST_PORT:-25433}:5432"
+    environment:
+      POSTGRES_USER: ${CDC_DEMO_PG_USER:-demo}
+      POSTGRES_PASSWORD: ${CDC_DEMO_PG_PASSWORD:-demo}
+      POSTGRES_DB: ${CDC_DEMO_PG_DB:-demo}
+    volumes:
+      - cdc-postgres-target-data:/var/lib/postgresql/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    restart: unless-stopped
+
+  # ── Object storage warehouse (datalake landing) ────────────────
+  cdc-lake:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: cdc-lake
+    profiles: ["lake"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${CDC_LAKE_ACCESS_KEY:-cdcadmin}
+      MINIO_ROOT_PASSWORD: ${CDC_LAKE_SECRET_KEY:-cdcadmincdcadmin}
+    ports:
+      - "${CDC_LAKE_API_PORT:-19000}:9000"
+      - "${CDC_LAKE_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - cdc-lake-data:/data
+    networks: [server_zone]
+    restart: unless-stopped
+
+  cdc-lake-init:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    container_name: cdc-lake-init
+    profiles: ["lake"]
+    depends_on:
+      - cdc-lake
+    environment:
+      MINIO_ROOT_USER: ${CDC_LAKE_ACCESS_KEY:-cdcadmin}
+      MINIO_ROOT_PASSWORD: ${CDC_LAKE_SECRET_KEY:-cdcadmincdcadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          mc alias set local http://cdc-lake:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && break
+          sleep 2
+        done
+        mc mb -p local/lake || true
+    networks: [server_zone]
+    restart: "no"
+
+  # ── Control plane ──────────────────────────────────────────────
+  cdc-orchestrator:
+    image: ${CDC_ORCHESTRATOR_IMAGE:-cdc-orchestrator:local}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: cdc-orchestrator
+    depends_on:
+      cdc-connect:
+        condition: service_healthy
+      cdc-jdbc-admin:
+        condition: service_healthy
+      cdc-pgcopydb:
+        condition: service_healthy
+      cdc-redisshake:
+        condition: service_healthy
+      cdc-pgloader:
+        condition: service_healthy
+      cdc-mongocopy:
+        condition: service_healthy
+      cdc-message:
+        condition: service_healthy
+      cdc-rqlite:
+        condition: service_healthy
+    ports:
+      - "${CDC_ORCHESTRATOR_BIND:-127.0.0.1}:${CDC_ORCHESTRATOR_PORT:-9788}:9788"
+    env_file:
+      # Defaults to the existing development file. Production uses
+      # CDC_ENV_FILE=.env.production without changing this Compose file.
+      - ${CDC_ENV_FILE:-.env}
+    environment:
+      ORCH_HOST: 0.0.0.0
+      ORCH_PORT: 9788
+      ORCH_ENV: ${ORCH_ENV:-dev}
+      ORCH_ENGINE_PROVIDER: docker_api
+      ORCH_CONTAINER_PROJECT_NAME: cdc-stack
+      ORCH_MANAGED_CONTAINERS: cdc-message,cdc-admin,cdc-connect,cdc-jdbc-admin,cdc-ksqldb,cdc-redis,cdc-vector,cdc-rqlite
+      # In-compose Connect URL (not host.docker.internal)
+      ORCH_CONNECT_BASE_URL: http://cdc-connect:8083
+      ORCH_SCHEMA_REGISTRY_URL: ${ORCH_SCHEMA_REGISTRY_URL:-http://cdc-message:8081}
+      ORCH_KSQL_URL: ${ORCH_KSQL_URL:-http://cdc-ksqldb:8088}
+      ORCH_REDPANDA_CONTAINER: cdc-message
+      ORCH_CONTAINER_CONNECT: cdc-connect
+      ORCH_CONTAINER_KAFKA: cdc-message
+      ORCH_CONTAINER_VECTOR: cdc-vector
+      ORCH_CONTAINER_REDIS: cdc-redis
+      ORCH_COMMAND_TIMEOUT_SECS: ${ORCH_COMMAND_TIMEOUT_SECS:-30}
+      ORCH_API_TOKEN: ${ORCH_API_TOKEN:-}
+      ORCH_RQLITE_URL: ${ORCH_RQLITE_URL:-http://cdc-rqlite:4001}
+      ORCH_JDBC_ADMIN_URL: ${ORCH_JDBC_ADMIN_URL:-http://cdc-jdbc-admin:8084}
+      ORCH_JDBC_ADMIN_TOKEN: ${ORCH_JDBC_ADMIN_TOKEN:-}
+      ORCH_PGCOPY_URL: ${ORCH_PGCOPY_URL:-http://cdc-pgcopydb:8085}
+      ORCH_PGCOPY_TOKEN: ${ORCH_PGCOPY_TOKEN:-}
+      ORCH_REDIS_SHAKE_URL: ${ORCH_REDIS_SHAKE_URL:-http://cdc-redisshake:8086}
+      ORCH_REDIS_SHAKE_TOKEN: ${ORCH_REDIS_SHAKE_TOKEN:-}
+      ORCH_PGLOADER_URL: ${ORCH_PGLOADER_URL:-http://cdc-pgloader:8087}
+      ORCH_PGLOADER_TOKEN: ${ORCH_PGLOADER_TOKEN:-}
+      ORCH_MONGOCOPY_URL: ${ORCH_MONGOCOPY_URL:-http://cdc-mongocopy:8088}
+      ORCH_MONGOCOPY_TOKEN: ${ORCH_MONGOCOPY_TOKEN:-}
+      ORCH_REQUIRE_AUTH: ${ORCH_REQUIRE_AUTH:-}
+      ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-}
+      ORCH_STRICT_PERSISTENCE: ${ORCH_STRICT_PERSISTENCE:-}
+      ORCH_POLL_INTERVAL_MS: ${ORCH_POLL_INTERVAL_MS:-30000}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      server_zone:
+        aliases:
+          - hyper-cdc-orchestrator
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9788/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── MCP (optional agent surface) ───────────────────────────────
+  mcp-cdc:
+    image: ${MCP_CDC_IMAGE:-mcp-cdc:local}
+    build:
+      context: ../mcp
+      dockerfile: Dockerfile
+    container_name: mcp-cdc
+    profiles: ["mcp"]
+    depends_on:
+      cdc-orchestrator:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${MCP_CDC_BIND:-127.0.0.1}:${MCP_CDC_PORT:-8410}:8410"
+    environment:
+      MCP_BIND_ADDR: 0.0.0.0:8410
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:-change-me-mcp-cdc-token-min24}
+      CDC_ORCHESTRATOR_URL: http://cdc-orchestrator:9788
+      CDC_ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
+      # Local prompting: set ALLOW_WRITE_TOOLS=true in .env
+      ALLOW_WRITE_TOOLS: ${ALLOW_WRITE_TOOLS:-false}
+    networks: [server_zone]
+    restart: unless-stopped

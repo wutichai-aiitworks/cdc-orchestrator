@@ -1,0 +1,73 @@
+{
+  "id": "c28984d5-ebcc-4f1d-a256-a8363c9a7c94",
+  "name": "Customer FaaS Demo",
+  "input_topic": "cdc.customers.raw",
+  "output_topic": "cdc.customers.faas.v1",
+  "dead_letter_topic": "cdc.customers.faas.dlq",
+  "consumer_group": "hyper-cdc-customers-faas-v1",
+  "batch": {
+    "max_records": 500,
+    "max_bytes": 4194304,
+    "max_wait_ms": 25
+  },
+  "preserve_partition_order": true,
+  "enabled": true,
+  "stages": [
+    {
+      "id": "normalize",
+      "name": "Normalize Customer",
+      "kind": "transform",
+      "execution": "grpc",
+      "endpoint": "http://127.0.0.1:50051",
+      "timeout_ms": 5000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 100,
+        "max_backoff_ms": 2000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true,
+      "attributes": {
+        "function": "normalize_customer"
+      }
+    },
+    {
+      "id": "active-only",
+      "name": "Keep Active Customers",
+      "kind": "filter",
+      "execution": "grpc",
+      "endpoint": "http://127.0.0.1:50051",
+      "timeout_ms": 5000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 100,
+        "max_backoff_ms": 2000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true,
+      "attributes": {
+        "function": "filter_active",
+        "active_field": "active"
+      }
+    },
+    {
+      "id": "region",
+      "name": "Add Region",
+      "kind": "enrich",
+      "execution": "grpc",
+      "endpoint": "http://127.0.0.1:50051",
+      "timeout_ms": 5000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 100,
+        "max_backoff_ms": 2000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true,
+      "attributes": {
+        "function": "enrich_region",
+        "country_field": "country"
+      }
+    }
+  ]
+}

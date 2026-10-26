@@ -1,0 +1,18 @@
+# Quality gate for the Rust crates. Push/manual only, same as main-ci.
+# Pull requests stay on `test` (no Sonar token). main-ci waits for this workflow
+# before it publishes images.
+when:
+  event: [push, manual]
+
+steps:
+  sonar:
+    image: sonarsource/sonar-scanner-cli:11
+    environment:
+      SONAR_HOST_URL: https://sonarqube.b-quik-connect.com
+      SONAR_TOKEN:
+        from_secret: SONAR_TOKEN
+    commands:
+      - |
+        set -e
+        echo "SonarQube at $${SONAR_HOST_URL}"
+        sonar-scanner -Dsonar.qualitygate.wait=true

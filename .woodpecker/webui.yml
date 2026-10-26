@@ -1,0 +1,12 @@
+when:
+  event: [pull_request, push, manual]
+
+steps:
+  kafbat-webui:
+    image: node:22-bookworm
+    commands:
+      - cd kafbat-webui
+      - npm ci
+      - npm run openapi:check
+      - npm run typecheck
+      - npm run build

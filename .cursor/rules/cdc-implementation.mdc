@@ -1,0 +1,88 @@
+---
+description: Implementation standards for hyper-cdc-orchestrator — error handling, state, env config, auth, persistence, audit, CDC pipelines
+alwaysApply: true
+---
+
+# CDC Orchestrator — Implementation Rules
+
+## Error handling (main crate)
+
+Use the custom `AppError` enum in `src/error.rs`. **Do not add `anyhow` or `thiserror` to the main crate.**
+
+| Variant | When |
+|---|---|
+| `AppError::BadRequest(msg)` | Invalid input / missing fields |
+| `AppError::Unauthorized(msg)` | Token check failures |
+| `AppError::NotFound(msg)` | Missing profile / connector / topic |
+| `AppError::Upstream(msg)` | Kafka Connect / jdbc-admin / Docker returned error |
+| `AppError::Internal(msg)` | Unexpected internal failure |
+
+Return `Result<T, AppError>` from all handlers and domain functions. Propagate with `?`.
+
+> **MCP crate** (`mcp/`) is different: it uses `anyhow::Result` + `thiserror`. Keep these error styles separate per crate.
+
+## State injection
+
+Use Axum `State<AppState>` extraction — not `Extension`. `AppState` is defined in `src/main.rs` and is `Clone`.
+
+```rust
+pub async fn my_handler(
+    State(state): State<AppState>,
+    Json(body): Json<MyRequest>,
+) -> Result<Json<MyResponse>, AppError> {
+    let result = my_service::do_work(&state, &body).await?;
+    Ok(Json(result))
+}
+```
+
+## Handler weight
+
+- Handlers in `handlers.rs`, `ops.rs`, `kafka_admin.rs`, `processing_api.rs` delegate heavy work to domain modules (`reconcile`, `engine`, `store`, `trigger_cdc`, `connector_catalog`, `function_runtime`).
+- New handlers: validate input → call domain fn → return response. Keep HTTP concerns out of domain modules.
+
+## Environment / config
+
+All env vars use the **`ORCH_`** prefix (`ORCH_HOST`, `ORCH_PORT`, `ORCH_API_TOKEN`, `ORCH_RQLITE_URL`, `ORCH_CONNECT_BASE_URL`, …).
+- Read via `std::env` in `AppConfig::from_env()` — **no dotenv** in the main binary.
+- Local overrides go in `.env_local` (repo root) or `docker/.env` for compose runs.
+- JDBC Type 4 catalog admin: `ORCH_JDBC_ADMIN_URL` / `ORCH_JDBC_ADMIN_TOKEN`.
+
+## Auth
+
+- Token comparison **must** use `subtle::ConstantTimeEq` — never `==` on secret strings.
+- Health endpoints are public; all mutating and data endpoints require the Bearer / header token.
+- MCP write tools are gated by `ALLOW_WRITE_TOOLS=true` — keep off in shared/prod.
+
+## Persistence
+
+Persistence fallback order: **rqlite → in-memory**.
+- Use `state.rqlite` for durable profile/pipeline state when available.
+- In-memory is only for local dev / strict mode off.
+- Call `profile.redact_secrets()` before including any profile in a JSON response.
+
+## Audit
+
+Call `audit::log_action(...)` on every mutating operation (start, pause, stop, resync, delete, pipeline changes).
+
+## CDC pipeline lifecycle
+
+Route mutations through the `reconcile` module:
+- `reconcile::reconcile_start` → create/upsert connector
+- `reconcile::reconcile_pause / resume / stop`
+- Never call Kafka Connect, Docker, or Redpanda APIs directly from handlers.
+
+## API paths
+
+Both legacy (`/profiles`, `/connect/…`) and `/cdc/…` paths exist. Prefer `/cdc/…` for new code; legacy is kept for backward compat only.
+
+## Timestamps
+
+Include `timestamp: Utc::now()` in API response structs where latency / freshness matters.
+
+## Docker / Compose
+
+Always run compose from `docker/`:
+```sh
+cd docker && docker compose --profile demo up -d
+```
+Repo root is `..` relative to `docker/`. Only `.env_local` stays at root.

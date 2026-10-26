@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "hyper-cdc": {
+      "url": "http://127.0.0.1:8410/mcp",
+      "headers": {
+        "Authorization": "Bearer change-me-mcp-cdc-token-min24chars"
+      }
+    }
+  }
+}

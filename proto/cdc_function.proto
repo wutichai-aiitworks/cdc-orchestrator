@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package hyper.cdc.function.v1;
+
+service CdcFunction {
+  rpc Capabilities(CapabilityRequest) returns (CapabilityResponse);
+  rpc Process(stream RecordBatch) returns (stream BatchResult);
+}
+
+message CapabilityRequest {}
+
+message CapabilityResponse {
+  string function_name = 1;
+  string function_version = 2;
+  repeated string supported_stages = 3;
+  uint32 max_batch_records = 4;
+  uint64 max_batch_bytes = 5;
+}
+
+message RecordHeader {
+  string key = 1;
+  optional bytes value = 2;
+}
+
+message CdcRecord {
+  string record_id = 1;
+  optional bytes key = 2;
+  optional bytes value = 3;
+  repeated RecordHeader headers = 4;
+  int64 timestamp_ms = 5;
+  int64 offset = 6;
+}
+
+message RecordBatch {
+  string pipeline_id = 1;
+  string stage_id = 2;
+  string invocation_id = 3;
+  uint32 attempt = 4;
+  string topic = 5;
+  int32 partition = 6;
+  repeated CdcRecord records = 7;
+  map<string, string> attributes = 8;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  EMIT = 1;
+  DROP = 2;
+  DEAD_LETTER = 3;
+  RETRY = 4;
+}
+
+message FunctionError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  map<string, string> details = 4;
+}
+
+message RecordResult {
+  string record_id = 1;
+  Decision decision = 2;
+  optional bytes key = 3;
+  optional bytes value = 4;
+  repeated RecordHeader headers = 5;
+  optional FunctionError error = 6;
+}
+
+message BatchResult {
+  string invocation_id = 1;
+  repeated RecordResult results = 2;
+  optional FunctionError error = 3;
+}

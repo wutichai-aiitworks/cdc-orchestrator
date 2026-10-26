@@ -1,0 +1,330 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Keep the legacy surface scale identical to hyper-dataservice-webui. */
+:root,
+.dark {
+  color-scheme: dark;
+
+  --surface-50: 248 249 252;
+  --surface-100: 240 242 248;
+  --surface-200: 221 225 239;
+  --surface-300: 184 191 214;
+  --surface-400: 142 151 184;
+  --surface-500: 107 117 160;
+  --surface-600: 83 92 134;
+  --surface-700: 67 74 110;
+  --surface-800: 58 64 96;
+  --surface-900: 26 29 48;
+  --surface-950: 14 16 32;
+}
+
+html:not(.dark) {
+  color-scheme: light;
+
+  --surface-50: 15 23 42;
+  --surface-100: 30 41 59;
+  --surface-200: 51 65 85;
+  --surface-300: 71 85 105;
+  --surface-400: 100 116 139;
+  --surface-500: 148 163 184;
+  --surface-600: 203 213 225;
+  --surface-700: 226 232 240;
+  --surface-800: 241 245 249;
+  --surface-900: 248 250 252;
+  --surface-950: 255 255 255;
+}
+
+@layer base {
+  :root {
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: rgb(226 151 73);
+    --primary-foreground: oklch(0.98 0.016 73.684);
+    --secondary: oklch(0.967 0.001 286.375);
+    --secondary-foreground: oklch(0.21 0.006 285.885);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --destructive-foreground: oklch(0.98 0.016 73.684);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.837 0.128 66.29);
+    --chart-2: oklch(0.705 0.213 47.604);
+    --chart-3: oklch(0.646 0.222 41.116);
+    --chart-4: oklch(0.553 0.195 38.402);
+    --chart-5: oklch(0.47 0.157 37.304);
+    --radius: 0.45rem;
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: rgb(226 151 73);
+    --sidebar-primary-foreground: oklch(0.98 0.016 73.684);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
+  }
+
+  .dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: rgb(226 151 73);
+    --primary-foreground: oklch(0.98 0.016 73.684);
+    --secondary: oklch(0.274 0.006 286.033);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --destructive-foreground: oklch(0.98 0.016 73.684);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.837 0.128 66.29);
+    --chart-2: oklch(0.705 0.213 47.604);
+    --chart-3: oklch(0.646 0.222 41.116);
+    --chart-4: oklch(0.553 0.195 38.402);
+    --chart-5: oklch(0.47 0.157 37.304);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: rgb(226 151 73);
+    --sidebar-primary-foreground: oklch(0.98 0.016 73.684);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-body text-sm antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display;
+  }
+
+  th {
+    @apply text-xs font-medium font-body;
+  }
+
+  td {
+    @apply text-sm font-body;
+  }
+}
+
+@layer components {
+  .auth-card {
+    @apply border border-border rounded-2xl bg-card;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  .auth-input {
+    @apply box-border w-full h-10 min-h-10 border border-input rounded-xl px-4 py-0
+           text-foreground placeholder:text-muted-foreground text-sm font-body
+           focus:outline-none focus:ring-1 focus:ring-ring focus:border-primary;
+    background-color: color-mix(in oklab, var(--muted) 60%, transparent);
+  }
+
+  textarea.auth-input {
+    @apply h-auto min-h-[6rem] py-3 leading-relaxed;
+  }
+
+  .auth-input:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
+  .auth-label {
+    @apply mb-2 block text-sm font-medium text-muted-foreground;
+  }
+
+  .btn-primary {
+    @apply box-border h-10 min-h-10 w-full bg-primary hover:brightness-105 active:brightness-95
+           text-primary-foreground font-display font-semibold text-sm
+           py-0 px-4 rounded-xl shadow-sm
+           transition-all duration-200
+           focus:outline-none focus:ring-1 focus:ring-ring
+           disabled:opacity-50 disabled:cursor-not-allowed
+           inline-flex items-center justify-center gap-2;
+  }
+
+  .btn-secondary {
+    @apply box-border h-10 min-h-10 w-full bg-secondary hover:brightness-95
+           border border-border
+           text-secondary-foreground font-display font-medium text-sm
+           py-0 px-4 rounded-xl
+           transition-all duration-200
+           focus:outline-none focus:ring-1 focus:ring-ring
+           disabled:opacity-50 disabled:cursor-not-allowed
+           inline-flex items-center justify-center gap-2;
+  }
+
+  .btn-ghost {
+    @apply text-primary hover:brightness-110 font-medium text-sm
+           transition-colors duration-200 underline-offset-4 hover:underline;
+  }
+
+  .stat-card {
+    @apply bg-card text-card-foreground border border-border rounded-xl p-3;
+  }
+
+  .alert-error {
+    @apply border rounded-xl px-4 py-3 text-destructive text-sm flex items-center gap-2;
+    background-color: color-mix(in oklab, var(--destructive) 10%, transparent);
+    border-color: color-mix(in oklab, var(--destructive) 30%, transparent);
+  }
+
+  .alert-success {
+    @apply border rounded-xl px-4 py-3 text-emerald-700 dark:text-emerald-400 text-sm flex items-center gap-2
+           bg-emerald-500/10 border-emerald-500/30;
+  }
+
+  .alert-info {
+    @apply border rounded-xl px-4 py-3 text-blue-700 dark:text-blue-400 text-sm flex items-center gap-2
+           bg-blue-500/10 border-blue-500/30;
+  }
+
+  .alert-warning {
+    @apply border rounded-xl px-4 py-3 text-amber-700 dark:text-yellow-400 text-sm flex items-center gap-2
+           bg-yellow-500/10 border-yellow-500/30;
+  }
+
+  .data-table {
+    @apply w-full bg-card border border-border rounded-xl overflow-hidden text-sm font-body;
+  }
+
+  .data-table thead {
+    @apply border-b border-border;
+  }
+
+  .data-table th {
+    @apply px-4 py-3 text-left text-xs font-medium font-body text-muted-foreground;
+  }
+
+  .data-table tbody tr {
+    @apply last:border-0 transition-colors;
+    border-bottom: 1px solid color-mix(in oklab, var(--border) 50%, transparent);
+  }
+
+  .data-table tbody tr:hover {
+    @apply bg-accent;
+  }
+
+  .data-table td {
+    @apply px-4 py-3 text-sm font-body text-foreground;
+  }
+
+  .badge-success {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm font-medium
+           bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/25;
+  }
+
+  .badge-error {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm font-medium
+           bg-red-500/15 text-red-700 dark:text-red-400 border border-red-500/25;
+  }
+
+  .badge-warning {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm font-medium
+           bg-yellow-500/15 text-amber-700 dark:text-yellow-400 border border-yellow-500/25;
+  }
+
+  .badge-info {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm font-medium
+           bg-blue-500/15 text-blue-700 dark:text-blue-400 border border-blue-500/25;
+  }
+
+  .badge-neutral {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm font-medium
+           bg-muted text-muted-foreground border border-border;
+  }
+
+  .modal-overlay {
+    @apply fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60;
+  }
+
+  .code-block {
+    @apply bg-background border border-border rounded-xl p-4 text-sm text-primary
+           font-mono overflow-auto;
+  }
+
+  .page-container {
+    @apply mx-auto w-full max-w-7xl space-y-4 animate-fade-in;
+  }
+
+  .page-toolbar {
+    @apply flex items-center justify-between gap-3 flex-wrap;
+  }
+
+  .page-title {
+    @apply text-xl font-display font-semibold text-foreground;
+  }
+
+  .page-description {
+    @apply mt-1 text-sm text-muted-foreground;
+  }
+
+  .section-title {
+    @apply text-sm font-display font-semibold text-foreground;
+  }
+
+  .form-textarea {
+    @apply min-h-[180px] py-3 font-mono;
+  }
+
+  .list-option {
+    @apply w-full rounded-xl border border-border bg-card px-3 py-2 text-left
+           text-foreground hover:bg-accent transition-colors
+           focus:outline-none focus:ring-1 focus:ring-inset focus:ring-ring;
+  }
+
+  .list-option-active {
+    @apply border-primary bg-brand-500/10 text-primary
+           focus:ring-0;
+  }
+
+  .icon-button {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-xl border border-border
+           bg-card text-muted-foreground hover:bg-accent hover:text-foreground
+           transition-colors focus:outline-none focus:ring-1 focus:ring-ring;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgb(var(--surface-950));
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--surface-700));
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--surface-600));
+}
+
+::selection {
+  background: rgba(226, 151, 73, 0.35);
+  color: var(--foreground);
+}

@@ -1,0 +1,23 @@
+when:
+  event: [pull_request, push, manual]
+
+steps:
+  orchestrator:
+    image: rust:1.97-bookworm
+    commands:
+      # rdkafka builds librdkafka from source (cmake-build feature).
+      - apt-get update && apt-get install -y --no-install-recommends cmake zlib1g-dev
+      - cargo fmt --all -- --check
+      - cargo test --locked --all-targets
+      - cargo clippy --all-targets -- -D warnings
+
+  mcp:
+    image: rust:1.97-bookworm
+    depends_on: [orchestrator]
+    commands:
+      # mcp/ is a standalone crate, not a workspace member, so the root
+      # cargo invocations above do not cover it.
+      - cd mcp
+      - cargo fmt --all -- --check
+      - cargo test --locked --all-targets
+      - cargo clippy --all-targets -- -D warnings

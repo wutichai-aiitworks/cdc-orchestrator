@@ -1,0 +1,15 @@
+{
+  "name": "hyper-cdc-orchestrator-api-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright API tests for hyper-cdc-orchestrator",
+  "scripts": {
+    "test:api": "playwright test",
+    "test:api:headed": "playwright test --headed",
+    "test:api:debug": "playwright test --debug"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "@types/node": "^22.10.2"
+  }
+}

@@ -1,0 +1,58 @@
+# Portable production overlay for:
+#   - macOS with Docker Desktop
+#   - shared Linux hosts and VMs
+#
+# Phase 1 introduced the overlay. Phase 2 activates conservative Kafka Connect
+# tuning. Phase 3A increases Redpanda memory and adds an OS reserve while
+# retaining --overprovisioned and --check=false for virtualized/shared hosts.
+# Dedicated Linux hosts can add docker-compose.prod-linux.yaml in Phase 3B.
+#
+# Usage:
+#   docker compose \
+#     --env-file .env.production \
+#     -f docker-compose.yaml \
+#     -f docker-compose.prod.yaml \
+#     config
+#
+# Do not run `up` until production-preflight.sh passes and a maintenance window
+# is approved. Applying this overlay can recreate Redpanda and Kafka Connect.
+
+services:
+  cdc-message:
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "${CDC_REDPANDA_SMP:-1}"
+      - --memory
+      - "${CDC_REDPANDA_MEMORY:-2G}"
+      - --reserve-memory
+      - "${CDC_REDPANDA_RESERVE_MEMORY:-256M}"
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://cdc-message:9092,external://127.0.0.1:${CDC_KAFKA_HOST_PORT:-19092}
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://cdc-message:8082,external://127.0.0.1:18082
+      - --schema-registry-addr
+      - 0.0.0.0:8081
+
+  cdc-connect:
+    environment:
+      HEAP_OPTS: "${CDC_CONNECT_HEAP_OPTS:--Xms1g -Xmx2g}"
+      # CONNECT_* names are translated to worker properties by the Debezium
+      # entrypoint: producer.*, consumer.*, etc.
+      CONNECT_PRODUCER_COMPRESSION_TYPE: "${CDC_CONNECT_PRODUCER_COMPRESSION_TYPE:-lz4}"
+      CONNECT_PRODUCER_BATCH_SIZE: "${CDC_CONNECT_PRODUCER_BATCH_SIZE:-131072}"
+      CONNECT_PRODUCER_LINGER_MS: "${CDC_CONNECT_PRODUCER_LINGER_MS:-20}"
+      CONNECT_CONSUMER_MAX_POLL_RECORDS: "${CDC_CONNECT_CONSUMER_MAX_POLL_RECORDS:-500}"
+      # Use the non-CONNECT name here: Debezium exports it to
+      # CONNECT_OFFSET_FLUSH_INTERVAL_MS during startup.
+      OFFSET_FLUSH_INTERVAL_MS: "${CDC_CONNECT_OFFSET_FLUSH_INTERVAL_MS:-60000}"
+      OFFSET_FLUSH_TIMEOUT_MS: "${CDC_CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}"

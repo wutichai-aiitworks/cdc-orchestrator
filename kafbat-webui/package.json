@@ -1,0 +1,32 @@
+{
+  "name": "kafbat-webui",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "nuxt dev --host 0.0.0.0 --port 5173",
+    "openapi:generate": "node scripts/generate-openapi.mjs",
+    "openapi:check": "node scripts/generate-openapi.mjs --check",
+    "prebuild": "npm run openapi:generate",
+    "build": "nuxt build",
+    "preview": "nuxt preview --host 0.0.0.0 --port 4173",
+    "typecheck": "nuxt typecheck",
+    "test": "node --test scripts/sso-sanitize.test.mjs"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.30.0",
+    "@scalar/api-reference": "^1.64.1",
+    "@vueuse/core": "^14.4.0",
+    "json-editor-vue": "^0.19.1",
+    "monaco-editor": "^0.56.0",
+    "nuxt": "^3.17.5",
+    "tailwindcss-animate": "^1.0.7",
+    "vite-plugin-monaco-editor": "^1.1.0",
+    "vue": "^3.5.18",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@nuxtjs/tailwindcss": "^6.12.2",
+    "typescript": "^5.6.2",
+    "vue-tsc": "^2.2.2"
+  }
+}

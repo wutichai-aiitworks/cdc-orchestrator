@@ -1,0 +1,37 @@
+when:
+  event: [pull_request, push, manual]
+
+steps:
+  images:
+    image: docker:27-cli
+    commands:
+      - |
+        set -e
+
+        # Multi-platform needs the docker-container driver.
+        docker buildx create --use --name multiarch || docker buildx use multiarch
+        docker buildx inspect --bootstrap
+
+        # name|dockerfile|build context
+        # Orchestrator and Connect both build from the repo root: docker/Dockerfile
+        # copies Cargo sources; docker/connect/Dockerfile compiles kafka-connect-jdbc/.
+        for SPEC in \
+          "hyper-cdc-orchestrator|docker/Dockerfile|." \
+          "hyper-cdc-connect|docker/connect/Dockerfile|." \
+          "hyper-cdc-webui|kafbat-webui/Dockerfile|kafbat-webui" \
+          "hyper-cdc-mcp|mcp/Dockerfile|mcp" ; do
+
+          NAME="$${SPEC%%|*}"
+          REST="$${SPEC#*|}"
+          FILE="$${REST%%|*}"
+          CONTEXT="$${REST#*|}"
+
+          echo "==> $${NAME}  ($${FILE} @ $${CONTEXT})"
+          # cacheonly: a multi-platform result cannot be loaded into the local
+          # image store, and this workflow never publishes.
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f "$${FILE}" \
+            --output type=cacheonly \
+            "$${CONTEXT}"
+        done

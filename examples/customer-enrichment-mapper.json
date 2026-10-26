@@ -1,0 +1,3 @@
+{
+  "sql": "SELECT customer_id, customer_tier, region, risk_segment FROM customer_enrichment WHERE customer_id IN (<foreach collection=\"list\" item=\"customerId\" separator=\",\">#{customerId}</foreach>)"
+}

@@ -1,0 +1,199 @@
+/*
+ * Copyright 2018 Confluent Inc.
+ *
+ * Licensed under the Confluent Community License; you may not use this file
+ * except in compliance with the License.  You may obtain a copy of the License at
+ *
+ * http://www.confluent.io/confluent-community-license
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
+ */
+
+package io.confluent.connect.jdbc.sink;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.Map;
+
+import io.confluent.connect.jdbc.util.EnumRecommender;
+import io.confluent.connect.jdbc.util.TableType;
+
+import org.apache.kafka.common.config.ConfigException;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+
+public class JdbcSinkConfigTest {
+
+  private Map<String, String> props = new HashMap<>();
+  private JdbcSinkConfig config;
+
+  @Before
+  public void beforeEach() {
+    // add the minimum settings only
+    props.put("connection.url", "jdbc:mysql://something"); // we won't connect
+  }
+
+  @After
+  public void afterEach() {
+    props.clear();
+    config = null;
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithoutConnectionUrl() {
+    props.remove(JdbcSinkConfig.CONNECTION_URL);
+    createConfig();
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithEmptyTableNameFormat() {
+    props.put(JdbcSinkConfig.TABLE_NAME_FORMAT, "");
+    createConfig();
+  }
+
+  @Test
+  public void shouldCreateConfigWithMinimalConfigs() {
+    createConfig();
+    assertTableTypes(TableType.TABLE);
+  }
+
+  @Test
+  public void shouldDisableSensitiveLogTrimmingByDefault() {
+    createConfig();
+    assertFalse(config.trimSensitiveLogsEnabled);
+  }
+
+  @Test
+  public void shouldEnableSensitiveLogTrimming() {
+    props.put(JdbcSinkConfig.TRIM_SENSITIVE_LOG_ENABLED, "true");
+    createConfig();
+    assertTrue(config.trimSensitiveLogsEnabled);
+  }
+
+  @Test
+  public void shouldCreateConfigWithHoldlock() {
+    createConfig();
+    assertEquals(true, config.useHoldlockInMerge);
+  }
+
+  @Test
+  public void shouldCreateConfigWithNoHoldlock() {
+    props.put("mssql.use.merge.holdlock", "false");
+    createConfig();
+    assertEquals(false, config.useHoldlockInMerge);
+  }
+
+  @Test
+  public void shouldCreateConfigWithAdditionalConfigs() {
+    props.put("auto.create", "true");
+    props.put("pk.mode", "kafka");
+    props.put("pk.fields", "kafka_topic,kafka_partition,kafka_offset");
+    createConfig();
+    assertTableTypes(TableType.TABLE);
+  }
+
+  @Test
+  public void shouldCreateConfigWithViewOnly() {
+    props.put("table.types", "view");
+    createConfig();
+    assertTableTypes(TableType.VIEW);
+  }
+
+  @Test
+  public void shouldCreateConfigWithTableOnly() {
+    props.put("table.types", "table");
+    createConfig();
+    assertTableTypes(TableType.TABLE);
+  }
+
+  @Test
+  public void shouldCreateConfigWithPartitionedTableOnly() {
+    props.put("table.types", "partitioned table");
+    createConfig();
+    assertTableTypes(TableType.PARTITIONED_TABLE);
+  }
+
+  @Test
+  public void shouldCreateConfigWithViewAndTable() {
+    props.put("table.types", "view,table");
+    createConfig();
+    assertTableTypes(TableType.TABLE, TableType.VIEW);
+    props.put("table.types", "table,view");
+    createConfig();
+    assertTableTypes(TableType.TABLE, TableType.VIEW);
+    props.put("table.types", "table , view");
+    createConfig();
+    assertTableTypes(TableType.TABLE, TableType.VIEW);
+  }
+
+  @Test
+  public void shouldCreateConfigWithLeadingWhitespaceInTableTypes() {
+    props.put("table.types", " \t\n  view");
+    createConfig();
+    assertTableTypes(TableType.VIEW);
+  }
+
+  @Test
+  public void shouldCreateConfigWithTrailingWhitespaceInTableTypes() {
+    props.put("table.types", "table \t \n");
+    createConfig();
+    assertTableTypes(TableType.TABLE);
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithEmptyTableTypes() {
+    props.put("table.types", "");
+    createConfig();
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithInvalidTableType() {
+    props.put("table.types", "not-a-type");
+    createConfig();
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithMixedValidAndInvalidTableTypes() {
+    props.put("table.types", "table,not-a-type");
+    createConfig();
+  }
+
+  @Test
+  public void shouldRejectNullTableType() {
+    // A null element cannot be produced by parsing a config string, so the recommender
+    // that validates table.types is exercised directly for this case.
+    EnumRecommender recommender = EnumRecommender.in(TableType.values());
+    assertThrows(ConfigException.class,
+        () -> recommender.ensureValid("table.types", Collections.singletonList(null)));
+  }
+
+  @Test(expected = ConfigException.class)
+  public void shouldFailToCreateConfigWithInvalidCredentialsProviderClass() {
+    // Configuring SqliteHelper Class here which does not extends JdbcCredentialsProvider Interface
+    props.put(JdbcSinkConfig.CREDENTIALS_PROVIDER_CLASS_CONFIG,
+        SqliteHelper.class.getName());
+    createConfig();
+  }
+
+  protected void createConfig() {
+    config = new JdbcSinkConfig(props);
+  }
+
+  protected void assertTableTypes(TableType...types) {
+    EnumSet<TableType> expected = EnumSet.copyOf(Arrays.asList(types));
+    EnumSet<TableType> tableTypes = config.tableTypes;
+    assertEquals(expected, tableTypes);
+  }
+
+}

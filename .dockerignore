@@ -1,0 +1,9 @@
+.git
+**/.DS_Store
+**/.cargo-home/
+**/target/
+node_modules/
+**/node_modules/
+playwright-report/
+test-results/
+samples/*.sql.gz

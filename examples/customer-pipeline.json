@@ -1,0 +1,80 @@
+{
+  "id": "2ff76698-2ff6-4e48-87be-85dfe4a0bd87",
+  "name": "Customer Trusted View",
+  "input_topic": "cdc.customers.raw",
+  "output_topic": "cdc.customers.trusted.v1",
+  "dead_letter_topic": "cdc.customers.dlq",
+  "consumer_group": "hyper-cdc-customers-v1",
+  "batch": {
+    "max_records": 500,
+    "max_bytes": 4194304,
+    "max_wait_ms": 25
+  },
+  "preserve_partition_order": true,
+  "enabled": true,
+  "stages": [
+    {
+      "id": "transform",
+      "name": "Normalize Customer",
+      "kind": "transform",
+      "execution": "grpc",
+      "endpoint": "http://127.0.0.1:50051",
+      "timeout_ms": 5000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 100,
+        "max_backoff_ms": 2000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true,
+      "attributes": {
+        "contract": "customer-v1",
+        "function": "normalize_customer"
+      }
+    },
+    {
+      "id": "filter",
+      "name": "Keep Active Customers",
+      "kind": "filter",
+      "execution": "grpc",
+      "endpoint": "http://127.0.0.1:50051",
+      "timeout_ms": 5000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 100,
+        "max_backoff_ms": 2000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true,
+      "attributes": {
+        "function": "filter_active",
+        "active_field": "active"
+      }
+    },
+    {
+      "id": "enrich-customer",
+      "name": "Add Customer Tier",
+      "kind": "enrich",
+      "execution": "data_service",
+      "dataservice": {
+        "base_url": "http://127.0.0.1:8080",
+        "datasource": "customer-master",
+        "mapper": "cdc_customer_enrichment_batch",
+        "api_key_env": "DATA_SERVICE_API_KEY",
+        "lookup_field": "customer_id",
+        "lookup_parameter": "list",
+        "result_key_field": "customer_id",
+        "output_field": "customer",
+        "static_parameters": {}
+      },
+      "timeout_ms": 10000,
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff_ms": 200,
+        "max_backoff_ms": 5000
+      },
+      "failure_policy": "dead_letter",
+      "enabled": true
+    }
+  ]
+}

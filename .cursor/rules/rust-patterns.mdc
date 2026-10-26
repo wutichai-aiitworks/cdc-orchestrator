@@ -1,0 +1,108 @@
+---
+description: Rust coding patterns for hyper-cdc-orchestrator source files
+globs: src/**/*.rs,mcp/src/**/*.rs
+alwaysApply: false
+---
+
+# Rust Patterns — hyper-cdc-orchestrator
+
+## Module layout
+
+Modules are declared flat in `main.rs` (binary-local). Only `persist` and `function_runtime` live in `lib.rs` for reuse by the `cdc-processor` binary. Follow the same pattern for new modules.
+
+```
+src/
+  main.rs      ← mod declarations, AppState, router wiring
+  handlers.rs  ← HTTP handlers (thin)
+  models.rs    ← shared DTOs / domain types
+  reconcile.rs ← connector lifecycle domain logic
+  my_new.rs    ← new domain module (declare: `mod my_new;` in main.rs)
+```
+
+## Naming conventions
+
+- Modules: `snake_case` (e.g. `trigger_cdc`, `connector_catalog`)
+- Response structs: `<Noun>Response` (e.g. `EngineStatusResponse`)
+- Request structs: `<Noun>Request` or `<Noun>Params`
+- Env vars: `ORCH_<NAME>` prefix
+
+## Error handling
+
+In **main crate** (`src/`): return `Result<T, AppError>`. Map external errors to the right variant:
+
+```rust
+// ✅ Good
+fn call_connect(url: &str) -> Result<Value, AppError> {
+    let res = client.get(url).send().await
+        .map_err(|e| AppError::Upstream(e.to_string()))?;
+    Ok(res.json().await.map_err(|e| AppError::Internal(e.to_string()))?)
+}
+
+// ❌ Bad — don't add anyhow to main crate
+use anyhow::Result;  // only in mcp/ crate
+```
+
+In **mcp crate** (`mcp/src/`): use `anyhow::Result` and `thiserror::Error` — that crate already depends on them.
+
+## Tracing
+
+Instrument long-running or domain-critical async functions:
+
+```rust
+#[tracing::instrument(skip(state), fields(profile_id = %id))]
+pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Result<(), AppError> {
+    // ...
+}
+```
+
+Use `tracing::info!`, `tracing::warn!`, `tracing::error!` — not `println!` or `eprintln!`.
+
+## No `unwrap()` in production paths
+
+```rust
+// ❌ Bad
+let val = map.get("key").unwrap();
+
+// ✅ Good
+let val = map.get("key")
+    .ok_or_else(|| AppError::NotFound("key not found".into()))?;
+```
+
+`unwrap()` is acceptable only in unit tests and `#[cfg(test)]` blocks.
+
+## Shared state access
+
+`AppState` fields wrapped in `Arc<RwLock<…>>` require explicit lock:
+
+```rust
+// Read
+let snapshots = state.connector_snapshots.read().await;
+
+// Write — hold as briefly as possible
+{
+    let mut history = state.history.write().await;
+    history.push(entry);
+}
+```
+
+## Secret safety
+
+Always call `profile.redact_secrets()` before serializing a profile into any HTTP response.
+
+## Unit tests
+
+Co-locate unit tests in the same file:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_my_fn() {
+        // ...
+    }
+}
+```
+
+API/integration tests live in `tests/api/all-apis.spec.ts` (Playwright).

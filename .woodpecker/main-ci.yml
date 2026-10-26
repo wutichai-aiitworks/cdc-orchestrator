@@ -1,0 +1,115 @@
+when:
+  event: [push, manual]
+
+depends_on:
+  - test
+  - webui
+  - build
+  - sonar
+
+steps:
+  build-and-push:
+    image: docker:27-cli
+    environment:
+      DOCKERHUB_USERNAME:
+        from_secret: DOCKERHUB_USERNAME
+      DOCKERHUB_TOKEN:
+        from_secret: DOCKERHUB_TOKEN
+      REGISTRY_NAMESPACE:
+        from_secret: REGISTRY_NAMESPACE
+    commands:
+      - |
+        set -e
+
+        SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
+        BRANCH="$${CI_COMMIT_BRANCH:-$${CI_COMMIT_TAG:-$${CI_REPO_DEFAULT_BRANCH:-unknown}}}"
+        BRANCH_SAFE="$$(echo "$${BRANCH}" | tr '/' '-')"
+        VERSION="$${BRANCH_SAFE}-$${SHORT_SHA}"
+
+        echo "Commit: $${CI_COMMIT_SHA}"
+        echo "Short: $${SHORT_SHA}"
+        echo "Branch: $${BRANCH_SAFE}"
+        echo "VERSION=$${VERSION}"
+
+        echo "$${DOCKERHUB_TOKEN}" | docker login -u "$${DOCKERHUB_USERNAME}" --password-stdin
+
+        docker buildx create --use --name multiarch || docker buildx use multiarch
+        docker buildx inspect --bootstrap
+
+        # name|dockerfile|build context
+        # Orchestrator and Connect both build from the repo root: docker/Dockerfile
+        # copies Cargo sources; docker/connect/Dockerfile compiles kafka-connect-jdbc/.
+        for SPEC in \
+          "hyper-cdc-orchestrator|docker/Dockerfile|." \
+          "hyper-cdc-connect|docker/connect/Dockerfile|." \
+          "hyper-cdc-webui|kafbat-webui/Dockerfile|kafbat-webui" \
+          "hyper-cdc-mcp|mcp/Dockerfile|mcp" ; do
+
+          NAME="$${SPEC%%|*}"
+          REST="$${SPEC#*|}"
+          FILE="$${REST%%|*}"
+          CONTEXT="$${REST#*|}"
+          IMAGE_NAME="$${REGISTRY_NAMESPACE}/$${NAME}"
+
+          echo "==> $${IMAGE_NAME}:$${VERSION}  ($${FILE} @ $${CONTEXT})"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f "$${FILE}" \
+            -t "$${IMAGE_NAME}:latest" \
+            -t "$${IMAGE_NAME}:$${VERSION}" \
+            --push \
+            "$${CONTEXT}"v 
+        done
+
+  notify-discord:
+    image: curlimages/curl:8.7.1
+    depends_on: [build-and-push]
+    when:
+      status: [success]
+    environment:
+      DISCORD_WEBHOOK:
+        from_secret: DISCORD_WEBHOOK
+      REGISTRY_NAMESPACE:
+        from_secret: REGISTRY_NAMESPACE
+    commands:
+      - |
+        set -e
+        SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
+        BRANCH="$${CI_COMMIT_BRANCH:-$${CI_COMMIT_TAG:-$${CI_REPO_DEFAULT_BRANCH:-unknown}}}"
+        BRANCH_SAFE="$$(echo "$${BRANCH}" | tr '/' '-')"
+        VERSION="$${BRANCH_SAFE}-$${SHORT_SHA}"
+        BUILD_NO="$${CI_PIPELINE_NUMBER:-n/a}"
+        RUN_URL="$${CI_PIPELINE_URL:-$${CI_BUILD_LINK}}"
+        COMMIT_URL="$${CI_COMMIT_LINK:-$${CI_REPO_LINK}/commit/$${CI_COMMIT_SHA}}"
+        TS="$$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        WORKFLOW="$${CI_WORKFLOW_NAME:-main-ci}"
+        NS="$${REGISTRY_NAMESPACE}"
+
+        cat > payload.json <<EOF
+        {
+          "embeds": [
+            {
+              "title": "🚀 hyper-cdc-orchestrator images pushed",
+              "description": "Docker multi-arch publish completed.",
+              "color": 5763719,
+              "fields": [
+                { "name": "Project", "value": "$${CI_REPO_NAME}", "inline": true },
+                { "name": "Branch", "value": "$${BRANCH_SAFE}", "inline": true },
+                { "name": "Triggered by", "value": "$${CI_COMMIT_AUTHOR}", "inline": true },
+                { "name": "Images", "value": "\`$${NS}/hyper-cdc-orchestrator\`\n\`$${NS}/hyper-cdc-connect\`\n\`$${NS}/hyper-cdc-webui\`\n\`$${NS}/hyper-cdc-mcp\`", "inline": false },
+                { "name": "Tags", "value": "\`latest\`, \`$${VERSION}\`", "inline": true },
+                { "name": "Platforms", "value": "\`linux/amd64\`, \`linux/arm64\`", "inline": true },
+                { "name": "Commit", "value": "[\`$${SHORT_SHA}\`]($${COMMIT_URL})", "inline": true },
+                { "name": "Pipeline", "value": "[#$${BUILD_NO}]($${RUN_URL}) · \`$${WORKFLOW}\`", "inline": true }
+              ],
+              "footer": { "text": "Woodpecker CI" },
+              "timestamp": "$${TS}"
+            }
+          ]
+        }
+        EOF
+
+        # One POST only; -f fails the step if Discord returns an error.
+        curl -sSf -X POST "$${DISCORD_WEBHOOK}" \
+          -H "Content-Type: application/json" \
+          --data-binary @payload.json

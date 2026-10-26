@@ -1,0 +1,41 @@
+# Phase 3B overlay for a dedicated native Linux host only.
+#
+# Apply after docker-compose.prod.yaml. This replaces the Redpanda command to
+# remove --overprovisioned. It intentionally retains --check=false until the
+# separate Phase 3C host/filesystem validation is complete.
+#
+# Do not use this overlay with Docker Desktop, a shared Linux host, or a VM with
+# contended vCPUs.
+#
+# Usage:
+#   docker compose \
+#     --env-file .env.production \
+#     -f docker-compose.yaml \
+#     -f docker-compose.prod.yaml \
+#     -f docker-compose.prod-linux.yaml \
+#     config
+
+services:
+  cdc-message:
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "${CDC_REDPANDA_SMP:-1}"
+      - --memory
+      - "${CDC_REDPANDA_MEMORY:-2G}"
+      - --reserve-memory
+      - "${CDC_REDPANDA_RESERVE_MEMORY:-256M}"
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://cdc-message:9092,external://127.0.0.1:${CDC_KAFKA_HOST_PORT:-19092}
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://cdc-message:8082,external://127.0.0.1:18082
+      - --schema-registry-addr
+      - 0.0.0.0:8081
