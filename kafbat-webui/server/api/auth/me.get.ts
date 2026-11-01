@@ -1,4 +1,4 @@
-import { isAuthDisabled } from "~/utils/authMode"
+import { isAuthDisabled, isLocalAuth } from "~/utils/authMode"
 import { getSessionConfig } from "~/server/utils/sessionConfig"
 
 export default defineEventHandler(async (event) => {
@@ -15,6 +15,6 @@ export default defineEventHandler(async (event) => {
     userId: data.userId || "",
     email: data.email || "",
     groups: Array.isArray(data.groups) ? data.groups : [],
-    authProvider: data.authProvider || "sso",
+    authProvider: data.authProvider || (isLocalAuth(cfg) ? "local" : "sso"),
   }
 })

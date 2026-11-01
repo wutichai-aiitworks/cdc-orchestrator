@@ -79,7 +79,8 @@ Detailed workflow: [compendium Ch.14](docs/architecture/hyper-cdc-orchestrator-d
 
 - **Design compendium — every document in one file, with diagrams:**
   [`docs/architecture/hyper-cdc-orchestrator-design.html`](docs/architecture/hyper-cdc-orchestrator-design.html)
-- Frontend workspace: [`kafbat-webui/`](kafbat-webui)
+- Native CDC UI (`cdc-native-ui` service): [`cdc-native-ui/`](cdc-native-ui)
+- Legacy/shared Nuxt workspace: [`kafbat-webui/`](kafbat-webui)
 - Milestone plan, cutover checklist, and Level-2 Kafbat fork workflow:
   compendium [Ch.14](docs/architecture/hyper-cdc-orchestrator-design.html#webui)
 - Production readiness assessment: compendium [Ch.21](docs/architecture/hyper-cdc-orchestrator-design.html#readiness)
@@ -181,7 +182,7 @@ Your Kafka/Connect stack is already on the compose host ports, so this mainly bu
 | Endpoint | URL |
 |----------|-----|
 | Orchestrator | http://127.0.0.1:9788/health |
-| Native UI (kafbat-webui) | http://127.0.0.1:4320 |
+| Native UI (cdc-native-ui) | http://127.0.0.1:4320 |
 | Connect REST | http://127.0.0.1:28083 |
 | Kafbat UI | http://127.0.0.1:4321 |
 | Kafka (Redpanda) | 127.0.0.1:19092 |
@@ -199,7 +200,7 @@ Use this only when iterating on Rust/Nuxt without rebuilding images. Do not run 
 
 ```bash
 ./start.sh --build .env_local
-cd kafbat-webui && ./start.sh --build .env_local
+cd cdc-native-ui && ./start.sh --build .env_local
 ```
 
 ## Guardrails

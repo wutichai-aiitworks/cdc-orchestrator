@@ -227,7 +227,8 @@ pub fn definitions() -> Vec<ToolDef> {
                     "capture_mode":{"type":"string","enum":["logical","trigger","sync_once","incremental"],"default":"logical","description":"logical=WAL CDC; trigger=changelog triggers; sync_once=one-time copy; incremental=JDBC watermark poll (no WAL/triggers; hard deletes not captured)"},
                     "sink_error_policy":{"type":"string","enum":["fail_fast","dlq"],"default":"fail_fast","description":"Source-to-target sink rejected-record behavior. dlq continues processing and requires correction/replay."},
                     "timestamp_column":{"type":"string","description":"Incremental: watermark column such as updated_at"},
-                    "incrementing_column":{"type":"string","description":"Incremental: strictly incrementing PK column such as id. Required for replica upsert."},
+                    "incrementing_column":{"type":"string","description":"Incremental: numeric monotonic column for JDBC poll offset (optional when upsert_key_columns + timestamp_column are set)."},
+                    "upsert_key_columns":{"type":"string","description":"Incremental replica upsert PK on target, comma-separated (text/composite OK), e.g. BRANCH_NO,PRO_CODE. Requires timestamp_column when incrementing_column is omitted."},
                     "stream_platform":{"type":"string","enum":["redpanda","kafka"],"default":"redpanda"},
                     "validate":{"type":"boolean","default":true},
                     "start":{"type":"boolean","default":false,"description":"Enable and start after create"}
@@ -257,7 +258,7 @@ pub fn definitions() -> Vec<ToolDef> {
             "cdc_connector_validate",
             "Validate a connector config before create/update.",
             json!({"type":"object","required":["name","config"],"properties":{"name":{"type":"string"},"config":{"type":"object"}}}),
-            false,
+            true,
         ),
         td(
             "cdc_connector_create",
@@ -980,7 +981,8 @@ async fn pipeline_create(state: &AppState, args: &Value) -> Result<Value, ApiErr
             "schemas": schemas,
             "tables": tables,
             "timestamp_column": args.get("timestamp_column").and_then(Value::as_str),
-            "incrementing_column": args.get("incrementing_column").and_then(Value::as_str)
+            "incrementing_column": args.get("incrementing_column").and_then(Value::as_str),
+            "upsert_key_columns": list_arg(args, "upsert_key_columns")
         },
         "flow": {
             "transforms": [],
@@ -1319,4 +1321,79 @@ fn topics_query(args: &Value) -> String {
         q.push(format!("sort_order={s}"));
     }
     format!("/cdc/topics?{}", q.join("&"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_arg_accepts_arrays_and_csv() {
+        assert_eq!(list_arg(&json!({"t": ["a", " b ", ""]}), "t"), vec!["a", "b"]);
+        assert_eq!(list_arg(&json!({"t": "a, b,,c"}), "t"), vec!["a", "b", "c"]);
+        assert!(list_arg(&json!({}), "t").is_empty());
+        assert!(list_arg(&json!({"t": 5}), "t").is_empty());
+    }
+
+    #[test]
+    fn connection_from_uses_side_prefixed_args_and_numeric_ports() {
+        let c = connection_from(
+            &json!({"source_host": "db1", "source_port": 15432, "source_password": "pw"}),
+            "source",
+        )
+        .unwrap();
+        assert_eq!(c["host"], "db1");
+        assert_eq!(c["port"], "15432");
+        assert_eq!(c["password"], "pw");
+        let t = connection_from(&json!({}), "target").unwrap();
+        assert_eq!(t["host"], "cdc-postgres-target");
+        assert_eq!(t["port"], "5432");
+    }
+
+    #[test]
+    fn db_probe_body_shapes_source_and_target() {
+        let s = db_probe_body(&json!({"source_type": "mysql", "port": "3306"}), "source").unwrap();
+        assert_eq!(s["source_type"], "mysql");
+        assert_eq!(s["schema_mode"], "all_schemas");
+        assert_eq!(s["connection"]["port"], "3306");
+        let t = db_probe_body(&json!({}), "target").unwrap();
+        assert_eq!(t["target_type"], "postgres");
+        assert!(t.get("schema_mode").is_none());
+    }
+
+    #[test]
+    fn destination_depends_on_pattern() {
+        let mut body = json!({});
+        attach_pipeline_destination(&mut body, &json!({}), "source_to_target", "orders").unwrap();
+        assert_eq!(body["target"]["name"], "orders-target");
+        assert!(body["lake"].is_null());
+
+        let mut stream = json!({});
+        attach_pipeline_destination(&mut stream, &json!({}), "source_to_stream", "orders").unwrap();
+        assert!(stream["target"].is_null());
+        assert_eq!(stream["stream_platform"], "redpanda");
+
+        let mut lake = json!({});
+        attach_pipeline_destination(&mut lake, &json!({"lake_zone": "silver"}), "source_to_lake", "orders").unwrap();
+        assert!(lake["target"].is_null());
+        assert_eq!(lake["lake"]["name"], "orders-lake");
+        assert_eq!(lake["lake"]["change_mode"], "upsert");
+    }
+
+    #[test]
+    fn lake_change_mode_defaults_by_zone() {
+        assert_eq!(lake_change_mode(&json!({}), "bronze"), "changelog");
+        assert_eq!(lake_change_mode(&json!({}), "silver"), "upsert");
+        assert_eq!(lake_change_mode(&json!({"lake_change_mode": "append"}), "silver"), "append");
+    }
+
+    #[test]
+    fn every_prompt_has_description_and_messages() {
+        for p in prompts().as_array().unwrap() {
+            let name = p["name"].as_str().unwrap();
+            assert_ne!(prompt_description(name), "CDC prompt", "{name} lacks a description");
+            let args = json!({"table_or_topic": "orders", "name": "p1"});
+            assert!(prompt_messages(name, &args).is_ok(), "{name} prompt_messages failed");
+        }
+    }
 }

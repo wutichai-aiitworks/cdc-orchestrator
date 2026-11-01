@@ -95,6 +95,19 @@ final class JdbcOps {
             DatabaseMetaData meta = conn.getMetaData();
             Set<String> schemas = new LinkedHashSet<>();
             List<TableInfo> tables = new ArrayList<>();
+            try (ResultSet rs = meta.getSchemas()) {
+                while (rs.next()) {
+                    String schema = firstNonBlank(rs.getString("TABLE_SCHEM"), rs.getString(1));
+                    if (schema == null || schema.isBlank() || isSystemSchema(schema)) {
+                        continue;
+                    }
+                    if (!filter.isEmpty()
+                            && !filter.contains(schema.toLowerCase(Locale.ROOT))) {
+                        continue;
+                    }
+                    schemas.add(schema);
+                }
+            }
             try (ResultSet rs = meta.getTables(null, null, "%", new String[] {"TABLE"})) {
                 while (rs.next()) {
                     String schema = schemaName(rs);
@@ -102,21 +115,11 @@ final class JdbcOps {
                     if (name == null || name.isBlank() || isSystemSchema(schema)) {
                         continue;
                     }
-                    schemas.add(schema);
                     if (!filter.isEmpty() && !filter.contains(schema.toLowerCase(Locale.ROOT))) {
                         continue;
                     }
+                    schemas.add(schema);
                     tables.add(new TableInfo(schema, name, primaryKeys(meta, schema, name)));
-                }
-            }
-            if (schemas.isEmpty()) {
-                try (ResultSet rs = meta.getSchemas()) {
-                    while (rs.next()) {
-                        String schema = firstNonBlank(rs.getString("TABLE_SCHEM"), rs.getString(1));
-                        if (schema != null && !isSystemSchema(schema)) {
-                            schemas.add(schema);
-                        }
-                    }
                 }
             }
             return new CatalogResult(new ArrayList<>(schemas), tables);

@@ -18,7 +18,7 @@ steps:
         for SPEC in \
           "hyper-cdc-orchestrator|docker/Dockerfile|." \
           "hyper-cdc-connect|docker/connect/Dockerfile|." \
-          "hyper-cdc-webui|kafbat-webui/Dockerfile|kafbat-webui" \
+          "hyper-cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui" \
           "hyper-cdc-mcp|mcp/Dockerfile|mcp" ; do
 
           NAME="$${SPEC%%|*}"

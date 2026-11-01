@@ -28,7 +28,8 @@ export default defineNuxtPlugin({
         window.location.replace(buildSsoStartPath(next))
         return
       }
-      window.location.replace("/auth/login")
+      const next = sanitizeNextPath(window.location.pathname + window.location.search)
+      window.location.replace(`/auth/login?next=${encodeURIComponent(next)}`)
     }
 
     const guarded = $fetch.create({

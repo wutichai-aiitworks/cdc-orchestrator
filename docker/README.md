@@ -9,7 +9,7 @@ and the native UI are compose profiles.
 ./install.sh --mcp --demo
 ```
 
-`./install.sh`, `./start.sh`, and `./reload-dev.sh` at the repo root are thin wrappers
+`./install.sh`, `./start.sh`, and `./redeploy.sh` at the repo root are thin wrappers
 that forward here.
 
 ## Layout
@@ -26,7 +26,7 @@ that forward here.
 | `init/` | Demo Postgres bootstrap, mounted to `/docker-entrypoint-initdb.d` |
 | `install.sh` | Stack installer |
 | `start.sh` | Local cargo dev runner (`--stack` also brings up compose infra) |
-| `reload-dev.sh` | Rebuild + restart the fast-moving services |
+| `redeploy.sh` | Rebuild orchestrator + native UI (default); checks rqlite health only (never recreates it); `--connect` / `--full` |
 
 ## Running compose directly
 
@@ -62,7 +62,7 @@ Relative paths in `docker-compose.yaml` resolve against `docker/`:
 
 - `./connect`, `./config/...`, `./init` — inside this directory
 - `..` — repo root (orchestrator and Connect build context; Connect compiles `kafka-connect-jdbc/`)
-- `../kafbat-webui`, `../mcp` — sibling source workspaces used as build contexts
+- `../cdc-native-ui` (compose service `cdc-native-ui`), `../kafbat-webui`, `../mcp` — build contexts
 - `../samples` — demo Postgres dumps
 
 `dockerfile:` is relative to its own `context:`, which is why the orchestrator and

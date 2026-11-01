@@ -622,10 +622,15 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_column: Option<String>,
     /// Incremental capture: strictly incrementing column, usually the primary key
-    /// (e.g. `id`). Required for replica upsert. Append-only tables can use this
-    /// without a timestamp column.
+    /// (e.g. `id`). Used for JDBC poll offset when numeric. Append-only tables can
+    /// use this without a timestamp column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incrementing_column: Option<String>,
+    /// Incremental replica upsert key on the target (e.g. `BRANCH_NO,PRO_CODE`).
+    /// Text/composite keys are supported. When set without `incrementing_column`,
+    /// JDBC poll runs in timestamp-only mode and requires `timestamp_column`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upsert_key_columns: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1087,6 +1092,10 @@ pub struct CdcProfile {
     pub flow: FlowConfig,
     pub status: ProfileStatus,
     pub enabled: bool,
+    /// When true, orchestrator brings this pipeline back on process/container boot if it was
+    /// running (and still enabled). When false, use Start manually after a restart.
+    #[serde(default = "default_profile_autostart")]
+    pub autostart: bool,
     pub last_error: Option<String>,
     pub history: Vec<HistoryItem>,
     pub created_at: DateTime<Utc>,
@@ -1211,6 +1220,7 @@ mod tests {
             changelog_retention_hours: None,
             timestamp_column: None,
             incrementing_column: None,
+            upsert_key_columns: vec![],
         };
         assert_eq!(
             source.capture_identity(),
@@ -1454,11 +1464,17 @@ pub struct StateTransition {
     pub snapshot: ConnectorSnapshot,
 }
 
+fn default_profile_autostart() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProfileUpsertRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub autostart: Option<bool>,
     pub pattern: Option<ProfilePattern>,
     pub stream_platform: Option<StreamPlatform>,
     pub transform_strategy: Option<TransformStrategy>,
@@ -1642,6 +1658,9 @@ pub struct CopyDataRequest {
     /// Use when copying large tables directly instead of via CDC SyncOnce.
     #[serde(default)]
     pub force_direct_copy: bool,
+    /// Optional cap per table (connectivity / test loads). No Kafka, no source triggers.
+    #[serde(default)]
+    pub max_rows: Option<u64>,
 }
 
 fn default_copy_batch_size() -> usize {

@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::audit::log_action;
+use crate::audit::{detail_json, emit, log_action, new_event, profile_snapshot};
 use crate::command::run_docker;
 use crate::connector_catalog;
 use crate::connector_meta::{self, ConnectorKind};
@@ -1261,6 +1261,7 @@ pub async fn list_profiles(
 ) -> Result<Json<ProfilesResponse>, AppError> {
     let mut profiles = state.profiles.list().await?;
     for p in &mut profiles {
+        crate::incremental_cdc::hydrate_upsert_keys_from_mappings(p);
         p.redact_secrets();
     }
     Ok(Json(ProfilesResponse {
@@ -1278,6 +1279,7 @@ pub async fn get_profile(
         .get(id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    crate::incremental_cdc::hydrate_upsert_keys_from_mappings(&mut profile);
     profile.redact_secrets();
     Ok(Json(ProfileResponse {
         profile,
@@ -1303,12 +1305,15 @@ pub async fn delete_profile(
     let name = profile.name.clone();
     state.profiles.delete(id).await?;
     let actor = actor_from_headers(&headers);
-    log_action(
+    let event = new_event(
         &actor,
         "profile.delete",
         "success",
-        &format!("profile={name}"),
+        &detail_json(json!({ "profile_name": name, "profile_id": id.to_string() })),
+        Some(id),
+        Some(name.as_str()),
     );
+    emit(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1320,14 +1325,20 @@ pub async fn create_profile(
     validate_profile_payload(&payload, false)?;
     reject_dual_source_capture(&state, None, &payload).await?;
     let mut profile = build_profile(None, payload)?;
+    crate::incremental_cdc::hydrate_upsert_keys_from_mappings(&mut profile);
     state.profiles.upsert(&profile).await?;
     let actor = actor_from_headers(&headers);
-    log_action(
+    let pid = profile.id;
+    let pname = profile.name.clone();
+    let event = new_event(
         &actor,
         "profile.create",
         "success",
-        &format!("profile={}", profile.name),
+        &detail_json(json!({ "profile": profile_snapshot(&profile) })),
+        Some(pid),
+        Some(pname.as_str()),
     );
+    emit(&state, event).await;
     profile.redact_secrets();
 
     Ok(Json(ProfileResponse {
@@ -1404,6 +1415,7 @@ pub async fn create_profile_from_case(
                 full_refresh_minutes: None,
             },
         },
+        autostart: None,
     };
     validate_profile_payload(&request, true)?;
     reject_dual_source_capture(&state, None, &request).await?;
@@ -1463,6 +1475,7 @@ pub async fn update_profile(
     let old_lake_conn = profile.lake.as_ref().map(|l| l.connection.clone());
     let mut new_source = payload.source;
     preserve_secret_fields(&mut new_source.connection, &old_source_conn);
+    merge_incremental_source_fields(&profile.source, &mut new_source);
     profile.source = new_source;
 
     profile.target = merge_profile_target(&profile.name, payload.target, old_target_conn.as_ref());
@@ -1471,8 +1484,12 @@ pub async fn update_profile(
     if let Some(policy) = payload.sink_error_policy {
         profile.sink_error_policy = policy;
     }
+    if let Some(autostart) = payload.autostart {
+        profile.autostart = autostart;
+    }
 
     profile.flow = payload.flow;
+    crate::incremental_cdc::hydrate_upsert_keys_from_mappings(&mut profile);
     profile.updated_at = Utc::now();
     profile.push_history(HistoryItem {
         timestamp: Utc::now(),
@@ -1488,12 +1505,15 @@ pub async fn update_profile(
     }
     state.profiles.upsert(&profile).await?;
     let actor = actor_from_headers(&headers);
-    log_action(
+    let event = new_event(
         &actor,
         "profile.update",
         "success",
-        &format!("profile={}", profile.name),
+        &detail_json(json!({ "profile": profile_snapshot(&profile) })),
+        Some(profile.id),
+        Some(profile.name.as_str()),
     );
+    emit(&state, event).await;
     profile.redact_secrets();
 
     Ok(Json(ProfileResponse {
@@ -1527,6 +1547,7 @@ pub async fn set_profile_enabled(
         detail: format!("Profile enabled set to {}", payload.enabled),
     });
 
+    let actor = actor_from_headers(&headers);
     if payload.enabled {
         if let Err(e) = reconcile::apply_profile_action(&state, &mut profile, "start").await {
             if profile.status != ProfileStatus::Draft {
@@ -1534,24 +1555,61 @@ pub async fn set_profile_enabled(
             }
             profile.last_error = Some(e.to_string_message());
             state.profiles.upsert(&profile).await?;
+            emit(
+                &state,
+                new_event(
+                    &actor,
+                    "profile.enable",
+                    "failure",
+                    &detail_json(json!({
+                        "error": e.to_string_message(),
+                        "enabled": true,
+                        "profile": profile_snapshot(&profile),
+                    })),
+                    Some(profile.id),
+                    Some(profile.name.as_str()),
+                ),
+            )
+            .await;
             return Err(e);
         }
     } else if profile.status == ProfileStatus::Running {
         if let Err(e) = reconcile::apply_profile_action(&state, &mut profile, "pause").await {
             profile.last_error = Some(e.to_string_message());
             state.profiles.upsert(&profile).await?;
+            emit(
+                &state,
+                new_event(
+                    &actor,
+                    "profile.enable",
+                    "failure",
+                    &detail_json(json!({
+                        "error": e.to_string_message(),
+                        "enabled": false,
+                        "profile": profile_snapshot(&profile),
+                    })),
+                    Some(profile.id),
+                    Some(profile.name.as_str()),
+                ),
+            )
+            .await;
             return Err(e);
         }
     }
 
     state.profiles.upsert(&profile).await?;
-    let actor = actor_from_headers(&headers);
-    log_action(
+    let event = new_event(
         &actor,
         "profile.enable",
         "success",
-        &format!("profile={} enabled={}", profile.name, payload.enabled),
+        &detail_json(json!({
+            "enabled": payload.enabled,
+            "profile": profile_snapshot(&profile),
+        })),
+        Some(profile.id),
+        Some(profile.name.as_str()),
     );
+    emit(&state, event).await;
     profile.redact_secrets();
 
     Ok(Json(ProfileResponse {
@@ -1565,6 +1623,61 @@ pub struct ProfileActionParams {
     /// Only honoured by `resync`: empty the target tables before replaying.
     #[serde(default)]
     pub clear_target: bool,
+    /// Trigger/incremental test load: cap rows copied per table on `resync`, or on `start`/`restart`
+    /// after connectors come up (test initial sync).
+    #[serde(default)]
+    pub row_limit: Option<u64>,
+}
+
+const RESYNC_ROW_LIMIT_MAX: u64 = 100_000;
+
+fn validate_resync_params(params: &ProfileActionParams) -> Result<(), AppError> {
+    if let Some(limit) = params.row_limit {
+        if limit == 0 || limit > RESYNC_ROW_LIMIT_MAX {
+            return Err(AppError::BadRequest(format!(
+                "row_limit must be between 1 and {RESYNC_ROW_LIMIT_MAX}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn profile_audit_action_name(action: &str, params: &ProfileActionParams) -> &'static str {
+    match action {
+        "start" if params.row_limit.is_some() => "profile.test_initial_sync",
+        "restart" if params.row_limit.is_some() => "profile.test_initial_sync",
+        "resync" => "profile.resync",
+        "start" => "profile.start",
+        "stop" => "profile.stop",
+        "pause" => "profile.pause",
+        "resume" => "profile.resume",
+        "restart" => "profile.restart",
+        _ => "profile.action",
+    }
+}
+
+fn profile_audit_detail(
+    profile: &crate::models::CdcProfile,
+    action: &str,
+    params: &ProfileActionParams,
+) -> String {
+    let history_tail = profile.history.last().map(|h| {
+        json!({
+            "event": h.event,
+            "level": h.level,
+            "detail": h.detail,
+            "timestamp": h.timestamp.to_rfc3339(),
+        })
+    });
+    detail_json(json!({
+        "requested_action": action,
+        "params": {
+            "clear_target": params.clear_target,
+            "row_limit": params.row_limit,
+        },
+        "profile": profile_snapshot(profile),
+        "history_tail": history_tail,
+    }))
 }
 
 pub async fn profile_action(
@@ -1583,29 +1696,70 @@ pub async fn profile_action(
         validate_profile_payload(&upsert_from_profile(&profile), true)?;
     }
 
+    let audit_action = profile_audit_action_name(&action, &params);
+
     let outcome = if action == "resync" {
-        reconcile::reconcile_resync(&state, &mut profile, params.clear_target).await
+        validate_resync_params(&params)?;
+        reconcile::reconcile_resync(
+            &state,
+            &mut profile,
+            params.clear_target,
+            params.row_limit,
+        )
+        .await
+    } else if (action == "start" || action == "restart") && params.row_limit.is_some() {
+        validate_resync_params(&params)?;
+        reconcile::reconcile_start_with_test_sync(
+            &state,
+            &mut profile,
+            &action,
+            params.clear_target,
+            params.row_limit,
+        )
+        .await
     } else {
         reconcile::apply_profile_action(&state, &mut profile, &action).await
     };
 
+    let actor = actor_from_headers(&headers);
     if let Err(e) = outcome {
         if profile.status != ProfileStatus::Draft {
             profile.status = ProfileStatus::Failed;
         }
         profile.last_error = Some(e.to_string_message());
         let _ = state.profiles.upsert(&profile).await;
+        let fail_detail = detail_json(json!({
+            "error": e.to_string_message(),
+            "requested_action": action,
+            "params": {
+                "clear_target": params.clear_target,
+                "row_limit": params.row_limit,
+            },
+            "profile": profile_snapshot(&profile),
+        }));
+        let event = new_event(
+            &actor,
+            audit_action,
+            "failure",
+            &fail_detail,
+            Some(profile.id),
+            Some(profile.name.as_str()),
+        );
+        emit(&state, event).await;
         return Err(e);
     }
 
     state.profiles.upsert(&profile).await?;
-    let actor = actor_from_headers(&headers);
-    log_action(
+    let audit_detail = profile_audit_detail(&profile, &action, &params);
+    let event = new_event(
         &actor,
-        &format!("profile.{action}"),
+        audit_action,
         "success",
-        &format!("profile={}", profile.name),
+        &audit_detail,
+        Some(profile.id),
+        Some(profile.name.as_str()),
     );
+    emit(&state, event).await;
     profile.redact_secrets();
 
     Ok(Json(ProfileResponse {
@@ -1740,6 +1894,7 @@ fn source_config_from_target(target: TargetConfig) -> SourceConfig {
         changelog_retention_hours: None,
         timestamp_column: None,
         incrementing_column: None,
+        upsert_key_columns: vec![],
     }
 }
 
@@ -2481,6 +2636,49 @@ fn merge_profile_lake(
     Some(new_lake)
 }
 
+/// Keep stored JDBC watermark columns when an incremental profile update omits them
+/// (e.g. draft save from a wizard step that did not re-post source fields).
+fn merge_incremental_source_fields(existing: &SourceConfig, incoming: &mut SourceConfig) {
+    use crate::models::CaptureMode;
+    if incoming.capture_mode != CaptureMode::Incremental
+        && existing.capture_mode != CaptureMode::Incremental
+    {
+        return;
+    }
+    if existing.capture_mode == CaptureMode::Incremental
+        && incoming.capture_mode != CaptureMode::Incremental
+    {
+        incoming.capture_mode = CaptureMode::Incremental;
+    }
+    let inc_empty = incoming
+        .incrementing_column
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    let ts_empty = incoming
+        .timestamp_column
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    if ts_empty {
+        if let Some(ts) = existing.timestamp_column.as_ref().filter(|s| !s.trim().is_empty()) {
+            incoming.timestamp_column = Some(ts.clone());
+        }
+    }
+    if incoming.upsert_key_columns.is_empty() && !existing.upsert_key_columns.is_empty() {
+        incoming.upsert_key_columns = existing.upsert_key_columns.clone();
+    }
+    if inc_empty {
+        if let Some(inc) = existing
+            .incrementing_column
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            incoming.incrementing_column = Some(inc.clone());
+        }
+    }
+}
+
 fn validate_profile_payload(payload: &ProfileUpsertRequest, strict: bool) -> Result<(), AppError> {
     if strict && payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("profile name is required".to_string()));
@@ -2569,6 +2767,7 @@ fn upsert_from_profile(profile: &crate::models::CdcProfile) -> ProfileUpsertRequ
         governance: Some(profile.governance.clone()),
         sink_error_policy: Some(profile.sink_error_policy),
         flow: profile.flow.clone(),
+        autostart: Some(profile.autostart),
     }
 }
 
@@ -2621,6 +2820,7 @@ fn build_profile(
         flow: payload.flow,
         status: ProfileStatus::Draft,
         enabled: true,
+        autostart: payload.autostart.unwrap_or(true),
         last_error: None,
         history: vec![HistoryItem {
             timestamp: now,
@@ -2803,6 +3003,7 @@ mod tests {
                 changelog_retention_hours: None,
                 timestamp_column: None,
                 incrementing_column: None,
+                upsert_key_columns: vec![],
             },
             target: Some(TargetConfig {
                 name: String::new(),
@@ -2822,6 +3023,7 @@ mod tests {
                     full_refresh_minutes: None,
                 },
             },
+            autostart: None,
         }
     }
 
@@ -2857,8 +3059,37 @@ mod tests {
         assert!(validate_profile_payload(&payload, true).is_err());
         payload.source.timestamp_column = Some("updated_at".into());
         assert!(validate_profile_payload(&payload, true).is_err());
+        payload.source.upsert_key_columns = vec!["id".into()];
+        assert!(validate_profile_payload(&payload, true).is_ok());
+        payload.source.upsert_key_columns = vec![];
         payload.source.incrementing_column = Some("id".into());
         assert!(validate_profile_payload(&payload, true).is_ok());
+    }
+
+    #[test]
+    fn merge_incremental_preserves_upsert_keys_when_omitted_on_update() {
+        use crate::models::{
+            CaptureMode, SchemaSelectionMode, SourceConfig, TableSelectionMode,
+        };
+        let existing = SourceConfig {
+            source_type: "oracle".into(),
+            connection: HashMap::new(),
+            capture_mode: CaptureMode::Incremental,
+            schema_mode: SchemaSelectionMode::SpecificSchemas,
+            table_mode: TableSelectionMode::SpecificTables,
+            schemas: vec![],
+            tables: vec!["PANDORA.PM_PRODUCT".into()],
+            changelog_retention_hours: None,
+            timestamp_column: Some("UPDATE_DATE".into()),
+            incrementing_column: None,
+            upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
+        };
+        let mut incoming = existing.clone();
+        incoming.upsert_key_columns = vec![];
+        incoming.timestamp_column = None;
+        merge_incremental_source_fields(&existing, &mut incoming);
+        assert_eq!(incoming.upsert_key_columns, existing.upsert_key_columns);
+        assert_eq!(incoming.timestamp_column.as_deref(), Some("UPDATE_DATE"));
     }
 }
 
@@ -2973,6 +3204,13 @@ pub async fn copy_compare_data(
     if req.tables.is_empty() {
         return Err(AppError::BadRequest("tables list must not be empty".into()));
     }
+    if let Some(limit) = req.max_rows {
+        if limit == 0 || limit > 100_000 {
+            return Err(AppError::BadRequest(
+                "max_rows must be between 1 and 100000".into(),
+            ));
+        }
+    }
 
     let mut src_conn = HashMap::new();
     src_conn.insert("host".to_string(), req.source.host.clone());
@@ -3010,6 +3248,7 @@ pub async fn copy_compare_data(
                 &spec.name,
                 req.batch_size,
                 req.truncate_before_copy,
+                req.max_rows,
             ),
         )
         .await

@@ -376,6 +376,7 @@ mod tests {
 
     fn lake_profile(zone: LakeZone, mode: ChangeMode, format: TableFormat) -> CdcProfile {
         CdcProfile {
+            autostart: true,
             id: Uuid::new_v4(),
             name: "Commerce Orders".into(),
             description: "lake landing".into(),
@@ -399,6 +400,7 @@ mod tests {
                 changelog_retention_hours: None,
                 timestamp_column: None,
                 incrementing_column: None,
+                upsert_key_columns: vec![],
             },
             target: None,
             lake: Some(LakeDestination {

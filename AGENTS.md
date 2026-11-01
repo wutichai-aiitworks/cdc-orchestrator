@@ -31,7 +31,41 @@ Instructions for AI coding agents working with the CDC control plane.
 | `mcp/README.md` | MCP crate / tool list |
 | `INSTALL.md` | Compose install (`--mcp --demo`) + `docker/` layout |
 | `.woodpecker/README.md` | CI workflows, published images, required secrets |
+| `docs/adr/0002-native-ui-local-auth.md` | Native WebUI login (`AUTH_MODE=local`), threat model, decisions |
+| `docs/testing/api-test-plan.md` | How to run tests, coverage map, **known-bug register** (B-xx) and fix order |
 
 ## Demo defaults (compose profile `demo`)
 
 Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`, schema `bookings`.
+
+## Native WebUI (Nuxt, `:4320`)
+
+1. **Two trees, kept in sync.** `cdc-native-ui/` is what compose and CI build; `kafbat-webui/` is kept too. Any change to shared files (auth, layout shell, `assets/css/main.css`) goes into **both**. Finish with `scripts/check-native-ui-parity.sh` (exit 0 = in sync; `--diff` shows drift). Do not delete or merge either tree unless asked.
+2. **Auth modes:** `AUTH_MODE = none | local | sso`. `local` = env-only `ADMIN_USERNAME` / `ADMIN_PASSWORD` (default `admin` / `admin`). Decisions and rejected options live in ADR 0002 — don't re-propose forced password change, hashing, or public exposure unless the deployment model changes.
+3. **Threat model:** internal/VPN, single operator, direct `:4320`. Lockout keys on socket IP; `TRUST_PROXY=true` only behind a proxy that overwrites `X-Forwarded-For`.
+4. **Orchestrator token:** `docker/install.sh` generates `ORCH_API_TOKEN` into `docker/.env` if missing. Host-side callers of `:9788` need `Authorization: Bearer $ORCH_API_TOKEN`.
+5. **UI conventions:** icons `class="h-4 w-4" :stroke-width="1.75"`; brand chips `bg-brand-500/10 text-primary`; focus `ring-1 ring-ring`; popovers teleport to body (see `AppInfoHint`, `AppUserMenu`); reuse `.icon-button`, `.avatar`, `.menu-panel`, `.menu-item`, `.auth-input`, `.btn-primary`, `.alert-*` instead of ad-hoc classes.
+6. **Verify:** `npm run build` then run `.output` with `AUTH_MODE=local node map-env.mjs ./.output/server/index.mjs` and exercise `/api/auth/login`, `/api/auth/me`, `/api/auth/logout`. Don't commit unless asked.
+
+## Testing
+
+1. **Offline gate:** `npm run check` — OpenAPI route coverage (`scripts/check-openapi-routes.mjs`), native-UI parity, Rust unit tests (orchestrator + `mcp/`). Must pass before finishing any change.
+2. **Live API:** `npm run test:api` (strict, self-cleaning `pw-` fixtures). `npm run test:api:e2e` also starts pipelines against demo DBs. Engine up/restart/down only with `ORCH_TEST_ALLOW_ENGINE=true` — never on a shared stack.
+3. **New `/cdc` route ⇒ document it** in `docs/openapi.yaml` (the route check fails otherwise), then regenerate JSON in both UI trees (`node scripts/generate-openapi.mjs`).
+4. **Known bugs are `test.fail(...)`** tied to IDs in `docs/testing/api-test-plan.md`. When you fix one, remove its annotation (the test turns red until you do) and update the register.
+5. Never point tests at objects you didn't create; the stack may hold real customer profiles.
+
+### Short prompts that work
+
+| Say | Agent does |
+|-----|-----------|
+| "check native ui parity" | Run `scripts/check-native-ui-parity.sh --diff`, report/offer to sync drift |
+| "sync native ui auth" | Copy the shared files from the newer tree to the other, re-run parity |
+| "change admin password / username" | Set `ADMIN_PASSWORD` / `ADMIN_USERNAME` in `docker/.env`, recreate `cdc-native-ui` |
+| "enable local login" | Set `AUTH_MODE=local` in `docker/.env`, recreate `cdc-native-ui` |
+| "native ui behind proxy" | Set `TRUST_PROXY=true`; re-check ADR 0002 "Revisit when" |
+| "grill native ui auth" | Re-read ADR 0002, interview only on what changed since |
+| "run all tests" | `npm run check` then `npm run test:api`; report pass/fail + any `test.fail` that flipped |
+| "run e2e" | `npm run test:api:e2e`, then verify no `pw-` leftovers (profiles, connectors, slots, topics, schemas) |
+| "fix B-02" (any B-xx) | Read the register row, fix, remove its `test.fail`, run `check` + `test:api:e2e`, update register |
+| "what's not tested" | Read "Not covered yet" in the test plan and re-check against current routes |

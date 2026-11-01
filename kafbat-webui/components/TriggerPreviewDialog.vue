@@ -126,17 +126,13 @@ const confirmLabel = computed(() => {
         <p v-if="error || installError" class="mb-3 shrink-0 text-sm text-red-700 dark:text-red-400">
           {{ installError || error }}
         </p>
-        <p
+        <AppContextHint
           v-else-if="preview"
-          class="mb-3 shrink-0 rounded-xl border px-3 py-2 text-sm"
-          :class="
-            preview.will_execute
-              ? 'border-yellow-500/30 bg-yellow-500/10 text-yellow-800 dark:text-yellow-300'
-              : 'border-blue-500/25 bg-blue-500/10 text-blue-700 dark:text-blue-400'
-          "
-        >
-          {{ preview.message }}
-        </p>
+          class="mb-3 shrink-0"
+          :tone="preview.will_execute ? 'yellow' : 'blue'"
+          :label="preview.will_execute ? 'Trigger install' : 'Preview'"
+          :hint="preview.message"
+        />
 
         <div v-if="preview" class="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-2">
           <div class="min-w-0 text-sm">

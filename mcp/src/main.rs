@@ -514,10 +514,129 @@ pub(crate) async fn orch(
 }
 
 pub(crate) fn urlencoding_simple(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
+    // Percent-encode UTF-8 bytes, not chars: `c as u8` truncated non-ASCII names (e.g. Thai).
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn state(allow_write: bool) -> AppState {
+        let cfg = Arc::new(Config {
+            bind_addr: "127.0.0.1:0".into(),
+            bearer_token: "test-token-that-is-long-enough-123".into(),
+            allow_write,
+            // Unroutable: any tool that skips guard_write fails with a connection error instead.
+            orchestrator_url: "http://127.0.0.1:1".into(),
+            orchestrator_token: None,
+            cors_origins: vec![],
+            rate_limit_enabled: false,
+            rate_limit_rpm: 60,
+        });
+        AppState {
+            cfg: cfg.clone(),
+            http: Client::builder().timeout(Duration::from_millis(500)).build().unwrap(),
+            sessions: Arc::new(RwLock::new(HashSet::new())),
+            rate_limit: Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit_rpm))),
+        }
+    }
+
+    /// Superset of argument names used across tools so arg parsing never masks the guard.
+    fn generous_args() -> Value {
+        json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "profile_id": "00000000-0000-0000-0000-000000000000",
+            "name": "mcp-test", "tool_id": "pgcopy", "job_id": "job-1",
+            "topic": "mcp-test-topic", "group": "mcp-test-group", "task": 0,
+            "action": "pause", "statement": "SELECT 1", "ksql": "SHOW STREAMS;",
+            "tables": ["public.t"], "schemas": ["public"], "value": "{}",
+            "enabled": true, "level": "INFO", "logger": "root",
+        })
+    }
+
+    #[test]
+    fn tool_names_are_unique_prefixed_and_documented() {
+        let defs = tools::definitions();
+        let mut seen = HashSet::new();
+        for d in &defs {
+            assert!(d.name.starts_with("cdc_"), "{} must start with cdc_", d.name);
+            assert!(seen.insert(d.name.clone()), "duplicate tool {}", d.name);
+            assert!(d.description.len() >= 10, "{} needs a description", d.name);
+            assert_eq!(d.input_schema["type"], "object", "{} input schema", d.name);
+            assert!(d.annotations["readOnlyHint"].is_boolean(), "{} readOnlyHint", d.name);
+        }
+    }
+
+    #[test]
+    fn required_args_exist_in_properties() {
+        for d in tools::definitions() {
+            let props = d.input_schema["properties"].as_object().cloned().unwrap_or_default();
+            for req in d.input_schema["required"].as_array().cloned().unwrap_or_default() {
+                let key = req.as_str().unwrap();
+                assert!(props.contains_key(key), "{}: required `{key}` missing from properties", d.name);
+            }
+        }
+    }
+
+    #[test]
+    fn every_tool_is_dispatched() {
+        let src = include_str!("tools.rs");
+        for d in tools::definitions() {
+            assert!(
+                src.contains(&format!("\"{}\" =>", d.name)),
+                "tool {} is advertised but has no match arm in tools::call",
+                d.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_tools_refuse_when_writes_disabled() {
+        let st = state(false);
+        let mut unguarded = Vec::new();
+        for d in tools::definitions() {
+            if d.annotations["readOnlyHint"] == json!(true) {
+                continue;
+            }
+            let call = ToolCall { name: d.name.clone(), arguments: generous_args() };
+            match tools::call(&st, call).await {
+                Err(ApiError::Message(m)) if m.contains("write tools disabled") => {}
+                other => unguarded.push(format!("{} → {:?}", d.name, other.map(|_| "ok"))),
+            }
+        }
+        assert!(unguarded.is_empty(), "write tools without guard_write:\n{}", unguarded.join("\n"));
+    }
+
+    #[test]
+    fn url_encoding_handles_utf8_and_reserved() {
+        assert_eq!(urlencoding_simple("cdc-orders_v1.2~x"), "cdc-orders_v1.2~x");
+        assert_eq!(urlencoding_simple("a b/c?d"), "a%20b%2Fc%3Fd");
+        assert_eq!(urlencoding_simple("ทด"), "%E0%B8%97%E0%B8%94");
+    }
+
+    #[test]
+    fn weak_secrets_are_detected() {
+        assert!(is_weak_secret(""));
+        assert!(is_weak_secret("change-me-mcp-cdc-token"));
+        assert!(is_weak_secret("short"));
+        assert!(!is_weak_secret("a-perfectly-long-random-token-123456"));
+    }
+
+    #[test]
+    fn bearer_check_is_exact() {
+        let mut h = HeaderMap::new();
+        assert!(!bearer_ok(&h, "secret-token"));
+        h.insert(header::AUTHORIZATION, "Bearer secret-token".parse().unwrap());
+        assert!(bearer_ok(&h, "secret-token"));
+        assert!(!bearer_ok(&h, "secret-token-2"));
+        h.insert(header::AUTHORIZATION, "Basic secret-token".parse().unwrap());
+        assert!(!bearer_ok(&h, "secret-token"));
+    }
 }

@@ -190,6 +190,11 @@ html:not(.dark) {
     border-color: color-mix(in oklab, var(--destructive) 30%, transparent);
   }
 
+  .row-error {
+    background-color: color-mix(in oklab, var(--destructive) 5%, transparent);
+    border-color: color-mix(in oklab, var(--destructive) 30%, transparent);
+  }
+
   .alert-success {
     @apply border rounded-xl px-4 py-3 text-emerald-700 dark:text-emerald-400 text-sm flex items-center gap-2
            bg-emerald-500/10 border-emerald-500/30;
@@ -303,6 +308,26 @@ html:not(.dark) {
     @apply inline-flex h-9 w-9 items-center justify-center rounded-xl border border-border
            bg-card text-muted-foreground hover:bg-accent hover:text-foreground
            transition-colors focus:outline-none focus:ring-1 focus:ring-ring;
+  }
+
+  .avatar {
+    @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full
+           border border-border bg-brand-500/10 text-xs font-display font-semibold text-primary;
+  }
+
+  button.avatar {
+    @apply hover:bg-brand-500/20 transition-colors focus:outline-none focus:ring-1 focus:ring-ring;
+  }
+
+  .menu-panel {
+    @apply fixed z-[80] rounded-xl border border-border bg-popover p-1
+           text-popover-foreground shadow-lg animate-slide-down;
+  }
+
+  .menu-item {
+    @apply flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-foreground
+           hover:bg-accent transition-colors
+           focus:outline-none focus:ring-1 focus:ring-inset focus:ring-ring;
   }
 }
 

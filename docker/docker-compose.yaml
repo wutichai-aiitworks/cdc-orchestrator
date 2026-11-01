@@ -296,9 +296,9 @@ services:
 
   # ── Native Level-3 WebUI (optional) ───────────────────────────
   cdc-native-ui:
-    image: ${CDC_NATIVE_UI_IMAGE:-kafbat-webui:local}
+    image: ${CDC_NATIVE_UI_IMAGE:-cdc-native-ui:local}
     build:
-      context: ../kafbat-webui
+      context: ../cdc-native-ui
       dockerfile: Dockerfile
     container_name: cdc-native-ui
     profiles: ["native-ui"]
@@ -313,16 +313,23 @@ services:
       ORCHESTRATOR_URL: http://cdc-orchestrator:9788
       PUBLIC_ORCHESTRATOR_URL: http://127.0.0.1:${CDC_ORCHESTRATOR_PORT:-9788}
       ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
-      AUTH_MODE: ${AUTH_MODE:-none}
+      # Same names as dataservice-admin. Defaults talk to that SuperTokens app.
+      # SSO_CALLBACK_URL must be listed on the app redirect URIs.
+      AUTH_MODE: ${AUTH_MODE:-sso}
       ALLOW_OPEN_AUTH: ${ALLOW_OPEN_AUTH:-true}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # true only behind a reverse proxy that overwrites X-Forwarded-For
+      TRUST_PROXY: ${TRUST_PROXY:-false}
       SESSION_SECRET: ${SESSION_SECRET:-}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
       SSO_PROVIDER: ${SSO_PROVIDER:-supertokens_gateway}
-      SSO_APP_ID: ${SSO_APP_ID:-}
-      SSO_LOGIN_URL: ${SSO_LOGIN_URL:-}
-      SSO_CALLBACK_URL: ${SSO_CALLBACK_URL:-}
-      SSO_EXCHANGE_URL: ${SSO_EXCHANGE_URL:-}
+      SSO_APP_ID: ${SSO_APP_ID:-8755327f-0c3f-4efb-9e83-6a7458454b9a}
+      SSO_LOGIN_URL: ${SSO_LOGIN_URL:-https://access.business-iq.work/auth/login}
+      SSO_CALLBACK_URL: ${SSO_CALLBACK_URL:-http://127.0.0.1:4320/auth/callback}
+      SSO_EXCHANGE_URL: ${SSO_EXCHANGE_URL:-http://proxy-supertokens-gateway:1900/auth/custom-sso/exchange}
       SSO_APP_SECRET: ${SSO_APP_SECRET:-}
+      SSO_TOKEN_URL: ${SSO_TOKEN_URL:-}
       SSO_EXCHANGE_TIMEOUT_MS: ${SSO_EXCHANGE_TIMEOUT_MS:-12000}
       SSO_EXCHANGE_DEBUG: ${SSO_EXCHANGE_DEBUG:-}
       AUTHELIA_AUTHORIZE_URL: ${AUTHELIA_AUTHORIZE_URL:-}
@@ -338,17 +345,31 @@ services:
   cdc-rqlite:
     image: ${CDC_RQLITE_IMAGE:-rqlite/rqlite:8.36.16}
     container_name: cdc-rqlite
+    hostname: cdc-rqlite
+    command:
+      - rqlited
+      - -node-id=1
+      - -http-addr=0.0.0.0:4001
+      - -http-adv-addr=cdc-rqlite:4001
+      - -raft-addr=0.0.0.0:4002
+      - -raft-adv-addr=cdc-rqlite:4002
+      - -bootstrap-expect=1
+      - /rqlite/file/data
     ports:
       - "${CDC_RQLITE_HOST_PORT:-14001}:4001"
     volumes:
       - cdc-rqlite-data:/rqlite/file
     networks: [server_zone]
     healthcheck:
-      test: ["CMD", "rqlite", "-H", "127.0.0.1", "-p", "4001", "-e", "SELECT 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- --post-data='[\"SELECT 1\"]' --header='Content-Type: application/json' 'http://127.0.0.1:4001/db/execute?level=strong' | grep -q '\"results\"'",
+        ]
       interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     restart: unless-stopped
 
   # ── Redis (offsets / cache helpers) ────────────────────────────
@@ -533,7 +554,8 @@ services:
       ORCH_CONTAINER_REDIS: cdc-redis
       ORCH_COMMAND_TIMEOUT_SECS: ${ORCH_COMMAND_TIMEOUT_SECS:-30}
       ORCH_API_TOKEN: ${ORCH_API_TOKEN:-}
-      ORCH_RQLITE_URL: ${ORCH_RQLITE_URL:-http://cdc-rqlite:4001}
+      # Always in-cluster URL (ignore host .env ORCH_RQLITE_URL=127.0.0.1 for cargo).
+      ORCH_RQLITE_URL: http://cdc-rqlite:4001
       ORCH_JDBC_ADMIN_URL: ${ORCH_JDBC_ADMIN_URL:-http://cdc-jdbc-admin:8084}
       ORCH_JDBC_ADMIN_TOKEN: ${ORCH_JDBC_ADMIN_TOKEN:-}
       ORCH_PGCOPY_URL: ${ORCH_PGCOPY_URL:-http://cdc-pgcopydb:8085}
@@ -545,9 +567,15 @@ services:
       ORCH_MONGOCOPY_URL: ${ORCH_MONGOCOPY_URL:-http://cdc-mongocopy:8088}
       ORCH_MONGOCOPY_TOKEN: ${ORCH_MONGOCOPY_TOKEN:-}
       ORCH_REQUIRE_AUTH: ${ORCH_REQUIRE_AUTH:-}
-      ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-}
+      # Fail startup if rqlite is down (avoid empty in-memory UI after redeploy --no-deps).
+      ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-true}
       ORCH_STRICT_PERSISTENCE: ${ORCH_STRICT_PERSISTENCE:-}
       ORCH_POLL_INTERVAL_MS: ${ORCH_POLL_INTERVAL_MS:-30000}
+      ORCH_AUDIT_REDIS_URL: ${ORCH_AUDIT_REDIS_URL:-redis://cdc-redis:6379/1}
+      ORCH_AUDIT_REDIS_KEY: ${ORCH_AUDIT_REDIS_KEY:-cdc:audit:events}
+      ORCH_AUDIT_REDIS_MAX_LEN: ${ORCH_AUDIT_REDIS_MAX_LEN:-100000}
+      ORCH_POLL_AUDIT_CHECK_SECS: ${ORCH_POLL_AUDIT_CHECK_SECS:-10}
+      ORCH_AUDIT_RQLITE_MAX_ROWS: ${ORCH_AUDIT_RQLITE_MAX_ROWS:-200000}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     extra_hosts:

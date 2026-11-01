@@ -2,6 +2,7 @@
 
 mod diff;
 mod dispatch;
+mod poll_audit;
 mod rules;
 
 use std::sync::Arc;
@@ -39,6 +40,12 @@ pub fn spawn_changelog_pruner(state: Arc<AppState>) -> tokio::task::JoinHandle<(
 pub fn spawn_refresh_scheduler(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_refresh_loop(state))
 }
+
+pub fn spawn_poll_audit(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    poll_audit::spawn_poll_audit(state)
+}
+
+pub use poll_audit::{PollAuditClock, PollAuditOffsets};
 
 async fn run_refresh_loop(state: Arc<AppState>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -82,7 +89,7 @@ async fn refresh_tick(state: &AppState) -> Result<(), AppError> {
             continue;
         }
         let mut profile = profile;
-        match crate::reconcile::reconcile_resync(state, &mut profile, true).await {
+        match crate::reconcile::reconcile_resync(state, &mut profile, true, None).await {
             Ok(()) => {
                 state.profiles.upsert(&profile).await?;
                 tracing::info!(
@@ -255,6 +262,20 @@ async fn check_dlq_growth(state: &AppState) -> Result<(), AppError> {
             messages = messages_count,
             "DLQ high-watermark increased"
         );
+        crate::audit::emit_system(
+            state,
+            "sync.dlq_growth",
+            "failure",
+            serde_json::json!({
+                "topic": topic,
+                "previous_high_watermark": old,
+                "high_watermark": current,
+                "messages_count": messages_count,
+            }),
+            None,
+            None,
+        )
+        .await;
     }
     Ok(())
 }

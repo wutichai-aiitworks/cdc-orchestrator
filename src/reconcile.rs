@@ -13,6 +13,7 @@ use crate::models::{
 };
 use crate::AppState;
 use chrono::Utc;
+use tracing::info;
 
 pub fn connector_name_for(profile: &CdcProfile) -> String {
     if let Some(ref n) = profile.connector_name {
@@ -412,7 +413,7 @@ pub(crate) fn source_table_include_list(profile: &CdcProfile) -> Vec<String> {
     Vec::new()
 }
 
-fn jdbc_target_schema(profile: &CdcProfile) -> &str {
+pub(crate) fn jdbc_target_schema(profile: &CdcProfile) -> &str {
     profile
         .flow
         .mappings
@@ -940,10 +941,272 @@ async fn truncate_target_tables(profile: &CdcProfile) -> Result<Vec<String>, App
 /// resetting offsets just replays leftover change events. A trigger resync copies
 /// the live source tables into the target and leaves the changelog offset where it
 /// is so stale events cannot overwrite that snapshot.
+fn table_snapshot_resync_path(profile: &CdcProfile, row_limit: Option<u64>) -> bool {
+    if profile.pattern != ProfilePattern::SourceToTarget {
+        return false;
+    }
+    match profile.source.capture_mode {
+        crate::models::CaptureMode::Trigger => true,
+        crate::models::CaptureMode::Incremental => row_limit.is_some(),
+        _ => false,
+    }
+}
+
+fn require_row_limit_for_profile(
+    profile: &CdcProfile,
+    row_limit: Option<u64>,
+) -> Result<(), AppError> {
+    if row_limit.is_none() {
+        return Ok(());
+    }
+    if profile.pattern != ProfilePattern::SourceToTarget {
+        return Err(AppError::BadRequest(
+            "row_limit applies only to database replica (source_to_target) pipelines".into(),
+        ));
+    }
+    if !matches!(
+        profile.source.capture_mode,
+        crate::models::CaptureMode::Trigger | crate::models::CaptureMode::Incremental
+    ) {
+        return Err(AppError::BadRequest(
+            "row_limit applies only to trigger or incremental replica pipelines (live table snapshot copy)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// (cleared target tables, rows copied per table) from a live table snapshot.
+type SnapshotOutcome = (Vec<String>, Vec<(String, i64)>);
+
+/// Halt connectors, optionally truncate targets, copy live source rows, then resume them
+/// when `resume_after` (resync). The test initial sync leaves them STOPPED for teardown.
+/// Does not reset Kafka Connect offsets (safe after Start or for resync).
+async fn run_trigger_table_snapshot(
+    state: &AppState,
+    profile: &CdcProfile,
+    clear_target: bool,
+    row_limit: Option<u64>,
+    resume_after: bool,
+) -> Result<SnapshotOutcome, AppError> {
+    let source_name = connector_name_for(profile);
+    let sink_name = if profile.has_managed_sink() {
+        Some(sink_connector_name_for(profile))
+    } else {
+        None
+    };
+    if let Some(sink) = sink_name.as_deref() {
+        halt_connector(state, sink).await?;
+    }
+    halt_connector(state, &source_name).await?;
+    wait_for_stopped(state, &source_name).await?;
+
+    let snapshot_result: Result<SnapshotOutcome, AppError> = async {
+        let cleared = if clear_target {
+            truncate_target_tables(profile).await?
+        } else {
+            Vec::new()
+        };
+        let copied = crate::postgres_trigger_cdc::snapshot_source_tables(
+            profile,
+            !clear_target,
+            row_limit,
+        )
+        .await?;
+        Ok((cleared, copied))
+    }
+    .await;
+
+    if !resume_after {
+        return snapshot_result;
+    }
+    if let Err(e) = resume_halted_connectors(state, &source_name, sink_name.as_deref()).await {
+        if snapshot_result.is_ok() {
+            return Err(e);
+        }
+        tracing::warn!(error = %e, "failed to resume connectors after failed table snapshot");
+    }
+    snapshot_result
+}
+
+async fn resume_halted_connectors(
+    state: &AppState,
+    source_name: &str,
+    sink_name: Option<&str>,
+) -> Result<(), AppError> {
+    resume_connector(state, source_name).await?;
+    if let Some(sink) = sink_name {
+        resume_connector(state, sink).await?;
+    }
+    Ok(())
+}
+
+/// Test initial sync: verify connectivity and configuration, then stop.
+///
+/// Starts the pipeline (Connect accepts the config and reaches source/target), copies up to
+/// `row_limit` rows per table into the target (read, write, mapping, permissions), then tears
+/// the connectors down — offsets reset first so a later production Start begins clean, then
+/// deleted. The profile ends `Stopped`; this is never a production sync. Teardown also runs
+/// when any step fails, so a failed test never leaves a pipeline running.
+pub async fn reconcile_start_with_test_sync(
+    state: &AppState,
+    profile: &mut CdcProfile,
+    action: &str,
+    clear_target: bool,
+    row_limit: Option<u64>,
+) -> Result<(), AppError> {
+    require_row_limit_for_profile(profile, row_limit)?;
+    let Some(limit) = row_limit else {
+        return Err(AppError::BadRequest(
+            "test initial sync requires row_limit".into(),
+        ));
+    };
+    if !matches!(action, "start" | "restart") {
+        return Err(AppError::BadRequest(format!(
+            "test initial sync is not supported for action '{action}'"
+        )));
+    }
+
+    let outcome: Result<SnapshotOutcome, AppError> = async {
+        match action {
+            "start" => reconcile_start(state, profile).await?,
+            _ => reconcile_restart(state, profile).await?,
+        }
+        run_trigger_table_snapshot(state, profile, clear_target, Some(limit), false).await
+    }
+    .await;
+
+    let teardown = teardown_test_connectors(state, profile).await;
+    profile.connector_name = None;
+    profile.sink_connector_name = None;
+    profile.updated_at = Utc::now();
+
+    let (cleared, copied) = match outcome {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(t) = teardown {
+                tracing::warn!(error = %t, "test initial sync teardown failed after error");
+            }
+            profile.status = ProfileStatus::Stopped;
+            profile.push_history(HistoryItem {
+                timestamp: Utc::now(),
+                level: "error".to_string(),
+                event: "profile_test_initial_sync_failed".to_string(),
+                detail: format!(
+                    "Test initial sync failed; connectors removed, nothing left running. {}",
+                    e.to_string_message()
+                ),
+            });
+            return Err(e);
+        }
+    };
+    teardown?;
+
+    profile.push_history(HistoryItem {
+        timestamp: Utc::now(),
+        level: "info".to_string(),
+        event: "profile_test_initial_sync".to_string(),
+        detail: test_sync_history_detail(limit, &copied, &cleared),
+    });
+    profile.status = ProfileStatus::Stopped;
+    profile.last_error = None;
+    Ok(())
+}
+
+/// Remove the connectors a test run created: stop, reset source offsets, delete.
+async fn teardown_test_connectors(state: &AppState, profile: &CdcProfile) -> Result<(), AppError> {
+    let source_name = connector_name_for(profile);
+    let mut first_error = None;
+    if profile.has_managed_sink() {
+        let sink = sink_connector_name_for(profile);
+        if let Err(e) = stop_connector(state, &sink, true).await {
+            first_error.get_or_insert(e);
+        }
+    }
+    if connector_exists(state, &source_name).await? {
+        let _ = halt_connector(state, &source_name).await;
+        let reset = async {
+            wait_for_stopped(state, &source_name).await?;
+            reset_connector_offsets(state, &source_name).await
+        }
+        .await;
+        if let Err(e) = reset {
+            first_error.get_or_insert(e);
+        }
+        if let Err(e) = stop_connector(state, &source_name, true).await {
+            first_error.get_or_insert(e);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn test_sync_history_detail(limit: u64, copied: &[(String, i64)], cleared: &[String]) -> String {
+    let total: i64 = copied.iter().map(|(_, n)| n).sum();
+    let tables = copied
+        .iter()
+        .map(|(t, n)| format!("{t}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cleared = if cleared.is_empty() {
+        String::new()
+    } else {
+        format!(" Cleared {} target table(s) first.", cleared.len())
+    };
+    format!(
+        "Test initial sync passed (row_limit={limit}): copied {total} row(s) across {} table(s) [{tables}].{cleared} \
+         Pipeline stopped and connectors removed — not a production sync. Use Start or Resync to run it.",
+        copied.len()
+    )
+}
+
+/// Restart pipelines marked autostart after orchestrator boot (docker redeploy, crash, etc.).
+pub async fn reconcile_autostart_profiles(state: &AppState) {
+    let Ok(profiles) = state.profiles.list().await else {
+        tracing::warn!("autostart skipped: could not list profiles");
+        return;
+    };
+    for mut profile in profiles {
+        if !profile.autostart || !profile.enabled {
+            continue;
+        }
+        if !matches!(
+            profile.status,
+            ProfileStatus::Running | ProfileStatus::Failed
+        ) {
+            continue;
+        }
+        if profile.pattern == ProfilePattern::SourceToOlake {
+            continue;
+        }
+        let name = profile.name.clone();
+        match reconcile_start(&state, &mut profile).await {
+            Ok(()) => {
+                profile.push_history(HistoryItem {
+                    timestamp: Utc::now(),
+                    level: "info".to_string(),
+                    event: "profile_autostarted".to_string(),
+                    detail: "Pipeline reconciled on orchestrator startup".to_string(),
+                });
+                if let Err(e) = state.profiles.upsert(&profile).await {
+                    tracing::warn!(profile = %name, error = %e, "autostart upsert failed");
+                } else {
+                    info!(profile = %name, "autostart reconciled pipeline");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(profile = %name, error = %e, "autostart reconcile failed");
+                profile.last_error = Some(e.to_string_message());
+                profile.status = ProfileStatus::Failed;
+                let _ = state.profiles.upsert(&profile).await;
+            }
+        }
+    }
+}
+
 pub async fn reconcile_resync(
     state: &AppState,
     profile: &mut CdcProfile,
     clear_target: bool,
+    row_limit: Option<u64>,
 ) -> Result<(), AppError> {
     let source_name = connector_name_for(profile);
     if !connector_exists(state, &source_name).await? {
@@ -951,49 +1214,44 @@ pub async fn reconcile_resync(
             "connector '{source_name}' does not exist yet — start the pipeline before resyncing"
         )));
     }
-    let sink_name = if profile.has_managed_sink() {
-        let name = sink_connector_name_for(profile);
-        connector_exists(state, &name).await?.then_some(name)
-    } else {
-        None
-    };
-    let trigger_snapshot = profile.source.capture_mode == crate::models::CaptureMode::Trigger
-        && profile.pattern == ProfilePattern::SourceToTarget;
+    require_row_limit_for_profile(profile, row_limit)?;
+    if table_snapshot_resync_path(profile, row_limit) {
+        let (cleared, copied) =
+            run_trigger_table_snapshot(state, profile, clear_target, row_limit, true).await?;
+        profile.connector_name = Some(source_name.clone());
+        if profile.has_managed_sink() {
+            profile.sink_connector_name = Some(sink_connector_name_for(profile));
+        }
+        profile.status = ProfileStatus::Running;
+        profile.updated_at = Utc::now();
+        profile.last_error = None;
+        profile.push_history(HistoryItem {
+            timestamp: Utc::now(),
+            level: "info".to_string(),
+            event: "profile_resynced".to_string(),
+            detail: resync_history_detail(Some(&copied), &cleared),
+        });
+        return Ok(());
+    }
 
-    // Stop the sink first so it cannot apply rows while the target is being cleared.
-    if let Some(sink) = sink_name.as_deref() {
-        halt_connector(state, sink).await?;
+    if let Some(sink) = profile.has_managed_sink().then(|| sink_connector_name_for(profile)) {
+        halt_connector(state, &sink).await?;
     }
     halt_connector(state, &source_name).await?;
     wait_for_stopped(state, &source_name).await?;
-
     let cleared = if clear_target {
         truncate_target_tables(profile).await?
     } else {
         Vec::new()
     };
-
-    let snapshot = if trigger_snapshot {
-        Some(crate::postgres_trigger_cdc::snapshot_source_tables(profile, !clear_target).await?)
-    } else {
-        None
-    };
-
-    // Changelog replay after a snapshot would overwrite current source rows with
-    // leftover events. Incremental / logical pipelines still need the offset reset.
-    if !trigger_snapshot {
-        reset_connector_offsets(state, &source_name).await?;
-    }
-
+    reset_connector_offsets(state, &source_name).await?;
     resume_connector(state, &source_name).await?;
-    if let Some(sink) = sink_name.as_deref() {
-        let _ = resume_connector(state, sink).await;
+    if profile.has_managed_sink() {
+        let sink = sink_connector_name_for(profile);
+        let _ = resume_connector(state, &sink).await;
+        profile.sink_connector_name = Some(sink);
     }
-
     profile.connector_name = Some(source_name);
-    if sink_name.is_some() {
-        profile.sink_connector_name = sink_name;
-    }
     profile.status = ProfileStatus::Running;
     profile.updated_at = Utc::now();
     profile.last_error = None;
@@ -1001,7 +1259,7 @@ pub async fn reconcile_resync(
         timestamp: Utc::now(),
         level: "info".to_string(),
         event: "profile_resynced".to_string(),
-        detail: resync_history_detail(snapshot.as_deref(), &cleared),
+        detail: resync_history_detail(None, &cleared),
     });
     Ok(())
 }
@@ -1052,7 +1310,7 @@ pub async fn apply_profile_action(
         "stop" => reconcile_stop(state, profile).await,
         // Clearing the target is destructive, so the plain action never does it; callers
         // that want it go through reconcile_resync directly with an explicit opt-in.
-        "resync" => reconcile_resync(state, profile, false).await,
+        "resync" => reconcile_resync(state, profile, false, None).await,
         _ => Err(AppError::BadRequest(
             "unsupported profile action".to_string(),
         )),
@@ -1069,6 +1327,18 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    #[test]
+    fn test_sync_history_detail_reports_counts_and_stop() {
+        let copied = vec![("app.orders".to_string(), 5), ("app.items".to_string(), 3)];
+        let detail = test_sync_history_detail(5, &copied, &["app.orders".to_string()]);
+        assert!(detail.contains("row_limit=5"));
+        assert!(detail.contains("copied 8 row(s) across 2 table(s)"));
+        assert!(detail.contains("app.orders=5, app.items=3"));
+        assert!(detail.contains("Cleared 1 target table(s) first."));
+        assert!(detail.contains("not a production sync"));
+        assert!(!test_sync_history_detail(5, &copied, &[]).contains("Cleared"));
+    }
+
     fn conn() -> std::collections::HashMap<String, String> {
         HashMap::from([
             ("host".into(), "localhost".into()),
@@ -1081,6 +1351,7 @@ mod tests {
 
     fn profile_with_mapping(mapping: TableMapping) -> CdcProfile {
         CdcProfile {
+            autostart: true,
             id: Uuid::new_v4(),
             name: "Orders CDC".into(),
             description: "demo".into(),
@@ -1098,6 +1369,7 @@ mod tests {
                 changelog_retention_hours: None,
                 timestamp_column: None,
                 incrementing_column: None,
+                upsert_key_columns: vec![],
             },
             target: Some(TargetConfig {
                 name: "warehouse".into(),

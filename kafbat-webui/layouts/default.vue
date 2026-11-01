@@ -22,14 +22,12 @@ import {
   Users,
   Workflow,
   X,
-  LogOut,
 } from "@lucide/vue"
-import { isSsoAuth } from "~/utils/authMode"
+import { isAuthDisabled } from "~/utils/authMode"
 
 const route = useRoute()
 const cfg = useRuntimeConfig()
-const { user, logout } = useAuth()
-const ssoEnabled = computed(() => isSsoAuth(cfg))
+const authEnabled = computed(() => !isAuthDisabled(cfg))
 const {
   data: capability,
   loading: capabilityLoading,
@@ -92,6 +90,13 @@ const nav = navGroups.flatMap((group) => group.items)
 const isActive = (to: string) => {
   if (to === "/") return route.path === "/"
   return route.path.startsWith(to)
+}
+
+const { reselect } = useNavReselect()
+// Same-route clicks don't navigate; tell the page so it can return to its landing view.
+const onNavClick = (to: string) => {
+  if (route.path === to) reselect(to)
+  mobileMenuOpen.value = false
 }
 
 const pageTitle = computed(
@@ -174,6 +179,7 @@ onUnmounted(() => {
               :key="item.to"
               :to="item.to"
               :title="sidebarOpen ? undefined : item.label"
+              @click="onNavClick(item.to)"
               :class="[
                 'flex h-10 items-center overflow-hidden rounded-xl text-sm font-medium transition-colors duration-150',
                 isActive(item.to)
@@ -234,6 +240,7 @@ onUnmounted(() => {
                 v-for="item in group.items"
                 :key="item.to"
                 :to="item.to"
+                @click="onNavClick(item.to)"
                 :class="[
                   'flex h-10 items-center gap-3 rounded-xl px-3 text-sm font-medium transition-colors',
                   isActive(item.to)
@@ -273,24 +280,7 @@ onUnmounted(() => {
             />
           </span>
           <AppThemeToggle />
-          <template v-if="ssoEnabled">
-            <span
-              v-if="user?.email || user?.userId"
-              class="hidden max-w-[12rem] truncate text-xs text-muted-foreground sm:inline"
-              :title="user?.email || user?.userId"
-            >
-              {{ user?.email || user?.userId }}
-            </span>
-            <button
-              type="button"
-              class="icon-button"
-              title="Sign out"
-              aria-label="Sign out"
-              @click="logout"
-            >
-              <LogOut class="h-4 w-4" :stroke-width="1.75" />
-            </button>
-          </template>
+          <AppUserMenu v-if="authEnabled" />
         </div>
       </header>
 

@@ -42,6 +42,12 @@
       <artifactId>ojdbc11</artifactId>
       <version>23.5.0.24.07</version>
     </dependency>
+    <!-- TH8TISASCII and other non-US7ASCII DB charsets need NLS classes (ORA-17056). -->
+    <dependency>
+      <groupId>com.oracle.database.nls</groupId>
+      <artifactId>orai18n</artifactId>
+      <version>23.5.0.24.07</version>
+    </dependency>
     <dependency>
       <groupId>org.xerial</groupId>
       <artifactId>sqlite-jdbc</artifactId>

@@ -42,7 +42,7 @@ Everything Docker-only sits under `docker/`:
 | `kafka-connect-jdbc/` | Vendored Confluent JDBC source fork (10.9.7 + Oracle timezone patch); compiled by the Connect image |
 | `docker/config/` | Files mounted into containers (`vector.toml`) |
 | `docker/init/` | Demo Postgres bootstrap (`/docker-entrypoint-initdb.d`) |
-| `docker/install.sh`, `docker/start.sh`, `docker/reload-dev.sh` | Real scripts; `./install.sh` etc. at the root are thin wrappers |
+| `docker/install.sh`, `docker/start.sh`, `docker/redeploy.sh` | Real scripts; `./install.sh` etc. at the root are thin wrappers |
 
 `.env` lives **next to** `docker-compose.yaml`, so Compose loads it automatically —
 no `--env-file` needed. Only `.env_local` stays at the repo root, since it is used
@@ -81,7 +81,8 @@ cd hyper-cdc-orchestrator
 # install.sh creates docker/.env from docker/.env.example on first run;
 # copy it up front if you want to edit secrets first.
 cp docker/.env.example docker/.env
-# Optional: set ORCH_API_TOKEN for auth even in dev
+# ORCH_API_TOKEN is generated into docker/.env if missing (see ADR 0002);
+# set your own first if host-side clients already use one.
 ./install.sh
 ```
 

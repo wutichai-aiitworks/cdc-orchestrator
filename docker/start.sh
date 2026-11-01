@@ -12,7 +12,7 @@
 #   --build    — force cargo rebuild; with --stack also docker compose --build
 #   --stack    — start compose infra only (not the orchestrator/native-ui containers)
 # 
-# Native UI: cd kafbat-webui && ./start.sh --build .env_local
+# Native UI: cd cdc-native-ui && ./start.sh --build .env_local
 
 set -euo pipefail
 
@@ -131,7 +131,7 @@ echo "Container project   : ${ORCH_CONTAINER_PROJECT_NAME}"
 echo "Managed containers  : ${ORCH_MANAGED_CONTAINERS}"
 echo "Connect base URL    : ${ORCH_CONNECT_BASE_URL}"
 echo "Kafbat UI           : http://127.0.0.1:${CDC_ADMIN_HOST_PORT:-4321}"
-echo "Native UI           : cd kafbat-webui && ./start.sh --build .env_local"
+echo "Native UI           : cd cdc-native-ui && ./start.sh --build .env_local"
 echo
 
 if [ "$FORCE_BUILD" -eq 1 ] || [ ! -x "$BIN" ]; then

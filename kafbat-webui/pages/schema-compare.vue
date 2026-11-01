@@ -974,6 +974,7 @@ const copyDialogOpen = ref(false)
 const copyTable = ref<{ schema: string; name: string } | null>(null)
 const copyTruncate = ref(false)
 const copyBatchSize = ref(500)
+const copyMaxRows = ref("")
 const copyForce = ref(false)
 const copyRunning = ref(false)
 const copyResults = ref<CopyTableResult[]>([])
@@ -983,6 +984,7 @@ const openCopyDialog = (schema: string, name: string) => {
   copyTable.value = { schema, name }
   copyTruncate.value = false
   copyBatchSize.value = 500
+  copyMaxRows.value = "100"
   copyForce.value = false
   copyResults.value = []
   copyError.value = ""
@@ -1014,6 +1016,9 @@ const runCopyData = async () => {
           batch_size: copyBatchSize.value,
           truncate_before_copy: copyTruncate.value,
           force_direct_copy: copyForce.value,
+          max_rows: copyMaxRows.value.trim()
+            ? Math.max(1, Math.min(100_000, Math.floor(Number(copyMaxRows.value))))
+            : undefined,
         },
       },
     )
@@ -1960,18 +1965,20 @@ const isNullCell = (val: any): boolean => val === null || val === undefined
       kind="empty"
       message="Test and load both connections above to start comparing tables."
     />
-    <div
+    <AppContextHint
       v-else-if="srcReady && !tgtReady"
-      class="mb-6 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-800 dark:text-yellow-300"
-    >
-      Source loaded — test and load the <strong>Target</strong> connection to start comparing.
-    </div>
-    <div
+      class="mb-6"
+      tone="yellow"
+      label="Target not loaded"
+      hint="Source is ready. Test and load the Target connection to start comparing."
+    />
+    <AppContextHint
       v-else-if="!srcReady && tgtReady"
-      class="mb-6 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-800 dark:text-yellow-300"
-    >
-      Target loaded — test and load the <strong>Source</strong> connection to start comparing.
-    </div>
+      class="mb-6"
+      tone="yellow"
+      label="Source not loaded"
+      hint="Target is ready. Test and load the Source connection to start comparing."
+    />
 
     <!-- ── Compare section (both ready) ── -->
     <template v-if="bothReady">
@@ -2610,7 +2617,7 @@ const isNullCell = (val: any): boolean => val === null || val === undefined
                 <div>
                   <p class="text-sm font-semibold">Copy Data to Target</p>
                   <p class="text-xs text-surface-400">
-                    Migrate rows from source table to matching target table.
+                    Direct SELECT → PostgreSQL insert. No pipeline, no Kafka, no Oracle triggers.
                   </p>
                 </div>
               </div>
@@ -2670,6 +2677,21 @@ const isNullCell = (val: any): boolean => val === null || val === undefined
                   type="number"
                   min="1"
                   max="5000"
+                  class="w-28 text-right"
+                />
+              </label>
+
+              <label class="flex items-center justify-between gap-4">
+                <div>
+                  <p class="text-sm font-medium">Max rows (test)</p>
+                  <p class="text-xs text-surface-400">Leave empty to copy the whole table</p>
+                </div>
+                <AppInput
+                  v-model="copyMaxRows"
+                  type="number"
+                  min="1"
+                  max="100000"
+                  placeholder="100"
                   class="w-28 text-right"
                 />
               </label>

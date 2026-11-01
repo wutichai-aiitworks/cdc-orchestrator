@@ -1,6 +1,9 @@
 use chrono::Utc;
+use serde_json::json;
 
+use crate::audit::{detail_json, emit, new_event};
 use crate::models::{AlertRule, CdcAlertPayload, HistoryEntry, StateTransition, WebhookBody};
+use crate::reconcile::{connector_name_for, sink_connector_name_for};
 use crate::watcher::rules::rules_matching_transition;
 use crate::AppState;
 
@@ -71,6 +74,38 @@ pub async fn handle_transition(state: &AppState, t: &StateTransition, enabled_ru
             tracing::warn!(rule = %r.id, error = %e, "webhook failed");
         }
     }
+
+    let audit_action = match t.to_state.as_str() {
+        "FAILED" => "connector.failed",
+        "PAUSED" => "connector.paused",
+        "RUNNING" => "connector.running",
+        _ => "connector.state_changed",
+    };
+    let outcome = if t.to_state == "FAILED" {
+        "failure"
+    } else {
+        "success"
+    };
+    let linked = state.profiles.list().await.ok().and_then(|profiles| {
+        profiles.into_iter().find(|p| {
+            connector_name_for(p) == t.connector || sink_connector_name_for(p) == t.connector
+        })
+    });
+    let detail = detail_json(json!({
+        "connector": t.connector,
+        "from_state": t.from_state,
+        "to_state": t.to_state,
+        "task_errors": errors,
+    }));
+    let event = new_event(
+        "system:watcher",
+        audit_action,
+        outcome,
+        &detail,
+        linked.as_ref().map(|p| p.id),
+        linked.as_ref().map(|p| p.name.as_str()),
+    );
+    emit(state, event).await;
 }
 
 async fn post_webhook(url: &str, secret: Option<&str>, body: &WebhookBody) -> Result<(), String> {

@@ -1,0 +1,15 @@
+---
+description: Prefer info icons over inline verbose help text in kafbat-webui
+globs:
+  - "**/*.vue"
+alwaysApply: false
+---
+
+# Help text → info icon
+
+- Put long explanations in **`AppInfoHint`** (tooltip/popover), not inline paragraphs.
+- Form fields: **`AppFormLabel`** with `hint="..."` (never long text in the default slot).
+- Section headers: **`AppSectionTitle`** with `hint="..."`.
+- Page headers: **`AppPageHeader`** `description` (renders as info icon).
+- Callout strips: **`AppContextHint`** — short `label` + `hint` (full text in icon).
+- Keep validation errors and dynamic API messages as visible text (not hidden in icons).

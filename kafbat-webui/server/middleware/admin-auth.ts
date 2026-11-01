@@ -1,5 +1,5 @@
 import { isAuthDisabled } from "~/utils/authMode"
-import { getSessionConfig } from "~/server/utils/sessionConfig"
+import { getSessionConfig, getSessionSecret } from "~/server/utils/sessionConfig"
 
 export default defineEventHandler(async (event) => {
   const path = event.path || ""
@@ -7,7 +7,7 @@ export default defineEventHandler(async (event) => {
 
   const cfg = useRuntimeConfig()
   if (isAuthDisabled(cfg)) return
-  if (String(cfg.sessionSecret || "").trim().length < 32) {
+  if (getSessionSecret().length < 32) {
     throw createError({ statusCode: 500, statusMessage: "Session is not configured" })
   }
 

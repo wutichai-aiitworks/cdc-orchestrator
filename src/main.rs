@@ -24,6 +24,7 @@ mod pgloader;
 mod pgloader_handlers;
 mod postgres_trigger_cdc;
 mod processing_api;
+mod profile_table_status;
 mod reconcile;
 mod redisshake;
 mod redisshake_handlers;
@@ -58,8 +59,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::audit::open_redis;
 use crate::models::ConnectorSnapshot;
+use crate::watcher::{PollAuditClock, PollAuditOffsets};
 use hyper_cdc_orchestrator::function_runtime::store::ProcessingPipelineStore;
+use redis::aio::ConnectionManager;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,6 +82,9 @@ pub struct AppState {
     pub dlq_high_watermarks: Arc<RwLock<HashMap<String, i64>>>,
     pub watcher_errors: Arc<RwLock<u64>>,
     pub processing_pipelines: ProcessingPipelineStore,
+    pub audit_redis: Option<ConnectionManager>,
+    pub poll_audit_clock: PollAuditClock,
+    pub poll_audit_offsets: PollAuditOffsets,
 }
 
 async fn open_rqlite(config: &AppConfig) -> Option<RqliteClient> {
@@ -107,16 +114,33 @@ async fn rqlite_after_connect(
     url: &str,
     client: RqliteClient,
 ) -> Option<RqliteClient> {
-    if let Err(e) = client.ensure_schema().await {
-        if config.require_persistence {
-            eprintln!("FATAL: rqlite schema init failed under ORCH_REQUIRE_PERSISTENCE: {e}");
-            std::process::exit(1);
+    const MAX_ATTEMPTS: u32 = 20;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client.ensure_schema().await {
+            Ok(()) => {
+                info!(rqlite = %url, "rqlite configuration store enabled");
+                return Some(client);
+            }
+            Err(e) if attempt < MAX_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max = MAX_ATTEMPTS,
+                    error = %e,
+                    "rqlite not ready; retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                if config.require_persistence {
+                    eprintln!("FATAL: rqlite schema init failed under ORCH_REQUIRE_PERSISTENCE: {e}");
+                    std::process::exit(1);
+                }
+                warn!(error = %e, "rqlite schema init failed; memory-only configuration");
+                return None;
+            }
         }
-        warn!(error = %e, "rqlite schema init failed; memory-only configuration");
-        return None;
     }
-    info!(rqlite = %url, "rqlite configuration store enabled");
-    Some(client)
+    None
 }
 
 #[tokio::main]
@@ -144,6 +168,13 @@ async fn main() {
     }
 
     let (alerts_tx, _) = broadcast::channel(256);
+    let audit_redis = match &config.audit_redis_url {
+        Some(url) => open_redis(url).await,
+        None => {
+            info!("ORCH_AUDIT_REDIS_URL unset — profile/sync audit is logs only (no Redis list)");
+            None
+        }
+    };
     let state = AppState {
         config: config.clone(),
         http: Client::builder()
@@ -163,6 +194,9 @@ async fn main() {
         dlq_high_watermarks: Arc::new(RwLock::new(HashMap::new())),
         watcher_errors: Arc::new(RwLock::new(0)),
         processing_pipelines: ProcessingPipelineStore::new(rqlite),
+        audit_redis,
+        poll_audit_clock: Arc::new(RwLock::new(HashMap::new())),
+        poll_audit_offsets: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let legacy = Router::new()
@@ -265,6 +299,12 @@ async fn main() {
         .route("/profiles/:id", put(handlers::update_profile))
         .route("/profiles/:id", delete(handlers::delete_profile))
         .route("/profiles/:id/dlq", get(kafka_topics::profile_dlq_status))
+        .route("/profiles/:id/investigate", get(ops::profile_investigate))
+        .route(
+            "/profiles/:id/tables/sync-status",
+            get(ops::profile_table_sync_status),
+        )
+        .route("/profiles/:id/logs", get(ops::profile_pipeline_logs))
         .route("/profiles/:id/enable", post(handlers::set_profile_enabled))
         .route(
             "/profiles/:id/actions/:action",
@@ -283,7 +323,8 @@ async fn main() {
             get(processing_api::get_pipeline)
                 .put(processing_api::update_pipeline)
                 .delete(processing_api::delete_pipeline),
-        );
+        )
+        .route("/pipeline-logs", get(ops::list_pipeline_logs));
 
     let cdc = Router::new()
         .route("/capability", get(ops::capability))
@@ -443,6 +484,12 @@ async fn main() {
         .route("/profiles/:id", put(handlers::update_profile))
         .route("/profiles/:id", delete(handlers::delete_profile))
         .route("/profiles/:id/dlq", get(kafka_topics::profile_dlq_status))
+        .route("/profiles/:id/investigate", get(ops::profile_investigate))
+        .route(
+            "/profiles/:id/tables/sync-status",
+            get(ops::profile_table_sync_status),
+        )
+        .route("/profiles/:id/logs", get(ops::profile_pipeline_logs))
         .route("/profiles/:id/enable", post(handlers::set_profile_enabled))
         .route(
             "/profiles/:id/actions/:action",
@@ -478,6 +525,8 @@ async fn main() {
                 .delete(ops::delete_rule),
         )
         .route("/notifications/history", get(ops::alert_history))
+        .route("/audit/events", get(ops::list_audit_events))
+        .route("/pipeline-logs", get(ops::list_pipeline_logs))
         .route("/ws/alerts", get(ops::ws_alerts))
         .route("/metrics", get(ops::metrics))
         .route("/compare/profiles", get(handlers::list_compare_profiles))
@@ -736,6 +785,13 @@ async fn main() {
     let _watcher = watcher::spawn_watcher(Arc::new(state.clone()));
     let _pruner = watcher::spawn_changelog_pruner(Arc::new(state.clone()));
     let _refresher = watcher::spawn_refresh_scheduler(Arc::new(state.clone()));
+    let _poll_audit = watcher::spawn_poll_audit(Arc::new(state.clone()));
+
+    let autostart_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        reconcile::reconcile_autostart_profiles(&autostart_state).await;
+    });
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()

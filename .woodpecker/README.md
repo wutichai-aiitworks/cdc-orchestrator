@@ -10,7 +10,7 @@ old single-file config was folded into the workflows below.
 | Workflow | Events | Depends on | Does |
 |----------|--------|-----------|------|
 | `test` | pull_request, push, manual | — | `cargo fmt --check`, `test --locked`, `clippy -D warnings` for the root crate, then the standalone `mcp/` crate |
-| `webui` | pull_request, push, manual | — | `kafbat-webui`: `npm ci`, `openapi:check`, `typecheck`, `build` |
+| `webui` | pull_request, push, manual | — | `cdc-native-ui`: `npm ci`, `openapi:check`, `typecheck`, `build` |
 | `build` | pull_request, push, manual | — | Builds all four images multi-arch **without pushing**, so pull requests catch broken Dockerfiles |
 | `sonar` | push, manual | — | `sonar-scanner` against `sonar-project.properties`, waits for the quality gate |
 | `main-ci` | push, manual | `test`, `webui`, `build`, `sonar` | Builds and pushes all four images multi-arch, then notifies Discord |
@@ -29,7 +29,7 @@ result cannot be loaded into the local image store); `main-ci` pushes
 |-------|-----------|---------------|
 | `$REGISTRY_NAMESPACE/hyper-cdc-orchestrator` | `docker/Dockerfile` | repo root |
 | `$REGISTRY_NAMESPACE/hyper-cdc-connect` | `docker/connect/Dockerfile` | repo root |
-| `$REGISTRY_NAMESPACE/hyper-cdc-webui` | `kafbat-webui/Dockerfile` | `kafbat-webui` |
+| `$REGISTRY_NAMESPACE/hyper-cdc-webui` | `cdc-native-ui/Dockerfile` | `cdc-native-ui` |
 | `$REGISTRY_NAMESPACE/hyper-cdc-mcp` | `mcp/Dockerfile` | `mcp` |
 
 The orchestrator image needs the repo root as its context because `docker/Dockerfile`

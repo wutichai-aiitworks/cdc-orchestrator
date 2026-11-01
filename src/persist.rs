@@ -25,6 +25,44 @@ const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_config (
   PRIMARY KEY (kind, id)
 )";
 
+const AUDIT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_audit_events (
+  audit_id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  profile_id TEXT,
+  profile_name TEXT
+)";
+
+const AUDIT_INDEX_TS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_audit_timestamp ON cdc_audit_events(timestamp)";
+const AUDIT_INDEX_ACTION: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_audit_action ON cdc_audit_events(action)";
+const AUDIT_INDEX_PROFILE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_audit_profile ON cdc_audit_events(profile_id)";
+
+const PIPELINE_LOG_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_pipeline_logs (
+  log_id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  profile_id TEXT,
+  profile_name TEXT,
+  level TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  message TEXT NOT NULL,
+  detail TEXT NOT NULL
+)";
+
+const PIPELINE_LOG_INDEX_TS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_pipeline_log_timestamp ON cdc_pipeline_logs(timestamp)";
+const PIPELINE_LOG_INDEX_PROFILE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_pipeline_log_profile ON cdc_pipeline_logs(profile_id)";
+const PIPELINE_LOG_INDEX_ACTION: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_pipeline_log_action ON cdc_pipeline_logs(action)";
+
 #[derive(Debug)]
 pub enum PersistError {
     Upstream(String),
@@ -82,7 +120,206 @@ impl RqliteClient {
 
     pub async fn ensure_schema(&self) -> Result<(), PersistError> {
         self.execute(json!([SCHEMA_SQL])).await?;
+        for sql in [
+            AUDIT_TABLE_SQL,
+            AUDIT_INDEX_TS,
+            AUDIT_INDEX_ACTION,
+            AUDIT_INDEX_PROFILE,
+            PIPELINE_LOG_TABLE_SQL,
+            PIPELINE_LOG_INDEX_TS,
+            PIPELINE_LOG_INDEX_PROFILE,
+            PIPELINE_LOG_INDEX_ACTION,
+        ] {
+            self.execute(json!([sql])).await?;
+        }
         Ok(())
+    }
+
+    pub async fn insert_audit_event(
+        &self,
+        audit_id: &str,
+        timestamp: &str,
+        actor: &str,
+        action: &str,
+        outcome: &str,
+        detail: &str,
+        profile_id: Option<&str>,
+        profile_name: Option<&str>,
+    ) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "INSERT INTO cdc_audit_events(audit_id, timestamp, actor, action, outcome, detail, profile_id, profile_name) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            audit_id,
+            timestamp,
+            actor,
+            action,
+            outcome,
+            detail,
+            profile_id,
+            profile_name
+        ]]))
+        .await
+    }
+
+    /// Drop oldest rows when the table grows past `max_rows`.
+    pub async fn trim_audit_events(&self, max_rows: usize) -> Result<(), PersistError> {
+        if max_rows == 0 {
+            return Ok(());
+        }
+        let max = max_rows as i64;
+        self.execute(json!([[
+            "DELETE FROM cdc_audit_events WHERE audit_id IN (\
+               SELECT audit_id FROM cdc_audit_events ORDER BY timestamp ASC \
+               LIMIT MAX(0, (SELECT COUNT(*) FROM cdc_audit_events) - ?)\
+             )",
+            max
+        ]]))
+        .await
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        limit: usize,
+        action: Option<&str>,
+        profile_id: Option<&str>,
+        outcome: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<AuditEventRow>, PersistError> {
+        let cap = limit.clamp(1, 2000) as i64;
+        let mut sql = String::from(
+            "SELECT audit_id, timestamp, actor, action, outcome, detail, profile_id, profile_name \
+             FROM cdc_audit_events WHERE 1=1",
+        );
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(v) = action {
+            sql.push_str(" AND action=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = profile_id {
+            sql.push_str(" AND profile_id=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = outcome {
+            sql.push_str(" AND outcome=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = since {
+            sql.push_str(" AND timestamp>=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = until {
+            sql.push_str(" AND timestamp<=?");
+            params.push(json!(v));
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        params.push(json!(cap));
+        let mut stmt: Vec<Value> = vec![json!(sql)];
+        stmt.extend(params);
+        let rows = self.query(json!([stmt])).await?;
+        rows.into_iter()
+            .map(|row| decode_audit_row(&row))
+            .collect()
+    }
+
+    pub async fn insert_pipeline_log(
+        &self,
+        log_id: &str,
+        timestamp: &str,
+        profile_id: Option<&str>,
+        profile_name: Option<&str>,
+        level: &str,
+        phase: &str,
+        action: &str,
+        outcome: &str,
+        message: &str,
+        detail: &str,
+    ) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "INSERT INTO cdc_pipeline_logs(log_id, timestamp, profile_id, profile_name, level, phase, action, outcome, message, detail) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            log_id,
+            timestamp,
+            profile_id,
+            profile_name,
+            level,
+            phase,
+            action,
+            outcome,
+            message,
+            detail
+        ]]))
+        .await
+    }
+
+    pub async fn trim_pipeline_logs(&self, max_rows: usize) -> Result<(), PersistError> {
+        if max_rows == 0 {
+            return Ok(());
+        }
+        let max = max_rows as i64;
+        self.execute(json!([[
+            "DELETE FROM cdc_pipeline_logs WHERE log_id IN (\
+               SELECT log_id FROM cdc_pipeline_logs ORDER BY timestamp ASC \
+               LIMIT MAX(0, (SELECT COUNT(*) FROM cdc_pipeline_logs) - ?)\
+             )",
+            max
+        ]]))
+        .await
+    }
+
+    pub async fn list_pipeline_logs(
+        &self,
+        limit: usize,
+        action: Option<&str>,
+        profile_id: Option<&str>,
+        outcome: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        level: Option<&str>,
+        phase: Option<&str>,
+    ) -> Result<Vec<PipelineLogRow>, PersistError> {
+        let cap = limit.clamp(1, 2000) as i64;
+        let mut sql = String::from(
+            "SELECT log_id, timestamp, profile_id, profile_name, level, phase, action, outcome, message, detail \
+             FROM cdc_pipeline_logs WHERE 1=1",
+        );
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(v) = action {
+            sql.push_str(" AND action=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = profile_id {
+            sql.push_str(" AND profile_id=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = outcome {
+            sql.push_str(" AND outcome=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = since {
+            sql.push_str(" AND timestamp>=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = until {
+            sql.push_str(" AND timestamp<=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = level {
+            sql.push_str(" AND level=?");
+            params.push(json!(v));
+        }
+        if let Some(v) = phase {
+            sql.push_str(" AND phase=?");
+            params.push(json!(v));
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        params.push(json!(cap));
+        let mut stmt: Vec<Value> = vec![json!(sql)];
+        stmt.extend(params);
+        let rows = self.query(json!([stmt])).await?;
+        rows.into_iter()
+            .map(|row| decode_pipeline_log_row(&row))
+            .collect()
     }
 
     pub async fn put_json<T: Serialize>(
@@ -160,10 +397,16 @@ impl RqliteClient {
             .await
             .map_err(|e| PersistError::Upstream(format!("rqlite execute: {e}")))?;
         let status = resp.status();
-        let payload: Value = resp
-            .json()
+        let raw = resp
+            .text()
             .await
-            .map_err(|e| PersistError::Upstream(format!("rqlite execute json: {e}")))?;
+            .map_err(|e| PersistError::Upstream(format!("rqlite execute body: {e}")))?;
+        let payload: Value = serde_json::from_str(&raw).map_err(|e| {
+            PersistError::Upstream(format!(
+                "rqlite execute json: {e} (body: {})",
+                raw.chars().take(200).collect::<String>()
+            ))
+        })?;
         if !status.is_success() {
             return Err(PersistError::Upstream(format!(
                 "rqlite execute {status}: {payload}"
@@ -181,10 +424,16 @@ impl RqliteClient {
             .await
             .map_err(|e| PersistError::Upstream(format!("rqlite query: {e}")))?;
         let status = resp.status();
-        let payload: Value = resp
-            .json()
+        let raw = resp
+            .text()
             .await
-            .map_err(|e| PersistError::Upstream(format!("rqlite query json: {e}")))?;
+            .map_err(|e| PersistError::Upstream(format!("rqlite query body: {e}")))?;
+        let payload: Value = serde_json::from_str(&raw).map_err(|e| {
+            PersistError::Upstream(format!(
+                "rqlite query json: {e} (body: {})",
+                raw.chars().take(200).collect::<String>()
+            ))
+        })?;
         if !status.is_success() {
             return Err(PersistError::Upstream(format!(
                 "rqlite query {status}: {payload}"
@@ -235,6 +484,75 @@ fn result_values(payload: &Value) -> Vec<Vec<Value>> {
         .and_then(Value::as_array)
         .map(|rows| rows.iter().filter_map(Value::as_array).cloned().collect())
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEventRow {
+    pub audit_id: String,
+    pub timestamp: String,
+    pub actor: String,
+    pub action: String,
+    pub outcome: String,
+    pub detail: String,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineLogRow {
+    pub log_id: String,
+    pub timestamp: String,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub level: String,
+    pub phase: String,
+    pub action: String,
+    pub outcome: String,
+    pub message: String,
+    pub detail: String,
+}
+
+fn decode_pipeline_log_row(row: &[Value]) -> Result<PipelineLogRow, PersistError> {
+    let col = |i: usize| -> Option<String> {
+        row.get(i).and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+    };
+    Ok(PipelineLogRow {
+        log_id: col(0).ok_or_else(|| PersistError::Internal("pipeline log missing log_id".into()))?,
+        timestamp: col(1)
+            .ok_or_else(|| PersistError::Internal("pipeline log missing timestamp".into()))?,
+        profile_id: col(2),
+        profile_name: col(3),
+        level: col(4).unwrap_or_else(|| "info".into()),
+        phase: col(5).unwrap_or_else(|| "sync".into()),
+        action: col(6).unwrap_or_default(),
+        outcome: col(7).unwrap_or_default(),
+        message: col(8).unwrap_or_default(),
+        detail: col(9).unwrap_or_default(),
+    })
+}
+
+fn decode_audit_row(row: &[Value]) -> Result<AuditEventRow, PersistError> {
+    let col = |i: usize| -> Option<String> {
+        row.get(i).and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+    };
+    Ok(AuditEventRow {
+        audit_id: col(0).ok_or_else(|| PersistError::Internal("audit row missing audit_id".into()))?,
+        timestamp: col(1).ok_or_else(|| PersistError::Internal("audit row missing timestamp".into()))?,
+        actor: col(2).unwrap_or_default(),
+        action: col(3).unwrap_or_default(),
+        outcome: col(4).unwrap_or_default(),
+        detail: col(5).unwrap_or_default(),
+        profile_id: col(6),
+        profile_name: col(7),
+    })
 }
 
 #[cfg(test)]

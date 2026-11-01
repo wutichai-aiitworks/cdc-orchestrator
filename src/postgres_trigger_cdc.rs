@@ -83,6 +83,7 @@ pub fn parse_qualified_tables(profile: &CdcProfile) -> Result<Vec<CapturedTable>
             ),
             _ => (schema.clone(), table.clone()),
         };
+        let (target_schema, target_table) = fold_oracle_postgres_target(profile, &target_schema, &target_table);
         quote_ident(&schema)?;
         quote_ident(&table)?;
         quote_ident(&target_schema)?;
@@ -118,6 +119,31 @@ fn split_qualified(qualified: &str) -> Result<(String, String), AppError> {
         _ => Err(AppError::BadRequest(format!(
             "trigger capture table must be schema.table: {value}"
         ))),
+    }
+}
+
+/// Oracle sources use uppercase schema/table names; Postgres replicas use lowercase identifiers.
+fn fold_oracle_postgres_target(
+    profile: &CdcProfile,
+    target_schema: &str,
+    target_table: &str,
+) -> (String, String) {
+    let oracle_to_postgres = profile
+        .source
+        .source_type
+        .trim()
+        .eq_ignore_ascii_case("oracle")
+        && profile
+            .target
+            .as_ref()
+            .is_some_and(|t| matches!(t.target_type.trim().to_ascii_lowercase().as_str(), "postgres" | "postgresql"));
+    if oracle_to_postgres {
+        (
+            target_schema.to_ascii_lowercase(),
+            target_table.to_ascii_lowercase(),
+        )
+    } else {
+        (target_schema.to_string(), target_table.to_string())
     }
 }
 
@@ -534,6 +560,7 @@ pub async fn install_target_apply(profile: &CdcProfile) -> Result<(), AppError> 
 pub async fn snapshot_source_tables(
     profile: &CdcProfile,
     truncate_each: bool,
+    max_rows: Option<u64>,
 ) -> Result<Vec<(String, i64)>, AppError> {
     let target = profile.target.as_ref().ok_or_else(|| {
         AppError::BadRequest("pipeline has no target for a source-table snapshot".into())
@@ -561,6 +588,7 @@ pub async fn snapshot_source_tables(
             &table.target_table,
             TRIGGER_BATCH_MAX_ROWS as usize,
             truncate_each,
+            max_rows,
         )
         .await?;
         copied.push((
@@ -789,6 +817,7 @@ mod tests {
 
     fn profile() -> CdcProfile {
         CdcProfile {
+            autostart: true,
             id: Uuid::new_v4(),
             name: "Pg Replica".into(),
             description: String::new(),
@@ -812,6 +841,7 @@ mod tests {
                 changelog_retention_hours: None,
                 timestamp_column: None,
                 incrementing_column: None,
+                upsert_key_columns: vec![],
             },
             target: Some(TargetConfig {
                 name: "replica".into(),

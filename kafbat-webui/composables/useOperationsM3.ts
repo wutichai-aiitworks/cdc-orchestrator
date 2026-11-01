@@ -10,6 +10,77 @@ export type AlertHistoryItem = {
   task_errors?: Array<{ taskId?: number; trace?: string }>
 }
 
+export type AuditEventItem = {
+  audit_id: string
+  timestamp: string
+  actor: string
+  action: string
+  outcome: string
+  detail: string
+  profile_id?: string | null
+  profile_name?: string | null
+}
+
+export type AuditEventsResponse = {
+  items: AuditEventItem[]
+  count: number
+  store?: string
+  table?: string
+}
+
+export type PipelineLogItem = {
+  log_id: string
+  timestamp: string
+  profile_id?: string | null
+  profile_name?: string | null
+  level: string
+  phase: string
+  action: string
+  outcome: string
+  message: string
+  detail: string
+}
+
+export type PipelineLogsResponse = {
+  items: PipelineLogItem[]
+  count: number
+  store?: string
+  table?: string
+  profile_id?: string
+}
+
+export type TableSyncPhase = "complete" | "in_progress" | "behind" | "unknown" | "error"
+
+export type TableSyncStatusRow = {
+  source_schema: string
+  source_table: string
+  target_schema: string
+  target_table: string
+  source_qualified: string
+  target_qualified: string
+  kafka_topic?: string | null
+  phase: TableSyncPhase
+  source_row_count?: number | null
+  target_row_count?: number | null
+  pending_rows?: number | null
+  kafka_messages?: number | null
+  processing_rows?: number | null
+  source_offset?: unknown
+  source_count_error?: string | null
+  target_count_error?: string | null
+  kafka_error?: string | null
+}
+
+export type ProfileTableSyncStatusResponse = {
+  timestamp: string
+  profile_id: string
+  profile_name: string
+  profile_status: string
+  capture_mode: string
+  tables: TableSyncStatusRow[]
+  counts_skipped: boolean
+}
+
 export type AlertRule = {
   id: string
   name: string
@@ -46,6 +117,54 @@ export const useOperationsM3 = () => {
   const deleteAlertRule = (id: string) =>
     $fetch(`/api/cdc/notifications/rules/${encodeURIComponent(id)}`, { method: "DELETE" })
   const fetchMetrics = () => $fetch<string>("/api/cdc/metrics", { responseType: "text" })
+  const fetchAuditEvents = (query: {
+    limit?: number
+    profile_id?: string
+    action?: string
+    outcome?: string
+    since?: string
+    until?: string
+  }) => $fetch<AuditEventsResponse>("/api/cdc/audit/events", { query })
+
+  const fetchPipelineLogs = (query: {
+    limit?: number
+    profile_id?: string
+    action?: string
+    outcome?: string
+    since?: string
+    until?: string
+    level?: string
+    phase?: string
+  }) => $fetch<PipelineLogsResponse>("/api/cdc/pipeline-logs", { query })
+
+  const fetchProfilePipelineLogs = (
+    profileId: string,
+    query?: {
+      limit?: number
+      action?: string
+      outcome?: string
+      since?: string
+      until?: string
+      level?: string
+      phase?: string
+    },
+  ) =>
+    $fetch<PipelineLogsResponse>(
+      `/api/cdc/profiles/${encodeURIComponent(profileId)}/logs`,
+      { query },
+    )
+
+  const fetchProfileInvestigate = (profileId: string) =>
+    $fetch<Record<string, unknown>>(`/api/cdc/profiles/${encodeURIComponent(profileId)}/investigate`)
+
+  const fetchProfileTableSyncStatus = (
+    profileId: string,
+    query?: { skip_counts?: boolean },
+  ) =>
+    $fetch<ProfileTableSyncStatusResponse>(
+      `/api/cdc/profiles/${encodeURIComponent(profileId)}/tables/sync-status`,
+      { query },
+    )
 
   return {
     fetchLogServices,
@@ -58,5 +177,10 @@ export const useOperationsM3 = () => {
     updateAlertRule,
     deleteAlertRule,
     fetchMetrics,
+    fetchAuditEvents,
+    fetchPipelineLogs,
+    fetchProfilePipelineLogs,
+    fetchProfileInvestigate,
+    fetchProfileTableSyncStatus,
   }
 }

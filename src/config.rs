@@ -77,6 +77,13 @@ pub struct AppConfig {
     pub docker_socket_path: String,
     pub log_containers: HashMap<String, String>,
     pub poll_interval: Duration,
+    /// Optional Redis URL for durable CDC audit events (`ORCH_AUDIT_REDIS_URL`).
+    pub audit_redis_url: Option<String>,
+    pub audit_redis_key: String,
+    pub audit_redis_max_len: usize,
+    pub audit_rqlite_max_rows: usize,
+    /// How often to check JDBC poll schedules for interval audit events (seconds).
+    pub poll_audit_check_secs: u64,
     /// How often the changelog pruner runs (seconds). Per-profile retention window
     /// is set on the source config; this only controls the sweep cadence.
     pub changelog_prune_interval_secs: u64,
@@ -233,6 +240,27 @@ impl AppConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30_000)
             .max(1);
+        let audit_redis_url = env::var("ORCH_AUDIT_REDIS_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let audit_redis_key = env::var("ORCH_AUDIT_REDIS_KEY")
+            .unwrap_or_else(|_| "cdc:audit:events".to_string());
+        let audit_redis_max_len = env::var("ORCH_AUDIT_REDIS_MAX_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100_000)
+            .max(1_000);
+        let poll_audit_check_secs = env::var("ORCH_POLL_AUDIT_CHECK_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10)
+            .max(1);
+        let audit_rqlite_max_rows = env::var("ORCH_AUDIT_RQLITE_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(200_000)
+            .max(1_000);
         let changelog_prune_interval_secs = env::var("ORCH_CHANGELOG_PRUNE_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -301,6 +329,11 @@ impl AppConfig {
             docker_socket_path,
             log_containers,
             poll_interval: Duration::from_millis(poll_interval_ms),
+            audit_redis_url,
+            audit_redis_key,
+            audit_redis_max_len,
+            audit_rqlite_max_rows,
+            poll_audit_check_secs,
             changelog_prune_interval_secs,
             history_capacity,
             stop_deletes_connector,

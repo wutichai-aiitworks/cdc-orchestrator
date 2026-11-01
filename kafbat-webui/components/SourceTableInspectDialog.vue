@@ -147,12 +147,13 @@ watch(
         </div>
 
         <p v-if="error" class="mb-3 shrink-0 text-sm text-red-700 dark:text-red-400">{{ error }}</p>
-        <p
+        <AppContextHint
           v-else-if="inspect && !inspect.primary_key.length"
-          class="mb-3 shrink-0 rounded-xl border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-800 dark:text-yellow-300"
-        >
-          This table has no primary key. Replica upsert/delete needs a key or compound key.
-        </p>
+          class="mb-3 shrink-0"
+          tone="yellow"
+          label="No primary key"
+          hint="Replica upsert/delete needs a key or compound key on the target."
+        />
 
         <div data-modal-scroll class="min-h-0 flex-1 overflow-auto overscroll-contain">
           <AppStateBlock v-if="loading && !inspect" kind="loading" message="Loading table…" />

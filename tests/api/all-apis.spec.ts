@@ -1,6 +1,9 @@
 import { expect, test, type APIResponse } from "@playwright/test";
 
 const strict = process.env.ORCH_TEST_STRICT === "true";
+// engine up/restart/down stop or bounce the whole stack — opt in explicitly.
+const allowEngine = process.env.ORCH_TEST_ALLOW_ENGINE === "true";
+const ENGINE_SKIP = "set ORCH_TEST_ALLOW_ENGINE=true to run engine up/restart/down";
 const testConnectorName =
   process.env.ORCH_TEST_CONNECTOR_NAME ?? "playwright-test-connector";
 
@@ -57,16 +60,19 @@ test.describe("hyper-cdc-orchestrator phase-1 APIs", () => {
   });
 
   test("POST /engine/up", async ({ request }) => {
+    test.skip(!allowEngine, ENGINE_SKIP);
     const response = await request.post("/engine/up");
     assertStatus(response.status(), "/engine/up");
   });
 
   test("POST /engine/restart", async ({ request }) => {
+    test.skip(!allowEngine, ENGINE_SKIP);
     const response = await request.post("/engine/restart");
     assertStatus(response.status(), "/engine/restart");
   });
 
   test("POST /engine/down", async ({ request }) => {
+    test.skip(!allowEngine, ENGINE_SKIP);
     const response = await request.post("/engine/down");
     assertStatus(response.status(), "/engine/down");
   });

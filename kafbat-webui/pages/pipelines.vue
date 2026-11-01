@@ -1,21 +1,16 @@
 <script setup lang="ts">
+import type { PipelineDetailAction } from "~/components/PipelineDetail.vue"
 import {
   ArrowRight,
   CheckCircle2,
   Eye,
   Filter,
   KeyRound,
-  Pause,
   Pencil,
-  Play,
   Plus,
-  RefreshCcwDot,
   RefreshCw,
-  RotateCw,
   Save,
-  ScrollText,
   Search,
-  Square,
   TriangleAlert,
   Trash2,
   Waves,
@@ -104,6 +99,7 @@ const form = reactive({
   tables: "",
   captureMode: "logical" as CaptureMode,
   sinkErrorPolicy: "fail_fast" as SinkErrorPolicy,
+  autostart: true,
   streamPlatform: "redpanda" as "kafka" | "redpanda",
   transformPreset: "none" as TransformPreset,
   deliveryMode: "realtime" as "realtime" | "micro_batch",
@@ -112,6 +108,7 @@ const form = reactive({
   changelogRetentionHours: "",
   timestampColumn: "",
   incrementingColumn: "",
+  upsertKeyColumns: "",
   targetName: "",
   targetType: "postgres" as DatabaseType,
   targetHost: "",
@@ -212,6 +209,12 @@ const startBlockedReason = (pattern?: string | null) => {
 
 const selected = computed(() => profiles.value.find((profile) => profile.id === selectedId.value) || null)
 const canStartSelected = computed(() => selected.value?.pattern === "source_to_target")
+
+const supportsCappedTableCopy = computed(() => {
+  const mode = String(selected.value?.source?.capture_mode || "").toLowerCase()
+  return mode === "trigger" || mode === "incremental"
+})
+
 const LIVE_CATALOG_TYPES = ["postgres", "postgresql", "mysql", "mariadb", "sqlserver", "mssql", "sqlite", "oracle"]
 const sourceLiveCatalogSupported = computed(() =>
   LIVE_CATALOG_TYPES.includes(form.sourceType.toLowerCase())
@@ -233,7 +236,7 @@ const canContinueSource = computed(
     (form.schemaMode !== "specific_schemas" || filled(form.schemas)) &&
     (form.tableMode !== "specific_tables" || filled(form.tables)) &&
     (form.captureMode !== "trigger" || filled(form.tables)) &&
-    (form.captureMode !== "incremental" || (filled(form.tables) && filled(form.incrementingColumn))) &&
+    (!isIncrementalCapture() || incrementalSourceReady()) &&
     ((form.captureMode !== "incremental" && form.captureMode !== "trigger") || form.deliveryMode !== "micro_batch" || filled(form.intervalSeconds))
 )
 const canContinueTarget = computed(() => {
@@ -271,6 +274,11 @@ const canTestTarget = computed(() => {
     filled(form.targetUsername)
   )
 })
+const canLoadTargetCatalog = computed(
+  () =>
+    canTestTarget.value &&
+    Boolean(selectedId.value || form.targetPassword || targetPasswordStored.value),
+)
 const syncAutofilledSecrets = () => {
   if (typeof document === "undefined") return
   const targetPassword = document.querySelector<HTMLInputElement>('input[name="targetPassword"]')
@@ -298,6 +306,157 @@ const canContinueMapping = computed(() => {
 })
 
 const splitList = (value: string) => value.split(",").map((item) => item.trim()).filter(Boolean)
+
+/** Map incrementing + upsert form fields to API (comma-separated PKs → upsert_key_columns). */
+const isIncrementalCapture = () => String(form.captureMode || "").toLowerCase() === "incremental"
+
+const upsertKeysFromSource = (source: CdcProfile["source"]) => {
+  const cols = source.upsert_key_columns
+  if (Array.isArray(cols)) return cols.map((c) => String(c).trim()).filter(Boolean)
+  return [] as string[]
+}
+
+const upsertKeysFromMappings = (mappings: TableMapping[] | undefined) => {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const mapping of mappings || []) {
+    for (const col of mapping.pk_columns || []) {
+      const key = String(col).trim()
+      if (!key) continue
+      const fold = key.toLowerCase()
+      if (seen.has(fold)) continue
+      seen.add(fold)
+      out.push(key)
+    }
+  }
+  return out
+}
+
+const upsertKeysForForm = (profile: CdcProfile) => {
+  const fromSource = upsertKeysFromSource(profile.source)
+  if (fromSource.length) return fromSource.join(", ")
+  return upsertKeysFromMappings(profile.flow.mappings).join(", ")
+}
+
+const qualifiedTableParts = (qualified: string) => {
+  const trimmed = qualified.trim()
+  const dot = trimmed.indexOf(".")
+  if (dot <= 0) {
+    return { source_schema: splitList(form.schemas)[0] || "public", source_table: trimmed }
+  }
+  return { source_schema: trimmed.slice(0, dot), source_table: trimmed.slice(dot + 1) }
+}
+
+/** Persist upsert PK on flow.mappings when orchestrator build lacks source.upsert_key_columns. */
+const incrementalPkStubMappings = (upsertKeys: string[]) => {
+  if (!upsertKeys.length) return [] as TableMapping[]
+  const stubs: TableMapping[] = []
+  for (const qualified of splitList(form.tables)) {
+    const { source_schema, source_table } = qualifiedTableParts(qualified)
+    if (!source_table) continue
+    const target_schema = source_schema
+    const target_table = source_table
+    stubs.push({
+      source_schema,
+      source_table,
+      target_schema,
+      target_table,
+      identical: mappingIsSameName({
+        source_schema,
+        source_table,
+        target_schema,
+        target_table,
+        identical: true,
+        columns: [],
+        pk_columns: upsertKeys,
+      }),
+      columns: [],
+      pk_columns: [...upsertKeys],
+    })
+  }
+  return stubs
+}
+
+const applyIncrementalSourceToForm = (profile: CdcProfile) => {
+  const mode = String(profile.source.capture_mode || "").toLowerCase()
+  if (mode) form.captureMode = mode as CaptureMode
+  form.timestampColumn = profile.source.timestamp_column ?? ""
+  form.incrementingColumn = profile.source.incrementing_column ?? ""
+  form.upsertKeyColumns = upsertKeysForForm(profile)
+}
+
+const buildSourceWatermarkFields = () => {
+  const timestamp_column = textValue(form.timestampColumn) || null
+  const wm = incrementalWatermarkFields()
+  const hasWatermarks = Boolean(
+    timestamp_column || wm.incrementing_column || wm.upsert_key_columns.length,
+  )
+  if (!isIncrementalCapture() && !hasWatermarks) {
+    return {
+      timestamp_column: null as string | null,
+      incrementing_column: null as string | null,
+      upsert_key_columns: [] as string[],
+      incremental: false,
+    }
+  }
+  return {
+    timestamp_column,
+    incrementing_column: wm.incrementing_column,
+    upsert_key_columns: wm.upsert_key_columns,
+    incremental: true,
+  }
+}
+
+const incrementalWatermarkFields = () => {
+  const raw = textValue(form.incrementingColumn)
+  const upsertExtra = splitList(form.upsertKeyColumns)
+  if (!raw) {
+    return { incrementing_column: null as string | null, upsert_key_columns: upsertExtra }
+  }
+  if (raw.includes(",")) {
+    const merged = [...splitList(raw), ...upsertExtra]
+    const seen = new Set<string>()
+    const upsert_key_columns = merged.filter((col) => {
+      const key = col.toLowerCase()
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    return { incrementing_column: null, upsert_key_columns }
+  }
+  return { incrementing_column: raw, upsert_key_columns: upsertExtra }
+}
+
+const incrementalSourceReady = () => {
+  if (!filled(form.tables)) return false
+  const { incrementing_column, upsert_key_columns } = incrementalWatermarkFields()
+  if (incrementing_column) return true
+  if (filled(form.timestampColumn) && upsert_key_columns.length > 0) return true
+  if (filled(form.timestampColumn) && form.pattern !== "source_to_target") return true
+  return false
+}
+
+const schemaPickerHint = computed(() => {
+  if (form.captureMode === "trigger") {
+    return "Select tables to capture, then create a changelog trigger on each. Trigger mode requires an explicit table list."
+  }
+  if (isIncrementalCapture()) {
+    return "Select large tables to poll. Incremental requires an explicit list. Prefer tables that share the same timestamp and PK column names."
+  }
+  return "Select schemas, then check source tables to capture. Leave tables unchecked to capture every table in a selected schema."
+})
+
+const incrementalSourceHint = computed(() => {
+  if (!isIncrementalCapture() || incrementalSourceReady()) return ""
+  if (!filled(form.tables)) return "Select at least one table for incremental capture."
+  if (form.pattern === "source_to_target") {
+    if (!filled(form.timestampColumn)) {
+      return "For replica: set Timestamp column, then Upsert key columns (e.g. BRANCH_NO, PRO_CODE), or a single numeric Incrementing column."
+    }
+    return "For replica with a timestamp: set Upsert key columns (comma-separated PK). Numeric-only tables can use Incrementing column instead."
+  }
+  return "Set a timestamp column and/or incrementing column."
+})
 
 type CatalogSchema = { name: string; table_count: number }
 type CatalogTable = { schema: string; name: string; row_count?: number | null; primary_key?: string[] }
@@ -430,6 +589,15 @@ const selectedTableKeys = computed({
     form.tables = keys.join(", ")
     form.tableMode = keys.length ? "specific_tables" : "all_tables"
   },
+})
+
+const tableSelectionHint = computed(() => {
+  if (selectedTableKeys.value.length) {
+    return `${selectedTableKeys.value.length} table(s) selected for capture.`
+  }
+  if (form.captureMode === "trigger") return "Select tables, then create a trigger on each one."
+  if (isIncrementalCapture()) return "Select tables to poll on the watermark column."
+  return "All tables in the selected schema(s) will be captured."
 })
 
 const schemaOptions = computed(() =>
@@ -666,7 +834,12 @@ const loadSourceCatalog = async () => {
 
 const loadTargetCatalog = async () => {
   syncAutofilledSecrets()
-  if (!canTestTarget.value) return
+  if (!canLoadTargetCatalog.value) {
+    if (canTestTarget.value) {
+      targetCatalogError.value = "Enter the target password or save a draft first so credentials are stored."
+    }
+    return
+  }
   const payload = buildPayload().target
   if (!payload) return
   targetCatalogLoading.value = true
@@ -679,6 +852,12 @@ const loadTargetCatalog = async () => {
     targetSelectedSchemas.value = targetSelectedSchemas.value.filter((name) =>
       targetCatalogSchemas.value.some((schema) => schema.name.toLowerCase() === name.toLowerCase())
     )
+    if (!targetSelectedSchemas.value.length && targetCatalogSchemas.value.length) {
+      const withTables = targetCatalogSchemas.value.filter((schema) => schema.table_count > 0)
+      targetSelectedSchemas.value = (withTables.length ? withTables : targetCatalogSchemas.value).map(
+        (schema) => schema.name,
+      )
+    }
     if (!targetCatalogSchemas.value.length) {
       targetCatalogError.value = result.message || "No schemas found."
     }
@@ -845,13 +1024,17 @@ const optionalPositiveInt = (value: string): number | null => {
   return Math.floor(n)
 }
 
-const buildPayload = (): ProfilePayload => ({
+const buildPayload = (): ProfilePayload => {
+  const watermarks = buildSourceWatermarkFields()
+  const incrementalCapture = isIncrementalCapture() || watermarks.incremental
+  return {
   name: textValue(form.name),
   description: textValue(form.description),
   pattern: form.pattern,
   stream_platform: form.pattern === "source_to_stream" ? form.streamPlatform : null,
   transform_strategy: form.transformPreset === "none" ? "none" : "predefined",
   sink_error_policy: form.sinkErrorPolicy,
+  autostart: form.autostart,
   source: {
     source_type: form.sourceType,
     connection: {
@@ -862,14 +1045,21 @@ const buildPayload = (): ProfilePayload => ({
       password: form.password,
     },
     schema_mode: form.schemaMode,
-    table_mode: form.captureMode === "trigger" || form.captureMode === "incremental" ? "specific_tables" : form.tableMode,
-    capture_mode: form.captureMode,
+    table_mode:
+      form.captureMode === "trigger" || incrementalCapture ? "specific_tables" : form.tableMode,
+    capture_mode: incrementalCapture ? "incremental" : form.captureMode,
     schemas: form.schemaMode === "specific_schemas" ? splitList(form.schemas) : [],
-    tables: form.tableMode === "specific_tables" || form.captureMode === "trigger" || form.captureMode === "incremental" ? splitList(form.tables) : [],
+    tables:
+      form.tableMode === "specific_tables" ||
+      form.captureMode === "trigger" ||
+      incrementalCapture
+        ? splitList(form.tables)
+        : [],
     changelog_retention_hours:
       form.captureMode === "trigger" ? optionalPositiveInt(form.changelogRetentionHours) : null,
-    timestamp_column: form.captureMode === "incremental" ? textValue(form.timestampColumn) || null : null,
-    incrementing_column: form.captureMode === "incremental" ? textValue(form.incrementingColumn) || null : null,
+    timestamp_column: watermarks.timestamp_column,
+    incrementing_column: watermarks.incrementing_column,
+    upsert_key_columns: watermarks.upsert_key_columns,
   },
   target:
     form.pattern === "source_to_target"
@@ -894,15 +1084,30 @@ const buildPayload = (): ProfilePayload => ({
       interval_seconds: form.deliveryMode === "micro_batch" ? optionalPositiveInt(form.intervalSeconds) : null,
       full_refresh_minutes: optionalPositiveInt(form.fullRefreshMinutes),
     },
-    mappings:
-      form.pattern === "source_to_target" &&
-      // Identical-name mappings are normally dropped, but they must still be sent when
-      // they carry a logical PK — trigger apply has no other source for those columns.
-      (form.mappingMode === "custom" ||
-        form.mappings.some((mapping) => (mapping.pk_columns ?? []).length > 0))
-        ? form.mappings
-            .filter((mapping) => filled(mapping.source_table) && filled(mapping.target_table))
-            .map((mapping) => {
+    mappings: (() => {
+      if (form.pattern !== "source_to_target") return []
+      const upsertKeys = watermarks.upsert_key_columns
+      const pkStubs = incrementalCapture ? incrementalPkStubMappings(upsertKeys) : []
+      const includeMappings =
+        form.mappingMode === "custom" ||
+        form.mappings.some((mapping) => (mapping.pk_columns ?? []).length > 0) ||
+        pkStubs.length > 0
+      if (!includeMappings) return []
+      const byKey = new Map<string, TableMapping>()
+      for (const mapping of form.mappings) {
+        if (!filled(mapping.source_table) || !filled(mapping.target_table)) continue
+        byKey.set(mappingKey(mapping.source_schema, mapping.source_table), mapping)
+      }
+      for (const stub of pkStubs) {
+        const key = mappingKey(stub.source_schema, stub.source_table)
+        const existing = byKey.get(key)
+        if (existing) {
+          if (!(existing.pk_columns ?? []).length) existing.pk_columns = stub.pk_columns
+        } else {
+          byKey.set(key, stub)
+        }
+      }
+      return [...byKey.values()].map((mapping) => {
               // Serialize column_links → backend ColumnMapping[]
               const links = mapping.column_links ?? []
               const columns = links
@@ -930,9 +1135,10 @@ const buildPayload = (): ProfilePayload => ({
                 ...(pk_columns.length ? { pk_columns } : {}),
               }
             })
-        : [],
+    })(),
   },
-})
+  }
+}
 
 const resetForm = () => {
   selectedId.value = ""
@@ -967,6 +1173,7 @@ const resetForm = () => {
     changelogRetentionHours: "",
     timestampColumn: "",
     incrementingColumn: "",
+    upsertKeyColumns: "",
     targetName: "",
     targetType: "postgres",
     targetHost: "cdc-postgres-target",
@@ -996,7 +1203,34 @@ const resetForm = () => {
     sensitivity: "internal",
     industryPack: "",
     eventLandIceberg: false,
+    autostart: true,
   })
+}
+
+const payloadFromProfile = (profile: CdcProfile): ProfilePayload => ({
+  name: profile.name,
+  description: profile.description || "",
+  pattern: profile.pattern,
+  stream_platform: profile.stream_platform ?? null,
+  transform_strategy: profile.transform_strategy,
+  sink_error_policy: profile.sink_error_policy,
+  autostart: profile.autostart !== false,
+  source: profile.source,
+  target: profile.target ?? null,
+  lake: profile.lake ?? null,
+  governance: profile.governance,
+  flow: profile.flow,
+})
+
+const persistAutostart = async (autostart: boolean) => {
+  if (!selected.value) return
+  try {
+    await updateProfile(selected.value.id, { ...payloadFromProfile(selected.value), autostart })
+    toast.success(autostart ? "Autostart enabled." : "Manual start after restart.")
+    await load()
+  } catch (e: any) {
+    error.value = formatApiError(e, "Failed to update autostart")
+  }
 }
 
 const editSelected = () => {
@@ -1024,8 +1258,9 @@ const editSelected = () => {
       (profile.source.tables?.length ? "specific_tables" : "all_tables"),
     schemas: profile.source.schemas.join(", "),
     tables: profile.source.tables.join(", "),
-    captureMode: (profile.source.capture_mode as CaptureMode) || "logical",
+    captureMode: (String(profile.source.capture_mode || "logical").toLowerCase() as CaptureMode) || "logical",
     sinkErrorPolicy: profile.sink_error_policy || "fail_fast",
+    autostart: profile.autostart !== false,
     transformPreset: presetFromProfile(profile),
     streamPlatform: profile.stream_platform || "redpanda",
     deliveryMode: profile.flow.schedule.delivery_mode,
@@ -1038,6 +1273,7 @@ const editSelected = () => {
       : "",
     timestampColumn: profile.source.timestamp_column || "",
     incrementingColumn: profile.source.incrementing_column || "",
+    upsertKeyColumns: upsertKeysForForm(profile),
     targetName: profile.target?.name || "",
     targetType: (profile.target?.target_type as DatabaseType) || "postgres",
     targetHost: profile.target?.connection.host || "",
@@ -1195,6 +1431,15 @@ const save = async (stayInWizard = false) => {
           : "Draft saved."
     )
     selectedId.value = result.profile.id
+    const priorUpsert = textValue(form.upsertKeyColumns)
+    const priorTimestamp = textValue(form.timestampColumn)
+    applyIncrementalSourceToForm(result.profile)
+    if (priorUpsert && !upsertKeysForForm(result.profile)) {
+      form.upsertKeyColumns = priorUpsert
+    }
+    if (priorTimestamp && !result.profile.source.timestamp_column) {
+      form.timestampColumn = priorTimestamp
+    }
 
     // Mark passwords as stored and clear plaintext from the form so subsequent
     // saves correctly send an empty password (backend restores from the profile).
@@ -1234,7 +1479,9 @@ const toggleEnabled = async () => {
   }
 }
 
-const execute = async (action: "start" | "pause" | "resume" | "restart" | "stop") => {
+type LifecycleAction = "start" | "pause" | "resume" | "restart" | "stop"
+
+const execute = async (action: LifecycleAction) => {
   if (!selected.value) return
   if ((action === "start" || action === "restart") && !canStartSelected.value) {
     toast.warning(startBlockedReason(selected.value.pattern) || "Only replica pipelines can Start in this phase.")
@@ -1251,7 +1498,43 @@ const execute = async (action: "start" | "pause" | "resume" | "restart" | "stop"
 
 const resyncOpen = ref(false)
 const resyncClearTarget = ref(true)
+const resyncRowLimit = ref("")
 const resyncing = ref(false)
+
+const startVerifyOpen = ref(false)
+const startVerifyClearTarget = ref(true)
+const startVerifyRowLimit = ref("100")
+const startVerifying = ref(false)
+
+const confirmStartVerify = async () => {
+  if (!selected.value) return
+  if (!canStartSelected.value) {
+    toast.warning(startBlockedReason(selected.value.pattern))
+    startVerifyOpen.value = false
+    return
+  }
+  const rowLimit = optionalPositiveInt(startVerifyRowLimit.value)
+  if (!rowLimit) {
+    toast.warning("Enter a row limit (e.g. 100) for test initial sync.")
+    return
+  }
+  startVerifying.value = true
+  try {
+    const res = await runAction(selected.value.id, "start", {
+      clearTarget: startVerifyClearTarget.value,
+      rowLimit,
+    })
+    const history = (res?.profile as { history?: Array<{ event: string; detail: string }> } | undefined)?.history
+    const last = history?.at(-1)
+    toast.success(last?.event === "profile_test_initial_sync" ? last.detail : `Test initial sync passed (up to ${rowLimit} rows per table). Pipeline stopped.`)
+    startVerifyOpen.value = false
+    await load()
+  } catch (e: any) {
+    error.value = formatApiError(e, "Test initial sync failed")
+  } finally {
+    startVerifying.value = false
+  }
+}
 
 const confirmResync = async () => {
   if (!selected.value) return
@@ -1262,7 +1545,8 @@ const confirmResync = async () => {
   }
   resyncing.value = true
   try {
-    await resyncProfile(selected.value.id, resyncClearTarget.value)
+    const rowLimit = optionalPositiveInt(resyncRowLimit.value)
+    await resyncProfile(selected.value.id, resyncClearTarget.value, rowLimit)
     toast.success(
       selected.value.source?.capture_mode === "trigger"
         ? resyncClearTarget.value
@@ -1282,7 +1566,6 @@ const confirmResync = async () => {
 }
 
 // ── Processing log (per-pipeline) ──────────────────────────────────────────
-const showProcessingLog = ref(false)
 
 /** Mirror the orchestrator's connector slug: lowercase alnum, others → '-'. */
 const connectorSlug = (value: string) =>
@@ -1326,7 +1609,6 @@ const loadSelectedDlq = async (id: string) => {
 watch(
   () => selected.value?.id,
   (id) => {
-    showProcessingLog.value = false
     dlqStatus.value = null
     dlqError.value = ""
     if (id) void loadSelectedDlq(id)
@@ -1666,6 +1948,13 @@ const selectPipeline = (id: string) => {
   editing.value = false
 }
 
+// Sidebar "CDC Pipelines" while already here: back to the list, like a fresh visit.
+const { onNavReselect } = useNavReselect()
+onNavReselect("/pipelines", () => {
+  editing.value = false
+  selectedId.value = ""
+})
+
 const confirmDelete = async () => {
   const profile = pendingDelete.value
   if (!profile) return
@@ -1744,6 +2033,42 @@ watch(
   { immediate: true }
 )
 
+const selectedFlow = computed(() => {
+  const profile = selected.value
+  if (!profile) return null
+  return {
+    sourceLabel: databaseLabel(profile.source.source_type),
+    sourceCaption: connectionCaption(profile.source.connection),
+    sourceImage: dbIconPath(profile.source.source_type),
+    transformCaption: viewerTransformCaption(profile),
+    targetLabel: destinationSummary(profile),
+    targetCaption: viewerTargetCaption(profile),
+    targetImage: profile.pattern === "source_to_target" ? dbIconPath(profile.target?.target_type) : "",
+  }
+})
+
+const onDetailAction = (action: PipelineDetailAction) => {
+  switch (action) {
+    case "edit":
+      editSelected()
+      return
+    case "toggle-enabled":
+      void toggleEnabled()
+      return
+    case "delete":
+      pendingDelete.value = selected.value
+      return
+    case "test-sync":
+      startVerifyOpen.value = true
+      return
+    case "resync":
+      resyncOpen.value = true
+      return
+    default:
+      void execute(action)
+  }
+}
+
 onMounted(() => {
   void load()
   statusPollTimer = setInterval(() => void refreshPipelineStatuses(), 5000)
@@ -1798,7 +2123,10 @@ onUnmounted(() => {
         </div>
         <div class="mb-6 flex flex-wrap items-end justify-between gap-3 rounded-xl border border-border bg-muted/40 p-3">
           <label class="min-w-[220px] flex-1">
-            <span class="auth-label">Pipeline name</span>
+            <AppFormLabel
+              label="Pipeline name"
+              hint="Optional — saved as Draft with the source database type when empty."
+            />
             <AppInput v-model="form.name" :placeholder="`Optional — saved as Draft · ${form.sourceType} if empty`" />
           </label>
           <div class="flex flex-wrap gap-2">
@@ -1908,51 +2236,31 @@ onUnmounted(() => {
                 </div>
               </button>
             </div>
-            <div
-              v-if="form.captureMode === 'logical'"
-              class="flex items-center gap-2 rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400"
-            >
-              <span class="font-medium">Logical CDC</span>
-              <AppInfoHint text="Ongoing CDC. PostgreSQL sources need wal_level=logical. The demo stack already sets that." />
-            </div>
-            <div
-              v-else-if="form.captureMode === 'trigger'"
-              class="flex items-center gap-2 rounded-xl border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-800 dark:text-yellow-300"
-            >
-              <span class="font-medium">Trigger capture</span>
-              <AppInfoHint>
-                Trigger mode does not use Debezium or WAL/binlog decoding. Select tables, create changelog triggers, then Start. The source connector is JDBC: it polls hyper_cdc.change_log (or the vendor equivalent). The source user needs CREATE TRIGGER. Native install runs on PostgreSQL, MySQL, MariaDB, SQL Server, and SQLite. Oracle catalog browsing is supported via DataService (requires ojdbc8.jar on DataService classpath). DB2 and Informix return the SQL to apply manually.
-              </AppInfoHint>
-            </div>
-            <div
-              v-else-if="form.captureMode === 'incremental'"
-              class="flex items-center gap-2 rounded-xl border border-blue-500/25 bg-blue-500/10 px-3 py-2 text-sm text-blue-700 dark:text-blue-400"
-            >
-              <span class="font-medium">Incremental poll</span>
-              <AppInfoHint text="Incremental polls the selected tables on a watermark column. No WAL, no triggers, no extra writes on the source. Use this for large tables. Hard deletes are not replicated — use Trigger on tables that must capture deletes. Watermark columns should be NOT NULL and indexed." />
-            </div>
-            <div
-              v-else
-              class="flex items-center gap-2 rounded-xl border border-blue-500/25 bg-blue-500/10 px-3 py-2 text-sm text-blue-700 dark:text-blue-400"
-            >
-              <span class="font-medium">One-time sync</span>
-              <AppInfoHint text="One-time sync copies the selected tables once, then the pipeline stops capturing. Later inserts are not replicated until you run it again." />
-            </div>
             <div v-if="form.captureMode === 'trigger'" class="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <label>
-                <span class="auth-label">Poll cadence</span>
-                <AppSelect v-model="form.deliveryMode" aria-label="Trigger poll cadence">
-                  <option value="realtime">Realtime (every 1s)</option>
-                  <option value="micro_batch">Interval (protect production)</option>
-                </AppSelect>
-              </label>
-              <label v-if="form.deliveryMode === 'micro_batch'">
-                <AppFormLabel
-                  label="Interval (seconds)"
-                  hint="JDBC polls only the changelog table, not your live tables. 300 = every 5 minutes."
-                />
-                <AppInput v-model="form.intervalSeconds" inputmode="numeric" placeholder="300" />
-              </label>
+              <div class="md:col-span-2 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:items-end">
+                <label>
+                  <AppFormLabel
+                    label="Poll cadence"
+                    hint="Realtime polls the changelog every 1s. Interval reduces load on production sources."
+                  />
+                  <AppSelect v-model="form.deliveryMode" aria-label="Trigger poll cadence">
+                    <option value="realtime">Realtime (every 1s)</option>
+                    <option value="micro_batch">Interval (protect production)</option>
+                  </AppSelect>
+                </label>
+                <label :class="{ 'opacity-60': form.deliveryMode !== 'micro_batch' }">
+                  <AppFormLabel
+                    label="Interval (seconds)"
+                    hint="JDBC polls only the changelog table, not your live tables. 300 = every 5 minutes."
+                  />
+                  <AppInput
+                    v-model="form.intervalSeconds"
+                    inputmode="numeric"
+                    placeholder="300"
+                    :disabled="form.deliveryMode !== 'micro_batch'"
+                  />
+                </label>
+              </div>
               <label>
                 <AppFormLabel
                   label="Changelog retention (hours)"
@@ -1965,35 +2273,53 @@ onUnmounted(() => {
               <label>
                 <AppFormLabel
                   label="Timestamp column"
-                  hint="Optional if the table is append-only. Same column name on every selected table. Must be NOT NULL and indexed."
+                  hint="Required for text/composite PK upsert. Optional for append-only numeric-id tables. Same name on every selected table. NOT NULL and indexed."
                 />
-                <AppInput v-model="form.timestampColumn" placeholder="updated_at" />
+                <AppInput v-model="form.timestampColumn" placeholder="UPDATE_DATE" />
+              </label>
+              <label class="md:col-span-2">
+                <AppFormLabel
+                  label="Upsert key columns"
+                  hint="Target PK for upsert (text/composite OK). Comma-separated — e.g. BRANCH_NO, PRO_CODE. With timestamp above, leave Incrementing empty; JDBC uses timestamp poll mode."
+                />
+                <AppInput v-model="form.upsertKeyColumns" placeholder="BRANCH_NO, PRO_CODE" />
               </label>
               <label>
                 <AppFormLabel
-                  label="Incrementing / PK column"
-                  hint="Required for replica upsert. Usually the primary key. Same column name on every selected table."
+                  label="Incrementing column (numeric)"
+                  hint="Optional when upsert keys + timestamp are set. Single numeric monotonic column for JDBC poll (e.g. id). Not for varchar PKs."
                 />
                 <AppInput v-model="form.incrementingColumn" placeholder="id" />
               </label>
-              <label>
-                <span class="auth-label">Poll cadence</span>
-                <AppSelect v-model="form.deliveryMode" aria-label="Incremental poll cadence">
-                  <option value="realtime">Realtime (every 1s)</option>
-                  <option value="micro_batch">Interval (protect production)</option>
-                </AppSelect>
-              </label>
-              <label v-if="form.deliveryMode === 'micro_batch'">
+              <div class="md:col-span-2 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:items-end">
+                <label>
+                  <AppFormLabel
+                    label="Poll cadence"
+                    hint="Realtime polls watermarks every 1s. Interval reduces JDBC load on large production tables."
+                  />
+                  <AppSelect v-model="form.deliveryMode" aria-label="Incremental poll cadence">
+                    <option value="realtime">Realtime (every 1s)</option>
+                    <option value="micro_batch">Interval (protect production)</option>
+                  </AppSelect>
+                </label>
+                <label :class="{ 'opacity-60': form.deliveryMode !== 'micro_batch' }">
+                  <AppFormLabel
+                    label="Interval (seconds)"
+                    hint="JDBC reads only rows newer than the last watermark. 300 = every 5 minutes. Prefer this on large production tables."
+                  />
+                  <AppInput
+                    v-model="form.intervalSeconds"
+                    inputmode="numeric"
+                    placeholder="300"
+                    :disabled="form.deliveryMode !== 'micro_batch'"
+                  />
+                </label>
+              </div>
+              <label class="md:col-span-2">
                 <AppFormLabel
-                  label="Interval (seconds)"
-                  hint="JDBC reads only rows newer than the last watermark. 300 = every 5 minutes. Prefer this on large production tables."
+                  label="Full refresh (minutes)"
+                  hint="Reloads the whole table on a cycle so updates and deletes reach the target. Leave blank to disable. Costs a full table read each time — keep it well above the poll interval."
                 />
-                <AppInput v-model="form.intervalSeconds" inputmode="numeric" placeholder="300" />
-              </label>
-              <label>
-                <AppFormLabel label="Full refresh (minutes)">
-                  Incremental capture only ever sees new rows. Set this to reload the whole table on a cycle so updates and deletes reach the target. Leave blank to disable. Costs a full table read each time — keep it well above the poll interval.
-                </AppFormLabel>
                 <AppInput v-model="form.fullRefreshMinutes" inputmode="numeric" placeholder="off" />
               </label>
             </div>
@@ -2012,29 +2338,27 @@ onUnmounted(() => {
                 {{ catalogLoading ? "Loading..." : "Load schemas" }}
               </AppButton>
             </div>
-            <p v-if="!sourceLiveCatalogSupported" class="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-800 dark:text-yellow-300">
-              Live catalog browsing is not available for <span class="font-medium capitalize">{{ form.sourceType }}</span>. Enter schema and table names manually in the fields below.
-              DB2 and Informix require manual entry.
-            </p>
-            <p v-else-if="form.schemaMode === 'all_schemas'" class="text-sm text-muted-foreground">
-              Every schema and table in this database will be captured. Switch to Selected schemas to pick a schema and its tables.
-            </p>
+            <AppContextHint
+              v-if="!sourceLiveCatalogSupported"
+              tone="yellow"
+              label="Manual schema entry"
+              :hint="`Live catalog browsing is not available for ${form.sourceType}. Enter schema and table names below. DB2 and Informix require manual entry.`"
+            />
+            <AppContextHint
+              v-else-if="form.schemaMode === 'all_schemas'"
+              tone="neutral"
+              label="All schemas"
+              hint="Every schema and table in this database will be captured. Switch to Selected schemas to pick a subset."
+            />
             <div v-else class="space-y-4">
-              <p class="text-sm text-muted-foreground">
-                <template v-if="form.captureMode === 'trigger'">
-                  Select the tables to capture, then create a changelog trigger on each table. Trigger mode cannot capture every table in a schema without an explicit list.
-                </template>
-                <template v-else-if="form.captureMode === 'incremental'">
-                  Select the large tables to poll. Incremental cannot capture every table in a schema without an explicit list. Prefer tables that share the same timestamp and PK column names.
-                </template>
-                <template v-else>
-                  Select one or more schemas, then check the source tables to capture. Leave tables unchecked to capture every table in the selected schema.
-                </template>
-              </p>
+              <AppContextHint tone="neutral" label="Schemas & tables" :hint="schemaPickerHint" />
               <p v-if="catalogError" class="text-sm text-red-700 dark:text-red-400">{{ catalogError }}</p>
-              <p v-else-if="!catalogSchemas.length && !catalogLoading" class="text-sm text-muted-foreground">
-                Test the connection or click Load schemas, then pick the schemas to capture. Nothing is selected until you check a schema.
-              </p>
+              <AppContextHint
+                v-else-if="!catalogSchemas.length && !catalogLoading"
+                tone="neutral"
+                label="Load schemas"
+                hint="Test the connection or click Load schemas, then pick schemas to capture. Nothing is selected until you check a schema."
+              />
 
               <!-- Saved selection summary — visible while catalog is loading or hasn't loaded yet -->
               <div
@@ -2172,10 +2496,10 @@ onUnmounted(() => {
                     </div>
                   </div>
                 </div>
-                <p class="text-xs text-muted-foreground">
-                  {{ selectedTableKeys.length ? `${selectedTableKeys.length} table(s) selected` : form.captureMode === "trigger" ? "Select tables, then create a trigger on each one" : form.captureMode === "incremental" ? "Select tables to poll on the watermark column" : "All tables in the selected schema(s) will be captured" }}
-                  <span v-if="lastCountLabel"> · {{ lastCountLabel }}</span>
-                </p>
+                <div class="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                  <span>{{ selectedTableKeys.length ? `${selectedTableKeys.length} selected` : "Table selection" }}</span>
+                  <AppInfoHint :text="tableSelectionHint + (lastCountLabel ? ` ${lastCountLabel}` : '')" />
+                </div>
                 <p v-if="triggerError" class="text-sm text-red-700 dark:text-red-400">{{ triggerError }}</p>
                 <p v-else-if="triggerMessage" class="text-sm text-emerald-700 dark:text-emerald-400">{{ triggerMessage }}</p>
                 <pre v-if="triggerSql" class="code-block max-h-48 overflow-auto whitespace-pre-wrap text-xs">{{ triggerSql }}</pre>
@@ -2196,6 +2520,12 @@ onUnmounted(() => {
                 {{ sourceValidation.message }}
               </p>
             </div>
+            <AppContextHint
+              v-if="incrementalSourceHint"
+              tone="yellow"
+              label="Incremental setup"
+              :hint="incrementalSourceHint"
+            />
             <AppButton variant="primary" :disabled="!canContinueSource" @click="wizardNext">
               Next: Transform <ArrowRight class="h-4 w-4" :stroke-width="1.75" />
             </AppButton>
@@ -2295,57 +2625,60 @@ onUnmounted(() => {
               </span>
             </span>
           </label>
-          <div
+          <AppContextHint
             v-if="dualCaptureWarning"
-            class="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-700 dark:text-red-400"
-          >
-            {{ dualCaptureWarning }}
-          </div>
-          <div
+            tone="red"
+            label="Source conflict"
+            :hint="dualCaptureWarning"
+          />
+          <AppContextHint
             v-if="form.pattern === 'source_to_target' && form.captureMode === 'logical'"
-            class="rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-4 text-sm text-emerald-700 dark:text-emerald-400"
-          >
-            Replica uses the capture mode chosen on Source. CDC needs <span class="font-medium">wal_level=logical</span>. Leave Transform as None for a straight copy.
-          </div>
-          <div
+            tone="emerald"
+            label="Logical replica"
+            hint="Uses the capture mode from Source. PostgreSQL needs wal_level=logical. Leave Transform as None for a straight copy."
+          />
+          <AppContextHint
             v-else-if="form.pattern === 'source_to_target' && form.captureMode === 'trigger'"
-            class="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-800 dark:text-yellow-300"
-          >
-            Trigger replica uses a JDBC source on the changelog table, not Debezium. Create triggers on Source before Start. The JDBC sink still upserts into the target.
-          </div>
-          <div
+            tone="yellow"
+            label="Trigger replica"
+            hint="JDBC source on the changelog table, not Debezium. Create triggers on Source before Start. The JDBC sink upserts into the target."
+          />
+          <AppContextHint
             v-else-if="form.pattern === 'source_to_target' && form.captureMode === 'incremental'"
-            class="rounded-xl border border-blue-500/25 bg-blue-500/10 p-4 text-sm text-blue-700 dark:text-blue-400"
-          >
-            Incremental replica uses JDBC source on the live tables (not Debezium, not triggers). The sink upserts on the PK column. Hard deletes on the source are not applied on the target.
-          </div>
-          <div
+            tone="blue"
+            label="Incremental replica"
+            hint="JDBC poll on live tables (not Debezium, not triggers). Sink upserts on incrementing or upsert key columns (text/composite OK with a timestamp). Hard deletes on the source are not applied on the target."
+          />
+          <AppContextHint
             v-else-if="form.pattern === 'source_to_target' && form.captureMode === 'sync_once'"
-            class="rounded-xl border border-blue-500/25 bg-blue-500/10 p-4 text-sm text-blue-700 dark:text-blue-400"
-          >
-            One-time sync uses Debezium snapshot only (<span class="font-medium">snapshot.mode=initial_only</span>). No ongoing WAL/binlog after the copy finishes.
-          </div>
-          <div
+            tone="blue"
+            label="One-time sync"
+            hint="Debezium snapshot only (snapshot.mode=initial_only). No ongoing WAL/binlog after the copy finishes."
+          />
+          <AppContextHint
             v-else-if="form.pattern === 'source_to_lake'"
-            class="rounded-xl border border-brand-500/25 bg-brand-500/10 p-4 text-sm text-brand-800 dark:text-brand-300"
-          >
-            Event-first plus Iceberg from Kafka. Debezium still reads the source; IcebergSink writes from topics. This is not Analytics-first / OLake.
-          </div>
-          <div
+            tone="brand"
+            label="Event-first + Iceberg"
+            hint="Debezium reads the source; IcebergSink writes from Kafka topics. This is not Analytics-first / OLake."
+          />
+          <AppContextHint
             v-else-if="form.pattern === 'source_to_olake'"
-            class="rounded-xl border border-brand-500/25 bg-brand-500/10 p-4 text-sm text-brand-800 dark:text-brand-300"
-          >
-            Analytics-first uses the OLake stack only — no Debezium, Kafka Connect, or JDBC replica. Save a draft. Start is blocked until Phase 3.
-          </div>
-          <div
-            v-else
-            class="rounded-xl border border-blue-500/25 bg-blue-500/10 p-4 text-sm text-blue-700 dark:text-blue-400"
-          >
-            Change events are published to Redpanda/Kafka topics. Start is Phase 2. Add Iceberg from Kafka above if you also want a lake landing.
-          </div>
+            tone="brand"
+            label="Analytics-first"
+            hint="OLake stack only — no Debezium, Kafka Connect, or JDBC replica. Save a draft. Start is blocked until Phase 3."
+          />
+          <AppContextHint
+            v-else-if="form.pattern === 'source_to_stream'"
+            tone="blue"
+            label="Event-first"
+            hint="Change events publish to Redpanda/Kafka topics. Start is Phase 2. Enable Iceberg from Kafka above for a lake landing."
+          />
           <div v-if="form.pattern === 'source_to_target'" class="grid grid-cols-1 gap-4 md:grid-cols-2">
             <label class="md:col-span-2">
-              <span class="auth-label">Target Name <span class="font-normal text-muted-foreground">(optional — auto-named from host/database)</span></span>
+              <AppFormLabel
+                label="Target name"
+                hint="Optional — auto-named from host and database when empty."
+              />
               <AppInput v-model="form.targetName" placeholder="Orders warehouse" />
             </label>
             <div class="md:col-span-2">
@@ -2398,6 +2731,19 @@ onUnmounted(() => {
                 </p>
               </label>
             </div>
+            <label v-if="form.pattern === 'source_to_target'" class="flex items-start gap-2 text-sm">
+              <input
+                v-model="form.autostart"
+                type="checkbox"
+                class="mt-0.5 h-4 w-4 rounded border-border accent-brand-500"
+              />
+              <span>
+                Autostart after orchestrator restart
+                <span class="mt-0.5 block text-xs text-muted-foreground">
+                  When running, reconcile again after redeploy or boot. Off = use Start manually.
+                </span>
+              </span>
+            </label>
           </div>
           <div v-if="form.pattern === 'source_to_target'" class="space-y-4">
             <div class="flex flex-wrap items-end justify-between gap-3">
@@ -2405,16 +2751,22 @@ onUnmounted(() => {
                 Connect to the target, then load schemas to preview tables that already exist.
                 Table-by-table mapping (same name or rename) is the next step.
               </p>
-              <AppButton :disabled="targetCatalogLoading || !canTestTarget" @click="loadTargetCatalog">
+              <AppButton :disabled="targetCatalogLoading || !canLoadTargetCatalog" @click="loadTargetCatalog">
                 <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': targetCatalogLoading }" :stroke-width="1.75" />
                 {{ targetCatalogLoading ? "Loading..." : "Load schemas" }}
               </AppButton>
             </div>
             <p v-if="targetCatalogError" class="text-sm text-red-700 dark:text-red-400">{{ targetCatalogError }}</p>
             <p v-else-if="!targetCatalogSchemas.length && !targetCatalogLoading" class="text-sm text-muted-foreground">
-              Test the target connection or click Load schemas, then pick a schema to list its tables.
+              Test the target connection or click Load schemas. Check one or more schemas below to list their tables.
             </p>
-            <div v-if="targetSchemaOptions.length" class="grid grid-cols-1 gap-2 md:grid-cols-2">
+            <p
+              v-else-if="targetCatalogSchemas.length && !targetSelectedSchemas.length"
+              class="text-sm text-muted-foreground"
+            >
+              Select at least one schema to show its tables.
+            </p>
+            <div v-if="targetSchemaOptions.length" class="grid max-h-72 grid-cols-1 gap-2 overflow-y-auto md:grid-cols-2">
               <label
                 v-for="schema in targetSchemaOptions"
                 :key="`target-${schema}`"
@@ -2645,7 +2997,7 @@ onUnmounted(() => {
                 <AppInput v-model="mappingSearch" placeholder="Filter source or target" />
               </label>
               <div class="flex flex-wrap gap-2">
-                <AppButton :disabled="targetCatalogLoading || !canTestTarget" @click="loadTargetCatalog">
+                <AppButton :disabled="targetCatalogLoading || !canLoadTargetCatalog" @click="loadTargetCatalog">
                   <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': targetCatalogLoading }" :stroke-width="1.75" />
                   {{ targetCatalogLoading ? "Loading..." : "Refresh target tables" }}
                 </AppButton>
@@ -2870,12 +3222,12 @@ onUnmounted(() => {
               </li>
             </ul>
           </div>
-          <div
+          <AppContextHint
             v-if="form.pattern !== 'source_to_target'"
-            class="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-800 dark:text-yellow-300"
-          >
-            {{ startBlockedReason(form.pattern) }} Save this draft. Only database replica can Start in this phase.
-          </div>
+            tone="yellow"
+            label="Start unavailable"
+            :hint="`${startBlockedReason(form.pattern)} Save this draft. Only database replica can Start in this phase.`"
+          />
           <div class="flex justify-between border-t border-border pt-5">
             <AppButton @click="wizardBack">Back</AppButton>
             <AppButton variant="primary" :disabled="saving || Boolean(dualCaptureWarning)" @click="save()">
@@ -2990,98 +3342,57 @@ onUnmounted(() => {
         </AppTable>
       </AppCard>
 
-      <section v-if="selected" class="space-y-4">
-        <div class="stat-card">
-          <div class="page-toolbar">
-            <div>
-              <div class="flex items-center gap-2">
-                <h2 class="text-lg font-semibold text-foreground">{{ selected.name }}</h2>
-                <AppStatusBadge :status="selected.status" />
-              </div>
-              <AppInfoHint
-                :text="selected.description || `${selected.source.source_type} → ${destinationSummary(selected)}`"
-              />
-            </div>
-            <div class="flex flex-wrap gap-2">
-              <AppButton variant="primary" @click="editSelected">
-                {{ selected.status === "draft" ? "Continue setup" : "Edit Configuration" }}
-              </AppButton>
-              <AppButton
-                :variant="selected.enabled ? 'destructive' : 'primary'"
-                :disabled="!selected.enabled && !canStartSelected"
-                @click="toggleEnabled"
-              >
-                {{ selected.enabled ? "Disable" : "Enable" }}
-              </AppButton>
-              <AppButton variant="destructive" @click="pendingDelete = selected">Delete</AppButton>
-            </div>
-          </div>
-        </div>
-        <PipelineFlow
-          variant="viewer"
-          :pattern="selected.pattern"
-          :status="selected.status"
-          :source-label="databaseLabel(selected.source.source_type)"
-          :source-caption="connectionCaption(selected.source.connection)"
-          :source-image="dbIconPath(selected.source.source_type)"
-          :transform-caption="viewerTransformCaption(selected)"
-          :target-label="destinationSummary(selected)"
-          :target-caption="viewerTargetCaption(selected)"
-          :target-image="selected.pattern === 'source_to_target' ? dbIconPath(selected.target?.target_type) : ''"
-        />
-        <div class="grid grid-cols-1 gap-4 md:grid-cols-4">
-          <AppMetricCard label="Source" :value="selected.source.source_type" :helper="selected.source.connection.host || '—'" tone="brand">
-            <AppDbIcon :type="selected.source.source_type" size="sm" />
-          </AppMetricCard>
-          <AppMetricCard label="Delivery" :value="selected.flow.schedule.delivery_mode" helper="Change event schedule" tone="info">
-            <Waves class="h-5 w-5" :stroke-width="1.75" />
-          </AppMetricCard>
-          <AppMetricCard label="Capture Scope" :value="selected.source.tables.length || 'All'" helper="Selected tables" tone="neutral">
-            <CheckCircle2 class="h-5 w-5" :stroke-width="1.75" />
-          </AppMetricCard>
-          <AppMetricCard
-            label="Sink Errors"
-            :value="selected.pattern === 'source_to_stream' || selected.pattern === 'source_to_olake' ? 'No sink' : dlqLoading ? 'Loading…' : dlqStatus?.enabled ? `${dlqStatus.messages_count} rejected` : 'Fail fast'"
-            :helper="selected.pattern === 'source_to_olake' ? 'OLake does not use a Kafka Connect sink' : selected.pattern === 'source_to_stream' ? 'Event-first pipeline' : dlqError || dlqStatus?.topic || 'Sink stops on rejected records'"
-            tone="warning"
-          >
-            <TriangleAlert class="h-5 w-5" :stroke-width="1.75" />
-          </AppMetricCard>
-        </div>
-        <div class="stat-card">
-          <h2 class="section-title mb-4">Pipeline Controls</h2>
-          <div class="flex flex-wrap gap-2">
-            <AppButton variant="primary" :disabled="!canStartSelected" @click="execute('start')"><Play class="h-4 w-4" />Start</AppButton>
-            <AppButton @click="execute('pause')"><Pause class="h-4 w-4" />Pause</AppButton>
-            <AppButton @click="execute('resume')"><Play class="h-4 w-4" />Resume</AppButton>
-            <AppButton :disabled="!canStartSelected" @click="execute('restart')"><RotateCw class="h-4 w-4" />Restart</AppButton>
-            <AppButton @click="execute('stop')"><Square class="h-4 w-4" />Stop</AppButton>
-            <AppButton :disabled="!canStartSelected" @click="resyncOpen = true"><RefreshCcwDot class="h-4 w-4" />Resync</AppButton>
-            <AppButton
-              :variant="showProcessingLog ? 'primary' : 'secondary'"
-              @click="showProcessingLog = !showProcessingLog"
-            >
-              <ScrollText class="h-4 w-4" />{{ showProcessingLog ? "Hide Log" : "View Log" }}
-            </AppButton>
-          </div>
-          <p class="mt-3 text-xs text-muted-foreground">
-            <template v-if="canStartSelected">
-              Resync replays every row from the source. Use it after clearing target data —
-              a plain Restart resumes where the source left off and will not re-send old rows.
-            </template>
-            <template v-else>{{ startBlockedReason(selected.pattern) }}</template>
-          </p>
-        </div>
-
-        <!-- Per-pipeline processing log -->
-        <PipelineProcessingLog
-          v-if="showProcessingLog"
-          :key="selected.id"
-          :connectors="pipelineConnectors"
-          :title="`Processing Log — ${selected.name}`"
-        />
-      </section>
+      <PipelineDetail
+        v-if="selected && selectedFlow"
+        :key="selected.id"
+        :profile="selected"
+        :flow="selectedFlow"
+        :connectors="pipelineConnectors"
+        :dlq-status="dlqStatus"
+        :dlq-loading="dlqLoading"
+        :can-start="canStartSelected"
+        :start-blocked-reason="startBlockedReason(selected.pattern) || ''"
+        :supports-test-sync="supportsCappedTableCopy"
+        @action="onDetailAction"
+        @autostart="persistAutostart"
+      />
     </template>
+
+    <AppConfirmDialog
+      :open="startVerifyOpen"
+      title="Test initial sync?"
+      confirm-label="Run test & stop"
+      :loading="startVerifying"
+      @update:open="(open) => { if (!open && !startVerifying) startVerifyOpen = false }"
+      @confirm="confirmStartVerify"
+    >
+      <p>
+        Checks connectivity and configuration for
+        <span class="font-semibold text-foreground">{{ selected?.name }}</span>: starts the pipeline, copies a
+        <span class="font-medium">limited</span> row sample from each captured table into the target, then
+        <span class="font-medium">stops it and removes its connectors</span>. Nothing keeps syncing — use
+        Start for production.
+      </p>
+      <label class="mt-3 block text-sm">
+        <span class="auth-label">Rows per table</span>
+        <AppInput v-model="startVerifyRowLimit" inputmode="numeric" placeholder="100" />
+      </label>
+      <label class="mt-3 flex items-start gap-2 text-sm">
+        <input
+          v-model="startVerifyClearTarget"
+          type="checkbox"
+          class="mt-0.5 h-4 w-4 rounded border-border accent-brand-500"
+        />
+        <span>
+          Empty target tables first
+          <span class="block text-xs text-muted-foreground">Recommended for a clean verify run.</span>
+        </span>
+      </label>
+      <p class="mt-2 text-xs text-muted-foreground">
+        Trigger and incremental replica. Rows are the first pages returned from the source (not a random sample).
+        Source offsets are reset on stop, so a later Start begins from the beginning.
+      </p>
+    </AppConfirmDialog>
 
     <AppConfirmDialog
       :open="resyncOpen"
@@ -3119,6 +3430,22 @@ onUnmounted(() => {
               overwritten in place and stale deletes remain.
             </template>
           </span>
+        </span>
+      </label>
+      <label v-if="supportsCappedTableCopy" class="mt-3 block text-sm">
+        <span class="auth-label">Row limit (optional test load)</span>
+        <AppInput
+          v-model="resyncRowLimit"
+          inputmode="numeric"
+          placeholder="e.g. 100 — leave empty for full table"
+        />
+        <span class="mt-1 block text-xs text-muted-foreground">
+          <template v-if="selected?.source?.capture_mode === 'incremental'">
+            Incremental: capped direct copy only (does not reset JDBC offsets). Leave empty for a full resync (offset reset + replay).
+          </template>
+          <template v-else>
+            Copies at most this many rows per captured table (first pages from the source, not a random sample).
+          </template>
         </span>
       </label>
     </AppConfirmDialog>

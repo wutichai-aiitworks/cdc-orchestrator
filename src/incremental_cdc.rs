@@ -31,7 +31,8 @@ pub fn validate_profile(payload: &ProfileUpsertRequest) -> Result<(), AppError> 
     }
     let timestamp = opt_column(payload.source.timestamp_column.as_deref())?;
     let incrementing = opt_column(payload.source.incrementing_column.as_deref())?;
-    if timestamp.is_none() && incrementing.is_none() {
+    let upsert_keys_early = normalized_upsert_keys(&payload.source);
+    if timestamp.is_none() && incrementing.is_none() && upsert_keys_early.is_empty() {
         return Err(AppError::BadRequest(
             "incremental capture needs timestamp_column (e.g. updated_at) and/or incrementing_column (e.g. id)".into(),
         ));
@@ -46,9 +47,15 @@ pub fn validate_profile(payload: &ProfileUpsertRequest) -> Result<(), AppError> 
         ));
     }
     if pattern == ProfilePattern::SourceToTarget {
-        if incrementing.is_none() {
+        let upsert_keys = normalized_upsert_keys(&payload.source);
+        if incrementing.is_none() && upsert_keys.is_empty() {
             return Err(AppError::BadRequest(
-                "incremental replica upsert needs incrementing_column (usually the primary key, e.g. id). Hard deletes are not captured.".into(),
+                "incremental replica upsert needs incrementing_column (numeric poll) and/or upsert_key_columns (e.g. BRANCH_NO,PRO_CODE). Hard deletes are not captured.".into(),
+            ));
+        }
+        if incrementing.is_none() && timestamp.is_none() {
+            return Err(AppError::BadRequest(
+                "incremental replica with text/composite upsert_key_columns requires timestamp_column (e.g. UPDATE_DATE) for JDBC poll".into(),
             ));
         }
         match payload.target.as_ref() {
@@ -79,6 +86,64 @@ pub fn validate_profile(payload: &ProfileUpsertRequest) -> Result<(), AppError> 
         ));
     }
     Ok(())
+}
+
+/// Fill `source.upsert_key_columns` from `flow.mappings[].pk_columns` when the profile
+/// was saved by an older UI/orchestrator pair that only persisted mapping PKs.
+pub fn hydrate_upsert_keys_from_mappings(profile: &mut CdcProfile) {
+    if !profile.source.upsert_key_columns.is_empty() {
+        return;
+    }
+    if profile.source.capture_mode != CaptureMode::Incremental {
+        return;
+    }
+    for mapping in &profile.flow.mappings {
+        for key in &mapping.pk_columns {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if profile
+                .source
+                .upsert_key_columns
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(key))
+            {
+                continue;
+            }
+            profile.source.upsert_key_columns.push(key.to_string());
+        }
+    }
+}
+
+fn normalized_upsert_keys(source: &SourceConfig) -> Vec<String> {
+    source
+        .upsert_key_columns
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn sink_upsert_key_fields(profile: &CdcProfile) -> Result<Vec<String>, AppError> {
+    let keys = normalized_upsert_keys(&profile.source);
+    if !keys.is_empty() {
+        return Ok(if needs_lowercase_fields(profile) {
+            keys.iter().map(|k| k.to_ascii_lowercase()).collect()
+        } else {
+            keys
+        });
+    }
+    let inc = opt_column(profile.source.incrementing_column.as_deref())?.ok_or_else(|| {
+        AppError::BadRequest(
+            "incremental sink upsert needs upsert_key_columns or incrementing_column".into(),
+        )
+    })?;
+    Ok(vec![if needs_lowercase_fields(profile) {
+        inc.to_ascii_lowercase()
+    } else {
+        inc.to_string()
+    }])
 }
 
 pub fn jdbc_mode(source: &SourceConfig) -> Result<&'static str, AppError> {
@@ -248,11 +313,7 @@ pub fn build_incremental_sink_config(
     let password = req(&target.connection, "password")?;
     let db_type = target.target_type.trim().to_ascii_lowercase();
     let prefix = topic_prefix_for(profile);
-    let pk = opt_column(profile.source.incrementing_column.as_deref())?.ok_or_else(|| {
-        AppError::BadRequest(
-            "incremental replica upsert needs incrementing_column (usually the primary key)".into(),
-        )
-    })?;
+    let pk_fields = sink_upsert_key_fields(profile)?;
 
     let jdbc_url = match db_type.as_str() {
         "postgres" | "postgresql" => {
@@ -290,14 +351,7 @@ pub fn build_incremental_sink_config(
     cfg.insert("insert.mode".into(), "upsert".into());
     cfg.insert("delete.enabled".into(), "false".into());
     cfg.insert("primary.key.mode".into(), "record_value".into());
-    // The source renames columns to lowercase before publishing, so the key field the
-    // sink looks up in the record must be folded the same way.
-    let pk_field = if needs_lowercase_fields(profile) {
-        pk.to_ascii_lowercase()
-    } else {
-        pk.to_string()
-    };
-    cfg.insert("primary.key.fields".into(), pk_field);
+    cfg.insert("primary.key.fields".into(), pk_fields.join(","));
     cfg.insert("schema.evolution".into(), "basic".into());
     cfg.insert("quote.identifiers".into(), "true".into());
     cfg.insert("table.name.format".into(), "${topic}".into());
@@ -404,6 +458,7 @@ mod tests {
 
     fn profile() -> CdcProfile {
         CdcProfile {
+            autostart: true,
             id: Uuid::new_v4(),
             name: "Large Tables".into(),
             description: String::new(),
@@ -427,6 +482,7 @@ mod tests {
                 changelog_retention_hours: None,
                 timestamp_column: Some("updated_at".into()),
                 incrementing_column: Some("id".into()),
+                upsert_key_columns: vec![],
             },
             target: Some(TargetConfig {
                 name: "replica".into(),
@@ -565,6 +621,29 @@ mod tests {
         assert_eq!(
             cfg.get("errors.deadletterqueue.topic.name").unwrap(),
             "cdc-large-tables-sink-dlq"
+        );
+    }
+
+    #[test]
+    fn composite_text_upsert_uses_timestamp_poll_only() {
+        let mut p = profile();
+        p.source.source_type = "oracle".into();
+        p.source.tables = vec!["PANDORA.PM_PRODUCT".into()];
+        p.source.timestamp_column = Some("UPDATE_DATE".into());
+        p.source.incrementing_column = None;
+        p.source.upsert_key_columns = vec!["BRANCH_NO".into(), "PRO_CODE".into()];
+        assert_eq!(jdbc_mode(&p.source).unwrap(), "timestamp");
+        let cfg = build_jdbc_source_config(&p, "http://cdc-message:8081", &HashMap::new()).unwrap();
+        assert_eq!(cfg.get("mode").unwrap(), "timestamp");
+        assert_eq!(
+            cfg.get("timestamp.columns.mapping").unwrap(),
+            ".*:[UPDATE_DATE]"
+        );
+        assert!(!cfg.contains_key("incrementing.column.mapping"));
+        let sink = build_incremental_sink_config(&p, "http://cdc-message:8081").unwrap();
+        assert_eq!(
+            sink.get("primary.key.fields").unwrap(),
+            "branch_no,pro_code"
         );
     }
 

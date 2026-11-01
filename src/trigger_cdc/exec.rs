@@ -547,6 +547,7 @@ async fn oracle_preview_columns(
                 changelog_retention_hours: None,
                 timestamp_column: None,
                 incrementing_column: None,
+                upsert_key_columns: vec![],
             },
             schema: table.source_schema.clone(),
             name: table.source_table.clone(),

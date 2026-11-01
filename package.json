@@ -6,7 +6,13 @@
   "scripts": {
     "test:api": "playwright test",
     "test:api:headed": "playwright test --headed",
-    "test:api:debug": "playwright test --debug"
+    "test:api:debug": "playwright test --debug",
+    "test:api:e2e": "ORCH_TEST_E2E=true playwright test",
+    "test:rust": "cargo test --lib --bins && cargo test --manifest-path mcp/Cargo.toml",
+    "check:openapi": "node scripts/check-openapi-routes.mjs",
+    "check:ui-parity": "scripts/check-native-ui-parity.sh",
+    "check": "npm run check:openapi && npm run check:ui-parity && npm run test:rust",
+    "test:all": "npm run check && npm run test:api"
   },
   "devDependencies": {
     "@playwright/test": "^1.54.2",

@@ -7,8 +7,14 @@ export default defineEventHandler((event) => {
   if (!["start", "pause", "resume", "restart", "stop", "resync"].includes(action)) {
     throw createError({ statusCode: 400, statusMessage: "Unsupported profile action" })
   }
-  const clearTarget = getQuery(event).clear_target === "true"
-  const query = action === "resync" && clearTarget ? "?clear_target=true" : ""
+  const q = getQuery(event)
+  const params = new URLSearchParams()
+  if (action === "resync" || action === "start" || action === "restart") {
+    if (q.clear_target === "true") params.set("clear_target", "true")
+    const rowLimit = String(q.row_limit ?? "").trim()
+    if (rowLimit) params.set("row_limit", rowLimit)
+  }
+  const query = params.toString() ? `?${params.toString()}` : ""
   return orchestratorFetch(event, `/cdc/profiles/${id}/actions/${action}${query}`, {
     method: "POST",
   })

@@ -12,6 +12,8 @@ let cached: CachedMachineToken | null = null
 let inflight: Promise<string> | null = null
 
 export function resolveSsoTokenUrl(cfg: RuntimeCfg): string {
+  const explicit = String(cfg.ssoTokenUrl || "").trim()
+  if (explicit) return explicit
   const exchangeUrl = String(cfg.ssoExchangeUrl || "").trim()
   if (!exchangeUrl) return ""
   try {

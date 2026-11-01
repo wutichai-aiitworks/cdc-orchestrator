@@ -1,4 +1,5 @@
-import { isAuthDisabled } from "~/utils/authMode"
+import { isAuthDisabled, isLocalAuth, isSsoAuth } from "~/utils/authMode"
+import { buildSsoStartPath, buildSupertokensLoginUrl, getSsoProvider } from "~/utils/sso"
 
 export type AuthUser = {
   userId: string
@@ -59,15 +60,54 @@ export function useAuth() {
   const loginWithAutheliaCode = (code: string, state: string) =>
     exchange({ provider: "authelia", code, state })
 
+  async function loginWithPassword(username: string, password: string, next?: string): Promise<ExchangeResult> {
+    loading.value = true
+    try {
+      const res = await $fetch<{ ok: boolean; next?: string }>("/api/auth/login", {
+        method: "POST",
+        body: { username, password, next },
+        timeout: 12000,
+      })
+      await refresh()
+      return { success: true, next: res.next }
+    } catch (e: any) {
+      return {
+        success: false,
+        error: e?.data?.message || e?.message || "Sign-in failed.",
+        status: e?.statusCode ?? e?.status ?? e?.response?.status,
+      }
+    } finally {
+      loading.value = false
+    }
+  }
+
   async function logout() {
-    const res = await $fetch<{ ok: boolean; redirect?: string }>("/api/auth/logout", { method: "POST" })
+    await $fetch("/api/auth/logout", { method: "POST" })
     user.value = null
-    const redirect = String(res?.redirect || "/").trim()
-    if (redirect.startsWith("http")) {
-      window.location.href = redirect
+    useState<number>("cdc-auth-last-verified").value = 0
+
+    if (import.meta.client && isSsoAuth(cfg)) {
+      const provider = getSsoProvider(cfg)
+      if (provider === "authelia") {
+        window.location.replace(buildSsoStartPath("/", { force_consent: "1" }))
+        return
+      }
+      const shared = buildSupertokensLoginUrl(cfg)
+      if (shared) {
+        const target = new URL(shared)
+        target.searchParams.set("force_login", "1")
+        target.searchParams.set("logged_out", "1")
+        window.location.replace(target.toString())
+        return
+      }
+      window.location.replace(buildSsoStartPath("/", { force_login: "1" }))
       return
     }
-    await navigateTo(redirect || "/")
+    if (isLocalAuth(cfg)) {
+      await navigateTo("/auth/login")
+      return
+    }
+    await navigateTo("/")
   }
 
   return {
@@ -78,6 +118,7 @@ export function useAuth() {
     refresh,
     loginWithSso,
     loginWithAutheliaCode,
+    loginWithPassword,
     logout,
   }
 }

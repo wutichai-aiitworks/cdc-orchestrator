@@ -42,7 +42,14 @@ Create `.env_local` from `.env.example`.
 See `.env.example`:
 
 - `APP_NAME`, `ORCHESTRATOR_URL`, `PUBLIC_ORCHESTRATOR_URL`, `ORCHESTRATOR_TOKEN`
-- `AUTH_MODE`, `SESSION_SECRET`, `SSO_APP_ID`, `SSO_LOGIN_URL`, `SSO_CALLBACK_URL`, `SSO_EXCHANGE_URL`, `SSO_APP_SECRET`
+- `AUTH_MODE` = `none` | `local` | `sso`
+- `AUTH_MODE=local`: standalone username/password login at `/auth/login`.
+  `ADMIN_USERNAME` / `ADMIN_PASSWORD` default to `admin` / `admin` — change them
+  outside local dev. `SESSION_SECRET` is optional (ephemeral per process if unset,
+  so sessions reset on restart). Failed logins are rate-limited per client IP
+  (10 per 5 minutes). The client IP is the socket address; set `TRUST_PROXY=true`
+  only behind a reverse proxy that overwrites `X-Forwarded-For`.
+- `SESSION_SECRET`, `SSO_APP_ID`, `SSO_LOGIN_URL`, `SSO_CALLBACK_URL`, `SSO_EXCHANGE_URL`, `SSO_APP_SECRET`
 - `SSO_EXCHANGE_DEBUG=true` to log `/auth/custom-sso/exchange` request and response (default off). Ad-hoc, no restart: `POST /api/auth/sso/debug` with `{"enabled":true}` on `:4320`
 - Authelia: `SSO_PROVIDER=authelia` plus `AUTHELIA_*`
 

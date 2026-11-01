@@ -106,6 +106,7 @@ export type ProfilePayload = {
     changelog_retention_hours?: number | null
     timestamp_column?: string | null
     incrementing_column?: string | null
+    upsert_key_columns?: string[]
   }
   target?: {
     name?: string
@@ -124,11 +125,14 @@ export type ProfilePayload = {
     }
     mappings?: TableMapping[]
   }
+  /** When true (default), orchestrator restarts this pipeline after boot if it was running. */
+  autostart?: boolean
 }
 
 export type CdcProfile = ProfilePayload & {
   id: string
   enabled: boolean
+  autostart?: boolean
   status: string
   created_at?: string
   updated_at?: string
@@ -136,6 +140,16 @@ export type CdcProfile = ProfilePayload & {
   connector_name?: string | null
   /** Sink connector name assigned by the orchestrator (e.g. `cdc-test01-sink`). */
   sink_connector_name?: string | null
+  last_error?: string | null
+  /** Capped lifecycle log, oldest first. */
+  history?: ProfileHistoryItem[]
+}
+
+export type ProfileHistoryItem = {
+  timestamp: string
+  level: string
+  event: string
+  detail: string
 }
 
 export type ProfileDlqStatus = {
@@ -255,18 +269,32 @@ export const useProfilesM3 = () => {
       method: "POST",
       body: { enabled },
     })
-  const runAction = (id: string, action: "start" | "pause" | "resume" | "restart" | "stop") =>
-    $fetch<{ profile: CdcProfile }>(
+  const runAction = (
+    id: string,
+    action: "start" | "pause" | "resume" | "restart" | "stop",
+    opts?: { clearTarget?: boolean; rowLimit?: number | null },
+  ) => {
+    const query: Record<string, string> = {}
+    if (opts?.clearTarget) query.clear_target = "true"
+    if (opts?.rowLimit != null && opts.rowLimit > 0) {
+      query.row_limit = String(Math.floor(opts.rowLimit))
+    }
+    return $fetch<{ profile: CdcProfile }>(
       `/api/cdc/profiles/${encodeURIComponent(id)}/actions/${action}`,
-      { method: "POST" }
+      { method: "POST", query: Object.keys(query).length ? query : undefined },
     )
+  }
 
   /// Replay the pipeline from the start of the source, optionally emptying the target first.
-  const resyncProfile = (id: string, clearTarget: boolean) =>
-    $fetch<{ profile: CdcProfile }>(
+  const resyncProfile = (id: string, clearTarget: boolean, rowLimit?: number | null) => {
+    const query: Record<string, string> = {}
+    if (clearTarget) query.clear_target = "true"
+    if (rowLimit != null && rowLimit > 0) query.row_limit = String(Math.floor(rowLimit))
+    return $fetch<{ profile: CdcProfile }>(
       `/api/cdc/profiles/${encodeURIComponent(id)}/actions/resync`,
-      { method: "POST", query: clearTarget ? { clear_target: "true" } : undefined }
+      { method: "POST", query: Object.keys(query).length ? query : undefined },
     )
+  }
 
   return {
     fetchProfiles,

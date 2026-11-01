@@ -325,6 +325,198 @@ pub async fn alert_history(
     Json(hist.into_iter().take(cap).collect())
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AuditEventsQuery {
+    #[serde(default = "default_audit_limit")]
+    pub limit: usize,
+    pub action: Option<String>,
+    pub profile_id: Option<String>,
+    pub outcome: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+fn default_audit_limit() -> usize {
+    100
+}
+
+pub async fn list_audit_events(
+    State(state): State<AppState>,
+    Query(q): Query<AuditEventsQuery>,
+) -> Result<Json<serde_json::Value>, crate::error::AppError> {
+    let Some(rqlite) = state.rqlite.as_ref() else {
+        return Err(crate::error::AppError::BadRequest(
+            "audit database requires ORCH_RQLITE_URL".into(),
+        ));
+    };
+    let rows = rqlite
+        .list_audit_events(
+            q.limit,
+            q.action.as_deref().filter(|s| !s.is_empty()),
+            q.profile_id.as_deref().filter(|s| !s.is_empty()),
+            q.outcome.as_deref().filter(|s| !s.is_empty()),
+            q.since.as_deref().filter(|s| !s.is_empty()),
+            q.until.as_deref().filter(|s| !s.is_empty()),
+        )
+        .await
+        .map_err(|e| crate::error::AppError::Upstream(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "items": rows,
+        "count": rows.len(),
+        "store": "rqlite",
+        "table": "cdc_audit_events",
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PipelineLogsQuery {
+    #[serde(default = "default_audit_limit")]
+    pub limit: usize,
+    pub action: Option<String>,
+    pub profile_id: Option<String>,
+    pub outcome: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub level: Option<String>,
+    pub phase: Option<String>,
+}
+
+pub async fn list_pipeline_logs(
+    State(state): State<AppState>,
+    Query(q): Query<PipelineLogsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let Some(rqlite) = state.rqlite.as_ref() else {
+        return Err(AppError::BadRequest(
+            "pipeline logs require ORCH_RQLITE_URL".into(),
+        ));
+    };
+    let rows = rqlite
+        .list_pipeline_logs(
+            q.limit,
+            q.action.as_deref().filter(|s| !s.is_empty()),
+            q.profile_id.as_deref().filter(|s| !s.is_empty()),
+            q.outcome.as_deref().filter(|s| !s.is_empty()),
+            q.since.as_deref().filter(|s| !s.is_empty()),
+            q.until.as_deref().filter(|s| !s.is_empty()),
+            q.level.as_deref().filter(|s| !s.is_empty()),
+            q.phase.as_deref().filter(|s| !s.is_empty()),
+        )
+        .await
+        .map_err(|e| AppError::Upstream(e.to_string()))?;
+    Ok(Json(json!({
+        "items": rows,
+        "count": rows.len(),
+        "store": "rqlite",
+        "table": "cdc_pipeline_logs",
+    })))
+}
+
+pub async fn profile_pipeline_logs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<PipelineLogsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let Some(rqlite) = state.rqlite.as_ref() else {
+        return Err(AppError::BadRequest(
+            "pipeline logs require ORCH_RQLITE_URL".into(),
+        ));
+    };
+    let rows = rqlite
+        .list_pipeline_logs(
+            q.limit,
+            q.action.as_deref().filter(|s| !s.is_empty()),
+            Some(&id.to_string()),
+            q.outcome.as_deref().filter(|s| !s.is_empty()),
+            q.since.as_deref().filter(|s| !s.is_empty()),
+            q.until.as_deref().filter(|s| !s.is_empty()),
+            q.level.as_deref().filter(|s| !s.is_empty()),
+            q.phase.as_deref().filter(|s| !s.is_empty()),
+        )
+        .await
+        .map_err(|e| AppError::Upstream(e.to_string()))?;
+    Ok(Json(json!({
+        "items": rows,
+        "count": rows.len(),
+        "profile_id": id,
+        "store": "rqlite",
+        "table": "cdc_pipeline_logs",
+    })))
+}
+
+pub async fn profile_table_sync_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<crate::profile_table_status::TableSyncStatusQuery>,
+) -> Result<Json<crate::profile_table_status::ProfileTableSyncStatusResponse>, AppError> {
+    let resp = crate::profile_table_status::profile_table_sync_status(&state, id, q).await?;
+    Ok(Json(resp))
+}
+
+pub async fn profile_investigate(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let mut profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    crate::incremental_cdc::hydrate_upsert_keys_from_mappings(&mut profile);
+
+    let source_status = if let Some(name) = profile.connector_name.as_deref() {
+        connector_status_json(&state, name).await
+    } else {
+        json!(null)
+    };
+    let sink_status = if let Some(name) = profile.sink_connector_name.as_deref() {
+        connector_status_json(&state, name).await
+    } else {
+        json!(null)
+    };
+    let source_offsets = if let Some(name) = profile.connector_name.as_deref() {
+        connector_offsets_json(&state, name).await
+    } else {
+        json!(null)
+    };
+
+    let pipeline_logs = if let Some(rqlite) = state.rqlite.as_ref() {
+        rqlite
+            .list_pipeline_logs(100, None, Some(&id.to_string()), None, None, None, None, None)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    profile.redact_secrets();
+    Ok(Json(json!({
+        "timestamp": Utc::now(),
+        "profile": crate::audit::profile_snapshot(&profile),
+        "connectors": {
+            "source": { "name": profile.connector_name, "status": source_status, "offsets": source_offsets },
+            "sink": { "name": profile.sink_connector_name, "status": sink_status },
+        },
+        "recent_pipeline_logs": pipeline_logs,
+        "profile_history": profile.history,
+    })))
+}
+
+async fn connector_status_json(state: &AppState, name: &str) -> Value {
+    let path = format!("/connectors/{}/status", urlencoding::encode(name));
+    match connect_request(state, Method::GET, &path, None).await {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+async fn connector_offsets_json(state: &AppState, name: &str) -> Value {
+    let path = format!("/connectors/{}/offsets", urlencoding::encode(name));
+    match connect_request(state, Method::GET, &path, None).await {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
 pub async fn ws_alerts(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |sock| relay(sock, state))
 }

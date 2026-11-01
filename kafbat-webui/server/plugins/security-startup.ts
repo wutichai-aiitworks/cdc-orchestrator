@@ -1,6 +1,7 @@
 /**
  * Production fail-closed checks. Local/dev may run with AUTH_MODE=none.
  * Production must not stay open unless ALLOW_OPEN_AUTH=true.
+ * AUTH_MODE=local (standalone admin login) only warns on default credentials.
  */
 
 const WEAK_SESSION_SECRETS = new Set([
@@ -26,6 +27,18 @@ export default defineNitroPlugin(() => {
 
   if ((authMode === "none" || authMode === "disabled" || authMode === "off") && !allowOpenAuth) {
     errors.push("AUTH_MODE=none is not allowed in production unless ALLOW_OPEN_AUTH=true.")
+  }
+
+  if (authMode === "local") {
+    const user = String(process.env.ADMIN_USERNAME || config.adminUsername || "admin")
+    const pass = String(process.env.ADMIN_PASSWORD || config.adminPassword || "admin")
+    if (user === "admin" && pass === "admin") {
+      console.warn("[security-startup] AUTH_MODE=local is using default admin/admin credentials. Set ADMIN_USERNAME / ADMIN_PASSWORD.")
+    }
+    const sessionSecret = String(process.env.SESSION_SECRET || config.sessionSecret || "").trim()
+    if (sessionSecret.length < 32) {
+      console.warn("[security-startup] SESSION_SECRET not set (>=32 chars); using an ephemeral secret, sessions reset on restart.")
+    }
   }
 
   if (authMode === "sso") {

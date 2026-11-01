@@ -31,6 +31,12 @@ tags:
     description: Alert rules, history, WebSocket events, and webhooks.
   - name: Observability
     description: Prometheus metrics and operational signals.
+  - name: Compare
+    description: Schema Compare — saved connection pairs, counts, previews, DDL apply, one-shot copy.
+  - name: Audit
+    description: Sync audit trail and pipeline logs (rqlite-backed).
+  - name: Migration Tools
+    description: One-shot migration jobs (pgcopydb, pgloader, redis-shake, mongo copy) with a shared contract.
 security:
   - bearerAuth: []
 paths:
@@ -1395,7 +1401,17 @@ paths:
                 $ref: "#/components/schemas/ProfileResponse"
   /cdc/profiles/{id}/actions/{action}:
     post:
-      summary: start | pause | resume | restart | stop (reconciles Kafka Connect)
+      summary: start | pause | resume | restart | stop | resync (reconciles Kafka Connect)
+      description: |
+        **Test initial sync** — `start` (or `restart`) with `row_limit` is a connectivity and
+        configuration check, not a production sync. It starts the pipeline, copies up to
+        `row_limit` rows per table into the target, then stops it: source offsets are reset and
+        both connectors are deleted. The profile ends `stopped` with a
+        `profile_test_initial_sync` history entry listing per-table row counts. If any step
+        fails, the connectors are still removed and the profile ends `failed`. Trigger and
+        incremental `source_to_target` pipelines only.
+
+        `resync` with `row_limit` copies a capped sample and keeps the pipeline running.
       operationId: profileAction
       tags: [Profiles]
       parameters:
@@ -1410,7 +1426,15 @@ paths:
           required: true
           schema:
             type: string
-            enum: [start, pause, resume, restart, stop]
+            enum: [start, pause, resume, restart, stop, resync]
+        - in: query
+          name: row_limit
+          schema: { type: integer, minimum: 1 }
+          description: With start/restart, runs a test initial sync and stops afterwards. With resync, caps the copied sample.
+        - in: query
+          name: clear_target
+          schema: { type: boolean, default: false }
+          description: Truncate the mapped target tables before copying (test initial sync / resync).
       responses:
         "200":
           description: Profile
@@ -1725,6 +1749,477 @@ paths:
       responses:
         "200":
           description: Topics
+  /cdc/profiles/{id}/investigate:
+    get:
+      summary: One-shot triage bundle (connector status, offsets, history, recent audit)
+      operationId: investigateProfile
+      tags: [Profiles, Audit]
+      parameters:
+        - $ref: "#/components/parameters/ProfileId"
+      responses:
+        "200":
+          description: Triage bundle
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/profiles/{id}/tables/sync-status:
+    get:
+      summary: Per-table source / Kafka / target counts and approximate lag
+      operationId: getProfileTableSyncStatus
+      tags: [Profiles]
+      parameters:
+        - $ref: "#/components/parameters/ProfileId"
+      responses:
+        "200":
+          description: Per-table sync status
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/profiles/{id}/logs:
+    get:
+      summary: Pipeline log entries for one profile
+      operationId: getProfilePipelineLogs
+      tags: [Profiles, Audit]
+      parameters:
+        - $ref: "#/components/parameters/ProfileId"
+        - $ref: "#/components/parameters/AuditLimit"
+      responses:
+        "200":
+          description: Pipeline log entries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEventsResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/audit/events:
+    get:
+      summary: Query the sync audit trail (rqlite)
+      operationId: listAuditEvents
+      tags: [Audit]
+      parameters:
+        - $ref: "#/components/parameters/AuditLimit"
+        - { in: query, name: action, schema: { type: string }, description: "e.g. profile.delete, topic.create" }
+        - { in: query, name: profile_id, schema: { type: string, format: uuid } }
+        - { in: query, name: outcome, schema: { type: string, enum: [success, failure] } }
+        - { in: query, name: since, schema: { type: string, format: date-time } }
+        - { in: query, name: until, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Audit events, newest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEventsResponse" }
+  /cdc/pipeline-logs:
+    get:
+      summary: Query pipeline logs across profiles
+      operationId: listPipelineLogs
+      tags: [Audit]
+      parameters:
+        - $ref: "#/components/parameters/AuditLimit"
+        - { in: query, name: action, schema: { type: string } }
+        - { in: query, name: profile_id, schema: { type: string, format: uuid } }
+        - { in: query, name: outcome, schema: { type: string } }
+        - { in: query, name: level, schema: { type: string } }
+        - { in: query, name: phase, schema: { type: string } }
+        - { in: query, name: since, schema: { type: string, format: date-time } }
+        - { in: query, name: until, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Pipeline log entries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEventsResponse" }
+  /cdc/compare/profiles:
+    get:
+      summary: List saved schema-compare connection pairs
+      operationId: listCompareProfiles
+      tags: [Compare]
+      responses:
+        "200":
+          description: Saved compare profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profiles:
+                    type: array
+                    items: { $ref: "#/components/schemas/SchemaCompareProfile" }
+    post:
+      summary: Save a schema-compare connection pair
+      operationId: createCompareProfile
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SchemaCompareProfileRequest" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SchemaCompareProfile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/compare/profiles/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ProfileId"
+    get:
+      summary: Get a saved compare profile
+      operationId: getCompareProfile
+      tags: [Compare]
+      responses:
+        "200":
+          description: Compare profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SchemaCompareProfile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Replace a saved compare profile
+      operationId: updateCompareProfile
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SchemaCompareProfileRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SchemaCompareProfile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a saved compare profile
+      operationId: deleteCompareProfile
+      tags: [Compare]
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/compare/target/exec-ddl:
+    post:
+      summary: Execute one DDL statement on a connection (Schema Compare apply)
+      description: |
+        Runs the statement as-is via jdbc-admin. Powerful by design — restrict who can
+        reach this endpoint (bearer token) in shared environments.
+      operationId: execCompareDdl
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExecDdlRequest" }
+      responses:
+        "200":
+          description: Statement executed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statement: { type: string }
+                  status: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/compare/data/copy:
+    post:
+      summary: One-shot batched copy of tables from source to target
+      operationId: copyCompareData
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CopyDataRequest" }
+      responses:
+        "200":
+          description: Per-table copy results
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CopyDataResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/compare/table/preview:
+    post:
+      summary: Page through table rows
+      operationId: previewCompareTable
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TablePreviewRequest" }
+      responses:
+        "200":
+          description: One page of rows
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TablePreviewResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/compare/table/count:
+    post:
+      summary: Exact row count for one table
+      operationId: countCompareTable
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TableCountRequest" }
+      responses:
+        "200":
+          description: Row count
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCountResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/compare/schema/counts:
+    post:
+      summary: Row counts for every table in a schema
+      operationId: countCompareSchema
+      tags: [Compare]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SchemaCountsRequest" }
+      responses:
+        "200":
+          description: Counts keyed by table name
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SchemaCountsResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/migration-tools/discover:
+    get:
+      summary: Discover enabled one-shot migration tools (pgcopy, pgloader, redisshake, mongocopy)
+      operationId: discoverMigrationTools
+      tags: [Migration Tools]
+      responses:
+        "200":
+          description: Tool registry with contract/discover/UI paths
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MigrationToolsDiscovery" }
+  /cdc/migration-tools/{tool}/contract:
+    get:
+      summary: Tool contract (same as /cdc/{tool}/contract)
+      operationId: getMigrationToolContract
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Tool contract, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/migration-tools/{tool}/discover:
+    get:
+      summary: Tool discovery (same as /cdc/{tool}/discover)
+      operationId: discoverMigrationTool
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Tool discovery, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/{tool}/capability:
+    get:
+      summary: Connection fields and options the tool accepts
+      operationId: getToolCapability
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Capability, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/{tool}/contract:
+    get:
+      summary: Tool contract
+      operationId: getToolContract
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Contract, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/{tool}/discover:
+    get:
+      summary: Tool discovery
+      operationId: discoverTool
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Discovery, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/{tool}/validate:
+    post:
+      summary: Validate a tool profile without saving (pgcopy, redisshake, mongocopy)
+      operationId: validateToolProfile
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses:
+        "200": { description: Validation result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/{tool}/profiles:
+    parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+    get:
+      summary: List saved tool profiles
+      operationId: listToolProfiles
+      tags: [Migration Tools]
+      responses:
+        "200":
+          description: Profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profiles: { type: array, items: { type: object, additionalProperties: true } }
+    post:
+      summary: Save a tool profile
+      operationId: createToolProfile
+      tags: [Migration Tools]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses:
+        "200": { description: Created, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/{tool}/profiles/{id}:
+    parameters:
+      - $ref: "#/components/parameters/MigrationTool"
+      - $ref: "#/components/parameters/ProfileId"
+    get:
+      summary: Get a tool profile
+      operationId: getToolProfile
+      tags: [Migration Tools]
+      responses:
+        "200": { description: Profile, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Replace a tool profile
+      operationId: updateToolProfile
+      tags: [Migration Tools]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a tool profile
+      operationId: deleteToolProfile
+      tags: [Migration Tools]
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/{tool}/profiles/{id}/run:
+    post:
+      summary: Start a job from a saved profile
+      operationId: runToolProfile
+      tags: [Migration Tools]
+      parameters:
+        - $ref: "#/components/parameters/MigrationTool"
+        - $ref: "#/components/parameters/ProfileId"
+      responses:
+        "200": { description: Job started, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/{tool}/jobs:
+    get:
+      summary: List jobs
+      operationId: listToolJobs
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      responses:
+        "200": { description: Jobs, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/{tool}/jobs/{job_id}:
+    get:
+      summary: Get one job
+      operationId: getToolJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }, { $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Job, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/{tool}/jobs/{job_id}/logs:
+    get:
+      summary: Job log output
+      operationId: getToolJobLogs
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }, { $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Logs, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/{tool}/jobs/{job_id}/stop:
+    post:
+      summary: Stop a running job
+      operationId: stopToolJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }, { $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Stopped, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/connectors/plugins:
+    get:
+      summary: List connector plugins installed on the Kafka Connect worker
+      operationId: listConnectorPlugins
+      tags: [Connectors]
+      responses:
+        "200": { description: Installed plugins, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/connectors/{name}/topics:
+    get:
+      summary: Topics a connector has produced to or consumed from
+      operationId: getConnectorTopics
+      tags: [Connectors, Kafka]
+      parameters:
+        - { in: path, name: name, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Connector topics, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/consumer-groups/{group}/lag:
+    get:
+      summary: Consumer group lag per partition (alias of /cdc/kafka/groups/{group}/lag)
+      operationId: getConsumerGroupLag
+      tags: [Kafka]
+      parameters:
+        - { in: path, name: group, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Group lag
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupLagResponse" }
+  /cdc/consumer-groups/{group}/topics/{topic}/offsets:
+    delete:
+      summary: Delete a consumer group's committed offsets for one topic
+      operationId: deleteConsumerGroupTopicOffsets
+      tags: [Kafka]
+      parameters:
+        - { in: path, name: group, required: true, schema: { type: string } }
+        - { in: path, name: topic, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Offsets deleted, content: { application/json: { schema: { $ref: "#/components/schemas/ActionResponse" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/schemas/{subject}/compatibility:
+    parameters:
+      - { in: path, name: subject, required: true, schema: { type: string } }
+    post:
+      summary: Test a candidate schema against the subject's compatibility rule
+      operationId: checkSchemaCompatibility
+      tags: [Kafka]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses:
+        "200": { description: Compatibility result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    put:
+      summary: Set the subject's compatibility level
+      operationId: setSchemaCompatibility
+      tags: [Kafka]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses:
+        "200": { description: Compatibility updated, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/schemas/{subject}/versions/{version}:
+    delete:
+      summary: Delete one schema version from a subject
+      operationId: deleteSchemaVersion
+      tags: [Kafka]
+      parameters:
+        - { in: path, name: subject, required: true, schema: { type: string } }
+        - { in: path, name: version, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Version deleted, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
 components:
   securitySchemes:
     bearerAuth:
@@ -1749,6 +2244,26 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+  parameters:
+    ProfileId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+    JobId:
+      in: path
+      name: job_id
+      required: true
+      schema: { type: string }
+    MigrationTool:
+      in: path
+      name: tool
+      required: true
+      schema: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy] }
+    AuditLimit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1 }
   schemas:
     ErrorResponse:
       type: object
@@ -2672,3 +3187,146 @@ components:
         webhookSecret: { type: string, nullable: true, writeOnly: true }
         enabled: { type: boolean }
         createdAt: { type: string, format: date-time, nullable: true }
+    SchemaCompareConn:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, example: postgres }
+        host: { type: string }
+        port: { type: string }
+        database: { type: string }
+        username: { type: string }
+        password: { type: string, writeOnly: true }
+        schema: { type: string, description: "Optional schema filter (blank = all)" }
+    SchemaCompareProfileRequest:
+      type: object
+      required: [name, source, target]
+      properties:
+        name: { type: string }
+        source: { $ref: "#/components/schemas/SchemaCompareConn" }
+        target: { $ref: "#/components/schemas/SchemaCompareConn" }
+    SchemaCompareProfile:
+      allOf:
+        - $ref: "#/components/schemas/SchemaCompareProfileRequest"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+    ExecDdlRequest:
+      type: object
+      required: [target, statement]
+      properties:
+        target: { $ref: "#/components/schemas/SchemaCompareConn" }
+        statement: { type: string, example: "CREATE SCHEMA IF NOT EXISTS analytics" }
+    CopyDataRequest:
+      type: object
+      required: [source, target, tables]
+      properties:
+        source: { $ref: "#/components/schemas/SchemaCompareConn" }
+        target: { $ref: "#/components/schemas/SchemaCompareConn" }
+        tables:
+          type: array
+          items:
+            type: object
+            required: [schema, name]
+            properties:
+              schema: { type: string }
+              name: { type: string }
+        batch_size: { type: integer }
+        truncate_before_copy: { type: boolean, default: false }
+        force_direct_copy: { type: boolean, default: false }
+        max_rows: { type: integer, nullable: true }
+    CopyDataResponse:
+      type: object
+      properties:
+        total_rows_copied: { type: integer }
+        errors: { type: integer }
+        tables:
+          type: array
+          items:
+            type: object
+            properties:
+              schema: { type: string }
+              name: { type: string }
+              rows_copied: { type: integer }
+              status: { type: string }
+              error: { type: string }
+    TableCountRequest:
+      type: object
+      required: [connection, schema, table]
+      properties:
+        connection: { $ref: "#/components/schemas/SchemaCompareConn" }
+        schema: { type: string }
+        table: { type: string }
+    TableCountResponse:
+      type: object
+      properties:
+        schema: { type: string }
+        table: { type: string }
+        count: { type: integer }
+    TablePreviewRequest:
+      type: object
+      required: [connection, schema, table]
+      properties:
+        connection: { $ref: "#/components/schemas/SchemaCompareConn" }
+        schema: { type: string }
+        table: { type: string }
+        page: { type: integer, default: 0 }
+        page_size: { type: integer }
+        search: { type: string, nullable: true }
+    TablePreviewResponse:
+      type: object
+      properties:
+        columns: { type: array, items: { type: string } }
+        rows: { type: array, items: { type: array, items: {} } }
+        page: { type: integer }
+        page_size: { type: integer }
+        has_more: { type: boolean }
+    SchemaCountsRequest:
+      type: object
+      required: [connection, schema]
+      properties:
+        connection: { $ref: "#/components/schemas/SchemaCompareConn" }
+        schema: { type: string }
+    SchemaCountsResponse:
+      type: object
+      properties:
+        schema: { type: string }
+        estimated: { type: boolean }
+        counts: { type: object, additionalProperties: { type: integer } }
+    AuditEvent:
+      type: object
+      properties:
+        audit_id: { type: string, format: uuid }
+        action: { type: string, example: profile.delete }
+        actor: { type: string }
+        outcome: { type: string, example: success }
+        profile_id: { type: string, format: uuid, nullable: true }
+        profile_name: { type: string, nullable: true }
+        detail: { type: string, description: JSON-encoded detail }
+        timestamp: { type: string, format: date-time }
+    AuditEventsResponse:
+      type: object
+      properties:
+        count: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/AuditEvent" }
+    MigrationToolsDiscovery:
+      type: object
+      properties:
+        contract_version: { type: string }
+        timestamp: { type: string, format: date-time }
+        tools:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy] }
+              title: { type: string }
+              enabled: { type: boolean }
+              contract_path: { type: string }
+              discover_path: { type: string }
+              ui_path: { type: string }
+              orchestrator_env: { type: array, items: { type: string } }

@@ -41,6 +41,8 @@ pub struct LiveCatalog {
     pub tables: Vec<LiveTable>,
 }
 
+/// Cap tables returned when browsing the whole database (no schema filter).
+const CATALOG_TABLE_MAX: i64 = 20_000;
 const EXACT_COUNT_TABLE_LIMIT: usize = 80;
 const EXACT_COUNT_BUDGET: Duration = Duration::from_secs(6);
 const EXACT_COUNT_PER_TABLE: Duration = Duration::from_secs(2);
@@ -89,6 +91,19 @@ pub async fn load_live_catalog_from_connection(
     connection: &HashMap<String, String>,
     schema_filter: &[String],
 ) -> Result<LiveCatalog, AppError> {
+    // Postgres catalog always uses the native driver (pg_namespace + pg_class). jdbc-admin
+    // is reserved for Oracle/DB2 and other Type 4-only paths in Compose.
+    match source_type.trim().to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" => {
+            return load_postgres_or_err(
+                &insight_from_connection(source_type, connection),
+                schema_filter,
+            )
+            .await;
+        }
+        _ => {}
+    }
+
     if let Some(admin) = jdbc_admin() {
         let (schemas, tables) = admin
             .catalog(source_type, connection, schema_filter)
@@ -97,13 +112,6 @@ pub async fn load_live_catalog_from_connection(
     }
 
     match source_type.trim().to_ascii_lowercase().as_str() {
-        "postgres" | "postgresql" => {
-            load_postgres_or_err(
-                &insight_from_connection(source_type, connection),
-                schema_filter,
-            )
-            .await
-        }
         "mysql" | "mariadb" | "sqlserver" | "mssql" | "sqlite" => {
             let (schemas, tables) =
                 crate::trigger_cdc::live_catalog(source_type, connection).await?;
@@ -355,6 +363,7 @@ pub async fn copy_table_data(
     table: &str,
     batch_size: usize,
     truncate_before_copy: bool,
+    max_rows: Option<u64>,
 ) -> Result<i64, AppError> {
     copy_mapped_table_data(
         src_type,
@@ -367,6 +376,7 @@ pub async fn copy_table_data(
         table,
         batch_size,
         truncate_before_copy,
+        max_rows,
     )
     .await
 }
@@ -390,6 +400,7 @@ pub async fn copy_mapped_table_data(
     tgt_table: &str,
     batch_size: usize,
     truncate_before_copy: bool,
+    max_rows: Option<u64>,
 ) -> Result<i64, AppError> {
     let src_norm = src_type.trim().to_ascii_lowercase();
     let tgt_norm = tgt_type.trim().to_ascii_lowercase();
@@ -405,6 +416,7 @@ pub async fn copy_mapped_table_data(
                 tgt_table,
                 batch_size,
                 truncate_before_copy,
+                max_rows,
             )
             .await
         }
@@ -420,6 +432,7 @@ pub async fn copy_mapped_table_data(
                 tgt_table,
                 batch_size,
                 truncate_before_copy,
+                max_rows,
             )
             .await
         }
@@ -456,6 +469,7 @@ async fn copy_via_jdbc_admin_to_postgres(
     tgt_table: &str,
     batch_size: usize,
     truncate_before_copy: bool,
+    max_rows: Option<u64>,
 ) -> Result<i64, AppError> {
     let admin = require_jdbc_admin(src_type)?;
     let tgt_qualified = quote_qualified(tgt_schema, tgt_table)?;
@@ -469,7 +483,12 @@ async fn copy_via_jdbc_admin_to_postgres(
         tgt_client
             .execute(&format!("TRUNCATE TABLE {tgt_qualified}"), &[])
             .await
-            .map_err(|e| AppError::BadRequest(format!("TRUNCATE {tgt_qualified} failed: {e}")))?;
+            .map_err(|e| {
+                AppError::BadRequest(format!(
+                    "TRUNCATE {tgt_qualified} failed: {}",
+                    postgres_ddl_detail(&e)
+                ))
+            })?;
     }
 
     let insert_sql = format!(
@@ -483,6 +502,13 @@ async fn copy_via_jdbc_admin_to_postgres(
     let mut copied: i64 = 0;
 
     loop {
+        let remaining = max_rows.map(|max| max.saturating_sub(copied as u64));
+        if remaining == Some(0) {
+            break;
+        }
+        let page_size = remaining
+            .map(|n| n.min(effective_batch).max(1))
+            .unwrap_or(effective_batch);
         let preview = admin
             .preview(
                 src_type,
@@ -490,15 +516,20 @@ async fn copy_via_jdbc_admin_to_postgres(
                 src_schema,
                 src_table,
                 page,
-                effective_batch,
+                page_size,
                 None,
             )
             .await?;
         if preview.rows.is_empty() {
             break;
         }
-        let objects: Vec<Value> = preview
-            .rows
+        let row_slice = if let Some(max) = max_rows {
+            let take = (max - copied as u64).min(preview.rows.len() as u64) as usize;
+            &preview.rows[..take]
+        } else {
+            preview.rows.as_slice()
+        };
+        let objects: Vec<Value> = row_slice
             .iter()
             .map(|row| postgres_json_row(&preview.columns, row))
             .collect();
@@ -511,6 +542,9 @@ async fn copy_via_jdbc_admin_to_postgres(
                 AppError::BadRequest(format!("INSERT into {tgt_qualified} failed: {e}"))
             })?;
         copied += batch_len as i64;
+        if max_rows.is_some_and(|max| copied as u64 >= max) {
+            break;
+        }
         if !preview.has_more {
             break;
         }
@@ -553,6 +587,7 @@ async fn copy_postgres_to_postgres(
     tgt_table: &str,
     _batch_size: usize, // not used for COPY — streaming is unbounded
     truncate_before_copy: bool,
+    max_rows: Option<u64>,
 ) -> Result<i64, AppError> {
     let src_qualified = quote_qualified(src_schema, src_table)?;
     let tgt_qualified = quote_qualified(tgt_schema, tgt_table)?;
@@ -572,29 +607,71 @@ async fn copy_postgres_to_postgres(
     let row_count: i64 = src_client
         .query_one(&format!("SELECT COUNT(*) FROM {src_qualified}"), &[])
         .await
-        .map_err(|e| AppError::BadRequest(format!("COUNT on {src_qualified} failed: {e}")))?
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "COUNT on {src_qualified} failed: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?
         .get(0);
+    let copy_limit = max_rows.map(|max| max.min(row_count as u64)).unwrap_or(row_count as u64);
 
     if truncate_before_copy {
         tgt_client
             .execute(&format!("TRUNCATE TABLE {tgt_qualified}"), &[])
             .await
-            .map_err(|e| AppError::BadRequest(format!("TRUNCATE {tgt_qualified} failed: {e}")))?;
+            .map_err(|e| {
+                AppError::BadRequest(format!(
+                    "TRUNCATE {tgt_qualified} failed: {}",
+                    postgres_ddl_detail(&e)
+                ))
+            })?;
     }
 
-    let copy_out_sql = format!("COPY {src_qualified} TO STDOUT WITH (FORMAT CSV, NULL '\\N')");
-    let copy_in_sql = format!("COPY {tgt_qualified} FROM STDIN WITH (FORMAT CSV, NULL '\\N')");
+    // Copy only the columns both tables share, by name. A positional `SELECT *` breaks as
+    // soon as the target has an extra column — including the `__deleted` column the
+    // Debezium sink adds with delete.handling.mode=rewrite.
+    let columns = shared_copy_columns(
+        &src_client,
+        src_schema,
+        src_table,
+        &tgt_client,
+        tgt_schema,
+        tgt_table,
+    )
+    .await?;
+    let column_list = columns.join(", ");
+    let limit_clause = if max_rows.is_some() {
+        format!(" LIMIT {copy_limit}")
+    } else {
+        String::new()
+    };
+    let copy_out_sql = format!(
+        "COPY (SELECT {column_list} FROM {src_qualified}{limit_clause}) TO STDOUT WITH (FORMAT CSV, NULL '\\N')"
+    );
+    let copy_in_sql =
+        format!("COPY {tgt_qualified} ({column_list}) FROM STDIN WITH (FORMAT CSV, NULL '\\N')");
 
     let byte_stream = src_client
         .copy_out(copy_out_sql.as_str())
         .await
-        .map_err(|e| AppError::BadRequest(format!("COPY OUT setup on {src_qualified}: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "COPY OUT setup on {src_qualified}: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
 
     // copy_in<T: ToStatement, U: Buf> — let Rust infer U = bytes::Bytes from usage below.
     let sink = tgt_client
         .copy_in(copy_in_sql.as_str())
         .await
-        .map_err(|e| AppError::BadRequest(format!("COPY IN setup on {tgt_qualified}: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "COPY IN setup on {tgt_qualified}: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
 
     // `CopyInSink<T>` is `!Unpin`; pin both sides on the stack so that
     // `StreamExt::next` and `SinkExt::send` / `SinkExt::close` work.
@@ -605,19 +682,87 @@ async fn copy_postgres_to_postgres(
 
     // Pipe raw bytes from source directly to target — no deserialise/reserialise.
     while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk
-            .map_err(|e| AppError::BadRequest(format!("COPY OUT read on {src_qualified}: {e}")))?;
-        sink.send(chunk)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("COPY IN write on {tgt_qualified}: {e}")))?;
+        let chunk = chunk.map_err(|e| {
+            AppError::BadRequest(format!(
+                "COPY OUT read on {src_qualified}: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
+        sink.send(chunk).await.map_err(|e| {
+            AppError::BadRequest(format!(
+                "COPY IN write on {tgt_qualified}: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
     }
 
     // Flush and signal EOF (COPY done message) to Postgres.
-    sink.close()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("COPY IN close on {tgt_qualified}: {e}")))?;
+    sink.close().await.map_err(|e| {
+        AppError::BadRequest(format!(
+            "COPY IN close on {tgt_qualified}: {}",
+            postgres_ddl_detail(&e)
+        ))
+    })?;
 
-    Ok(row_count)
+    Ok(if max_rows.is_some() {
+        copy_limit as i64
+    } else {
+        row_count
+    })
+}
+
+/// Quoted column names present in both tables (source order), skipping generated
+/// target columns that COPY cannot write.
+async fn shared_copy_columns(
+    src_client: &tokio_postgres::Client,
+    src_schema: &str,
+    src_table: &str,
+    tgt_client: &tokio_postgres::Client,
+    tgt_schema: &str,
+    tgt_table: &str,
+) -> Result<Vec<String>, AppError> {
+    const SQL: &str = "SELECT column_name, is_generated FROM information_schema.columns \
+                       WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
+    let src_rows = src_client
+        .query(SQL, &[&src_schema, &src_table])
+        .await
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "column lookup on source failed: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
+    let tgt_rows = tgt_client
+        .query(SQL, &[&tgt_schema, &tgt_table])
+        .await
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "column lookup on target failed: {}",
+                postgres_ddl_detail(&e)
+            ))
+        })?;
+    if tgt_rows.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "target table {tgt_schema}.{tgt_table} does not exist or has no columns"
+        )));
+    }
+    let writable: std::collections::HashSet<String> = tgt_rows
+        .iter()
+        .filter(|r| r.get::<_, String>(1) == "NEVER")
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    let columns: Vec<String> = src_rows
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .filter(|c| writable.contains(c))
+        .filter_map(|c| quote_ident(&c))
+        .collect();
+    if columns.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "no columns in common between {src_schema}.{src_table} and {tgt_schema}.{tgt_table}"
+        )));
+    }
+    Ok(columns)
 }
 
 // ── Table Data Preview ────────────────────────────────────────────────────────
@@ -875,28 +1020,61 @@ async fn load_postgres_catalog(
         )
         .await
         .map_err(|e| AppError::BadRequest(format!("failed to list schemas: {e}")))?;
-    let schemas: Vec<String> = schema_rows
+    let schema_filter_norm: Vec<String> = schema_filter
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut schemas: Vec<String> = schema_rows
         .into_iter()
         .filter_map(|row| row.try_get::<_, String>(0).ok())
         .filter(|name| !is_system_schema(name))
+        .filter(|name| {
+            schema_filter_norm.is_empty()
+                || schema_filter_norm
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(name))
+        })
         .collect();
 
-    let table_rows = client
-        .query(
-            "SELECT n.nspname, c.relname, \
-                    CASE WHEN c.reltuples < 0 THEN NULL \
-                         ELSE ROUND(c.reltuples)::bigint END \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p') \
-               AND n.nspname NOT LIKE 'pg_%' \
-               AND n.nspname <> 'information_schema' \
-             ORDER BY n.nspname, c.relname \
-             LIMIT 500",
-            &[],
-        )
-        .await
-        .map_err(|e| AppError::BadRequest(format!("failed to list tables: {e}")))?;
+    let table_rows = if schema_filter_norm.is_empty() {
+        client
+            .query(
+                &format!(
+                    "SELECT n.nspname, c.relname, \
+                            CASE WHEN c.reltuples < 0 THEN NULL \
+                                 ELSE ROUND(c.reltuples)::bigint END \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.relkind IN ('r', 'p') \
+                       AND n.nspname NOT LIKE 'pg_%' \
+                       AND n.nspname <> 'information_schema' \
+                     ORDER BY n.nspname, c.relname \
+                     LIMIT {CATALOG_TABLE_MAX}"
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::BadRequest(format!("failed to list tables: {e}")))?
+    } else {
+        client
+            .query(
+                "SELECT n.nspname, c.relname, \
+                        CASE WHEN c.reltuples < 0 THEN NULL \
+                             ELSE ROUND(c.reltuples)::bigint END \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p') \
+                   AND n.nspname NOT LIKE 'pg_%' \
+                   AND n.nspname <> 'information_schema' \
+                   AND n.nspname = ANY($1::text[]) \
+                 ORDER BY n.nspname, c.relname",
+                &[&schema_filter_norm],
+            )
+            .await
+            .map_err(|e| AppError::BadRequest(format!("failed to list tables: {e}")))?
+    };
     let mut tables: Vec<LiveTable> = table_rows
         .into_iter()
         .filter_map(|row| {

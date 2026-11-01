@@ -2,10 +2,10 @@ when:
   event: [pull_request, push, manual]
 
 steps:
-  kafbat-webui:
+  cdc-native-ui:
     image: node:22-bookworm
     commands:
-      - cd kafbat-webui
+      - cd cdc-native-ui
       - npm ci
       - npm run openapi:check
       - npm run typecheck
