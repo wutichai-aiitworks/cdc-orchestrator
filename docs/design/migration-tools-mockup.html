@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Copy &amp; Sync tools — redesign mockup</title>
+<style>
+  /* Tokens mirror cdc-native-ui assets/css/main.css (light theme). */
+  :root {
+    --ink: #252525; --ink-2: #525252; --muted-fg: #737373; --paper: #fff; --wash: #f5f5f5;
+    --rule: #ebebeb; --input: #e5e5e5; --signal: #e29749; --signal-ink: #fff;
+    --ok: #047857; --ok-bg: rgb(16 185 129 / .12); --err: #b91c1c; --err-bg: rgb(239 68 68 / .10);
+    --warn: #b45309; --warn-bg: rgb(234 179 8 / .14); --run: #1d4ed8; --run-bg: rgb(59 130 246 / .12);
+    --r-lg: 8px; --r-md: 6px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/20px Inter, ui-sans-serif, system-ui, sans-serif; color: var(--ink);
+         background: var(--paper); font-feature-settings: "cv11", "ss01"; -webkit-font-smoothing: antialiased; }
+  .num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+  /* App chrome (unchanged in the redesign; shown for context) */
+  .app { display: grid; grid-template-columns: 224px 1fr; min-height: 100vh; }
+  .nav { border-right: 1px solid var(--rule); background: #fafafa; padding: 16px 12px; }
+  .nav .brand { font-weight: 600; padding: 4px 8px 16px; }
+  .nav h6 { margin: 14px 8px 4px; font-size: 12px; font-weight: 500; color: var(--muted-fg); }
+  .nav a { display: block; padding: 7px 8px; border-radius: var(--r-md); color: var(--ink-2); text-decoration: none; }
+  .nav a.on { background: rgb(226 151 73 / .14); color: #9a5b16; font-weight: 500; }
+  .topbar { height: 56px; border-bottom: 1px solid var(--rule); display: flex; align-items: center; padding: 0 24px; }
+  .topbar h1 { font-size: 15px; font-weight: 600; margin: 0; }
+
+  /* Workspace */
+  .ws { display: grid; grid-template-columns: 288px 1fr; height: calc(100vh - 56px); }
+  .rail { border-right: 1px solid var(--rule); background: var(--wash); display: flex; flex-direction: column; min-height: 0; }
+  .rail-head { padding: 16px 16px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .rail-head h2 { font-size: 20px; line-height: 28px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  .rail-head p { margin: 0; color: var(--muted-fg); font-size: 12px; line-height: 16px; }
+  .search { margin: 0 16px 8px; height: 34px; border: 1px solid var(--input); border-radius: var(--r-md); background: var(--paper);
+            display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--muted-fg); font-size: 13px; }
+  .list { overflow: auto; padding: 4px 8px 16px; }
+  .item { display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 10px; border-radius: var(--r-md); cursor: pointer; }
+  .item:hover { background: rgb(0 0 0 / .035); }
+  .item.on { background: var(--paper); box-shadow: inset 0 0 0 1px var(--rule); }
+  .item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .sub { color: var(--muted-fg); font-size: 12px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .state { margin-top: 6px; display: flex; align-items: center; gap: 6px; font-size: 12px; line-height: 16px; color: var(--ink-2); }
+  .pair { display: flex; align-items: center; margin-top: 2px; }
+  .pair .logo + .logo { margin-left: -6px; }
+
+  .logo { width: 22px; height: 22px; border-radius: 5px; background: var(--paper); box-shadow: 0 0 0 1px var(--rule);
+          display: grid; place-items: center; overflow: hidden; flex: none; font-size: 9px; font-weight: 700; color: var(--ink-2); }
+  .logo img { width: 16px; height: 16px; }
+  .logo.lg { width: 40px; height: 40px; border-radius: 8px; font-size: 12px; }
+  .logo.lg img { width: 28px; height: 28px; }
+  .logo.sftp { color: #475569; }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.ok { background: #10b981; } .dot.err { background: #ef4444; } .dot.warn { background: #f59e0b; }
+  .dot.run { background: #3b82f6; box-shadow: 0 0 0 3px rgb(59 130 246 / .2); }
+  .dot.idle { background: #d4d4d4; }
+
+  .detail { overflow: auto; }
+  .dhead { padding: 20px 32px 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .dhead h3 { margin: 0; font-size: 16px; line-height: 24px; font-weight: 600; }
+  .dhead .meta { margin-top: 2px; color: var(--muted-fg); font-size: 12px; line-height: 16px; display: flex; gap: 16px; }
+  .actions { display: flex; gap: 8px; align-items: center; }
+
+  .btn { height: 36px; padding: 0 14px; border-radius: var(--r-md); border: 1px solid var(--input); background: var(--paper);
+         display: inline-flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; white-space: nowrap; }
+  .btn:hover { background: var(--wash); }
+  .btn.primary { background: var(--signal); border-color: var(--signal); color: var(--signal-ink); }
+  .btn.primary:hover { filter: brightness(1.04); }
+  .btn.ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
+  .btn.sm { height: 30px; padding: 0 10px; font-size: 13px; }
+  .btn.icon { width: 36px; padding: 0; justify-content: center; }
+  .btn[disabled] { opacity: .5; cursor: not-allowed; }
+  svg.i { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+  /* Route — the signature element */
+  .route { margin: 20px 32px 0; padding: 20px 24px; border: 1px solid var(--rule); border-radius: var(--r-lg);
+           display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 1.3fr) minmax(0, 1fr); align-items: center; gap: 8px; }
+  .end { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: center; min-width: 0; }
+  .end .role { font-size: 12px; color: var(--muted-fg); line-height: 16px; }
+  .end .host { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .end .db { font-size: 12px; color: var(--ink-2); line-height: 16px; }
+  .end.right { grid-template-columns: 1fr auto; text-align: right; }
+  .stack { display: grid; gap: 10px; }
+  .overwrite { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 12px; color: var(--warn); }
+  .wire { position: relative; height: 56px; }
+  .wire .line { position: absolute; left: 0; right: 0; top: 27px; height: 2px; background: var(--rule); border-radius: 2px; overflow: hidden; }
+  .wire.live .line::after { content: ""; position: absolute; inset: 0; width: 40%;
+           background: linear-gradient(90deg, transparent, var(--signal), transparent); animation: flow 1.6s linear infinite; }
+  @keyframes flow { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  @media (prefers-reduced-motion: reduce) { .wire.live .line::after { animation: none; width: 100%; opacity: .6; } }
+  .wire .steps { position: absolute; inset: 0; display: flex; justify-content: space-evenly; align-items: center; }
+  .step { position: relative; display: grid; justify-items: center; gap: 4px; background: var(--paper); padding: 0 8px; }
+  .step .b { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 600;
+             border: 1.5px solid var(--rule); background: var(--paper); color: var(--muted-fg); }
+  .step .b svg.i { width: 13px; height: 13px; }
+  .step.done .b { border-color: #10b981; background: #10b981; color: #fff; }
+  .step.now .b { border-color: var(--signal); color: #9a5b16; }
+  .step.fail .b { border-color: #ef4444; background: #ef4444; color: #fff; }
+  .step .t { font-size: 12px; line-height: 14px; color: var(--ink-2); white-space: nowrap; }
+  .step .s { font-size: 11px; line-height: 13px; color: var(--muted-fg); white-space: nowrap; }
+
+  /* Tabs */
+  .tabs { margin: 20px 32px 0; display: flex; gap: 24px; border-bottom: 1px solid var(--rule); }
+  .tab { padding: 10px 0; margin-bottom: -1px; color: var(--muted-fg); font-weight: 500; border-bottom: 2px solid transparent; cursor: pointer; }
+  .tab.on { color: var(--ink); border-color: var(--ink); }
+  .tab .c { margin-left: 6px; font-size: 12px; color: var(--muted-fg); }
+  .pane { padding: 24px 32px 96px; max-width: 1120px; }
+
+  /* Overview */
+  .facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; border: 1px solid var(--rule); border-radius: var(--r-lg); }
+  .facts > div { padding: 14px 16px; border-left: 1px solid var(--rule); }
+  .facts > div:first-child { border-left: 0; }
+  .k { font-size: 12px; color: var(--muted-fg); line-height: 16px; }
+  .v { margin-top: 2px; font-size: 15px; font-weight: 600; }
+  .bar { margin-top: 16px; height: 6px; border-radius: 3px; background: var(--wash); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--signal); border-radius: 3px; }
+  .note { margin-top: 10px; color: var(--muted-fg); font-size: 12px; }
+  h4 { margin: 32px 0 12px; font-size: 13px; line-height: 20px; font-weight: 600; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; row-gap: 10px; column-gap: 24px; }
+  .kv dt { color: var(--muted-fg); } .kv dd { margin: 0; }
+  .chip { display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border-radius: 12px; background: var(--wash);
+          font-size: 12px; margin: 0 4px 4px 0; }
+
+  /* Configuration */
+  .cfg { display: grid; grid-template-columns: 1fr 200px; gap: 48px; }
+  .sec { padding: 24px 0; border-top: 1px solid var(--rule); display: grid; grid-template-columns: 220px 1fr; gap: 32px; }
+  .sec:first-child { border-top: 0; padding-top: 0; }
+  .sec h5 { margin: 0; font-size: 13px; font-weight: 600; line-height: 20px; }
+  .sec .why { margin: 4px 0 0; color: var(--muted-fg); font-size: 12px; line-height: 18px; }
+  .fields { display: grid; gap: 14px; max-width: 640px; }
+  .row2 { display: grid; grid-template-columns: 1fr 120px; gap: 12px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  label.f { display: grid; gap: 6px; font-size: 13px; font-weight: 500; }
+  label.f small { font-weight: 400; color: var(--muted-fg); font-size: 12px; }
+  .in { height: 36px; border: 1px solid var(--input); border-radius: var(--r-md); padding: 0 12px; display: flex; align-items: center;
+        background: var(--paper); font-weight: 400; color: var(--ink); }
+  .in.ph { color: #a3a3a3; } .in.area { height: auto; min-height: 64px; align-items: flex-start; padding: 8px 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--input); border-radius: var(--r-md); padding: 2px; gap: 2px; background: var(--wash); }
+  .seg span { padding: 5px 12px; border-radius: 4px; font-size: 13px; color: var(--ink-2); }
+  .seg span.on { background: var(--paper); color: var(--ink); font-weight: 500; box-shadow: 0 1px 1px rgb(0 0 0 / .06); }
+  .conn { border: 1px solid var(--rule); border-radius: var(--r-lg); padding: 14px 16px; display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; }
+  .conn .host { font-weight: 600; } .conn .db { font-size: 12px; color: var(--muted-fg); }
+  .okline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ok); }
+  .toggle { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: start; }
+  .sw { width: 32px; height: 18px; border-radius: 9px; background: #d4d4d4; position: relative; margin-top: 1px; }
+  .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; }
+  .sw.on { background: var(--signal); } .sw.on::after { left: 16px; }
+  .toggle b { font-weight: 500; display: block; } .toggle span { color: var(--muted-fg); font-size: 12px; line-height: 18px; }
+  .toggle.danger b::after { content: " · replaces data on the target"; color: var(--warn); font-weight: 400; font-size: 12px; }
+  .dest { display: grid; grid-template-columns: auto 1fr auto auto; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--rule); }
+  .dest:first-child { border-top: 1px solid var(--rule); }
+  .dest .p { font-size: 12px; color: var(--muted-fg); }
+  .pin { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+  .pin.ok { color: var(--ok); } .pin.no { color: var(--warn); }
+  details.adv summary { cursor: pointer; font-weight: 500; list-style: none; display: flex; align-items: center; gap: 6px; }
+  .toc { position: sticky; top: 24px; align-self: start; display: grid; gap: 2px; font-size: 13px; }
+  .toc a { color: var(--muted-fg); text-decoration: none; padding: 4px 10px; border-left: 2px solid var(--rule); }
+  .toc a.on { color: var(--ink); border-color: var(--ink); font-weight: 500; }
+  .savebar { position: sticky; bottom: 0; margin: 0 -32px; padding: 12px 32px; background: rgb(255 255 255 / .94); backdrop-filter: blur(6px);
+             border-top: 1px solid var(--rule); display: flex; align-items: center; justify-content: space-between; }
+  .savebar .msg { color: var(--ink-2); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+
+  /* Runs */
+  table.runs { width: 100%; border-collapse: collapse; }
+  table.runs th { text-align: left; font-size: 12px; font-weight: 500; color: var(--muted-fg); padding: 0 12px 8px; border-bottom: 1px solid var(--rule); }
+  table.runs td { padding: 12px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+  table.runs tr.open td { background: #fcfcfc; border-bottom: 0; }
+  .st { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px; border-radius: 12px; font-size: 12px; font-weight: 500; }
+  .st.ok { background: var(--ok-bg); color: var(--ok); } .st.err { background: var(--err-bg); color: var(--err); }
+  .st.warn { background: var(--warn-bg); color: var(--warn); } .st.run { background: var(--run-bg); color: var(--run); }
+  .st.stop { background: var(--wash); color: var(--ink-2); }
+  .runx { background: #fcfcfc; border-bottom: 1px solid var(--rule); }
+  .runx-in { padding: 4px 12px 20px 12px; display: grid; gap: 16px; }
+  .phases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--rule); border-radius: var(--r-lg); background: var(--paper); }
+  .ph { padding: 12px 14px; border-left: 1px solid var(--rule); display: grid; gap: 4px; }
+  .ph:first-child { border-left: 0; }
+  .ph .h { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+  .ph .d { font-size: 12px; color: var(--muted-fg); }
+  .problem { border: 1px solid rgb(239 68 68 / .25); background: rgb(239 68 68 / .04); border-radius: var(--r-lg); padding: 14px 16px; display: grid; gap: 6px; }
+  .problem b { color: var(--err); font-weight: 600; }
+  .problem .fix { color: var(--ink); }
+  .log { border: 1px solid var(--rule); border-radius: var(--r-lg); background: var(--paper); overflow: hidden; }
+  .log-bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--rule); font-size: 12px; color: var(--muted-fg); }
+  .log pre { margin: 0; padding: 12px; max-height: 190px; overflow: auto; font: 12px/18px ui-monospace, SFMono-Regular, Menlo, monospace; color: #404040; background: #fafafa; }
+  .log pre .e { color: var(--err); } .log pre .w { color: var(--warn); } .log pre .h { color: var(--muted-fg); }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol>
+  <symbol id="plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="alert" viewBox="0 0 24 24"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.01"/></symbol>
+  <symbol id="dots" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="square" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+  <symbol id="lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></symbol>
+  <symbol id="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a1 1 0 011-1h9"/></symbol>
+  <symbol id="refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 10-2.3 5.7M20 4v7h-7"/></symbol>
+</svg>
+
+<div class="app">
+  <nav class="nav" aria-label="Main">
+    <div class="brand">Hyper CDC</div>
+    <h6>CDC</h6><a href="#">Overview</a><a href="#">CDC Pipelines</a><a href="#">Schema Compare</a>
+    <h6>Copy &amp; Sync</h6>
+    <a href="#">Postgres copy</a><a href="#" class="on">Postgres dump</a><a href="#">Load to Postgres</a>
+    <a href="#">Mongo copy</a><a href="#">Redis sync</a>
+  </nav>
+  <div>
+    <div class="topbar"><h1>Postgres dump</h1></div>
+    <div class="ws">
+      <!-- Rail: every transfer with its last result -->
+      <aside class="rail" aria-label="Transfers">
+        <div class="rail-head">
+          <p>Dump a database to a file, to SFTP servers, or into another database.</p>
+          <button class="btn sm"><svg class="i"><use href="#plus"/></svg>New</button>
+        </div>
+        <div class="search"><svg class="i"><use href="#search"/></svg>Find a transfer</div>
+        <div class="list">
+          <div class="item" data-sel="orders">
+            <div class="pair"><span class="logo"><img src="pg.png" alt=""></span><span class="logo"><img src="pg.png" alt=""></span></div>
+            <div><div class="name">Orders replica seed</div><div class="sub">prod-orders → replica-01</div>
+              <div class="state"><span class="dot run"></span>Running, restore 42%</div></div>
+          </div>
+          <div class="item" data-sel="shop">
+            <div class="pair"><span class="logo"><img src="pg.png" alt=""></span><span class="logo sftp">SF</span></div>
+            <div><div class="name">Shop nightly</div><div class="sub">shop-db → 2 SFTP servers</div>
+              <div class="state"><span class="dot ok"></span>Succeeded 2 h ago</div></div>
+          </div>
+          <div class="item" data-sel="analytics">
+            <div class="pair"><span class="logo"><img src="pg.png" alt=""></span><span class="logo sftp">SF</span></div>
+            <div><div class="name">Analytics weekly</div><div class="sub">analytics → backup-sg</div>
+              <div class="state"><span class="dot warn"></span>Upload failed yesterday</div></div>
+          </div>
+          <div class="item">
+            <div class="pair"><span class="logo"><img src="pg.png" alt=""></span><span class="logo"><svg class="i" style="width:13px;height:13px"><use href="#download"/></svg></span></div>
+            <div><div class="name">Billing schema only</div><div class="sub">billing → file</div>
+              <div class="state"><span class="dot idle"></span>Never run</div></div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ===================== VIEW: overview (running) ===================== -->
+      <main class="detail" id="v-overview" hidden>
+        <div class="dhead">
+          <div><h3>Orders replica seed</h3>
+            <div class="meta"><span>Dump and restore</span><span>Created by woody on 28 Oct</span></div></div>
+          <div class="actions">
+            <button class="btn"><svg class="i"><use href="#square"/></svg>Stop run</button>
+            <button class="btn icon ghost" aria-label="More"><svg class="i"><use href="#dots"/></svg></button>
+          </div>
+        </div>
+        <section class="route" aria-label="Route">
+          <div class="end"><span class="logo lg"><img src="pg.png" alt="PostgreSQL"></span>
+            <div style="min-width:0"><div class="role">Source, PostgreSQL 16</div><div class="host">prod-orders.internal</div><div class="db">orders, port 5432</div></div></div>
+          <div class="wire live">
+            <div class="line"></div>
+            <div class="steps">
+              <div class="step done"><span class="b"><svg class="i"><use href="#check"/></svg></span><span class="t">Dump</span><span class="s num">4 m 12 s</span></div>
+              <div class="step done"><span class="b"><svg class="i"><use href="#check"/></svg></span><span class="t">Create schemas</span><span class="s">sales, ops</span></div>
+              <div class="step now"><span class="b">3</span><span class="t">Restore</span><span class="s num">42%</span></div>
+            </div>
+          </div>
+          <div class="end right"><div style="min-width:0"><div class="role">Target, PostgreSQL 18</div><div class="host">replica-01.internal</div><div class="db">orders, port 5432</div>
+            <div class="overwrite"><svg class="i" style="width:13px;height:13px"><use href="#alert"/></svg>Replaces existing objects</div></div>
+            <span class="logo lg"><img src="pg.png" alt="PostgreSQL"></span></div>
+        </section>
+        <div class="tabs" role="tablist"><span class="tab on">Overview</span><span class="tab">Configuration</span><span class="tab">Runs<span class="c num">14</span></span></div>
+        <div class="pane">
+          <div class="facts num">
+            <div><div class="k">Started</div><div class="v">09:42</div></div>
+            <div><div class="k">Elapsed</div><div class="v">11 m 08 s</div></div>
+            <div><div class="k">Tables restored</div><div class="v">37 of 88</div></div>
+            <div><div class="k">Archive</div><div class="v">4.6 GB</div></div>
+          </div>
+          <div class="bar" aria-label="Restore progress 42%"><i style="width:42%"></i></div>
+          <div class="note mono">processing data for table "sales.order_lines"</div>
+
+          <h4>What this transfer does</h4>
+          <dl class="kv">
+            <dt>Copies</dt><dd><span class="chip">schema sales</span><span class="chip">schema ops</span><span class="chip">rows of ops.audit_log skipped</span></dd>
+            <dt>On the target</dt><dd>Drops and recreates the copied objects, then restores with 4 parallel jobs</dd>
+            <dt>Archive</dt><dd>Custom format, kept on the dump volume for 72 h</dd>
+            <dt>Last success</dt><dd>Yesterday at 09:51, took 19 m 40 s</dd>
+          </dl>
+        </div>
+      </main>
+
+      <!-- ===================== VIEW: configuration ===================== -->
+      <main class="detail" id="v-config" hidden>
+        <div class="dhead">
+          <div><h3>Shop nightly</h3><div class="meta"><span>Dump to SFTP</span><span>Last run succeeded 2 h ago</span></div></div>
+          <div class="actions">
+            <button class="btn primary" disabled title="Save your changes first"><svg class="i"><use href="#play"/></svg>Run dump</button>
+            <button class="btn icon ghost" aria-label="More"><svg class="i"><use href="#dots"/></svg></button>
+          </div>
+        </div>
+        <section class="route" aria-label="Route">
+          <div class="end"><span class="logo lg"><img src="pg.png" alt="PostgreSQL"></span>
+            <div style="min-width:0"><div class="role">Source</div><div class="host">shop-db.internal</div><div class="db">shop, port 5432</div></div></div>
+          <div class="wire"><div class="line"></div>
+            <div class="steps">
+              <div class="step"><span class="b">1</span><span class="t">Dump</span><span class="s">custom, level 6</span></div>
+              <div class="step"><span class="b">2</span><span class="t">Upload</span><span class="s">2 servers</span></div>
+            </div></div>
+          <div class="stack">
+            <div class="end right"><div style="min-width:0"><div class="role">SFTP</div><div class="host">db-host</div><div class="db mono">/var/backups/pg</div></div><span class="logo lg sftp">SF</span></div>
+            <div class="end right"><div style="min-width:0"><div class="role">SFTP</div><div class="host">backup-sg</div><div class="db mono">/srv/dumps/shop</div></div><span class="logo lg sftp">SF</span></div>
+          </div>
+        </section>
+        <div class="tabs" role="tablist"><span class="tab">Overview</span><span class="tab on">Configuration</span><span class="tab">Runs<span class="c num">31</span></span></div>
+        <div class="pane">
+          <div class="cfg">
+            <div>
+              <div class="sec" id="s-src">
+                <div><h5>Source database</h5><p class="why">The database to dump. Use a read-only role, for example one granted pg_read_all_data.</p></div>
+                <div class="fields">
+                  <div class="conn"><span class="logo lg"><img src="pg.png" alt=""></span>
+                    <div><div class="host">shop-db.internal:5432</div><div class="db">Database shop as backup_ro, TLS required</div>
+                      <div class="okline"><svg class="i" style="width:13px;height:13px"><use href="#check"/></svg>Connected 2 min ago, PostgreSQL 16.4</div></div>
+                    <button class="btn sm">Edit</button></div>
+                </div>
+              </div>
+              <div class="sec" id="s-scope">
+                <div><h5>What to dump</h5><p class="why">Leave empty to dump the whole database. Patterns that match nothing stop the run.</p></div>
+                <div class="fields">
+                  <label class="f">Schemas<div class="in"><span class="chip" style="margin:0 6px 0 0">public</span><span class="chip" style="margin:0">sales</span></div></label>
+                  <label class="f">Skip rows of<small>The table definition is kept; its data is not.</small><div class="in mono">public.audit_log, public.events</div></label>
+                </div>
+              </div>
+              <div class="sec" id="s-out">
+                <div><h5>File</h5><p class="why">Custom format restores selectively and in parallel. Plain SQL is readable but slower to restore.</p></div>
+                <div class="fields">
+                  <div class="seg" role="radiogroup" aria-label="Format"><span class="on">Custom archive</span><span>Plain SQL</span><span>Tar</span></div>
+                  <div class="row3"><label class="f">Compression<div class="in num">6</div></label>
+                    <label class="f">Wait for locks<div class="in num">30 s</div></label><div></div></div>
+                </div>
+              </div>
+              <div class="sec" id="s-dest">
+                <div><h5>Store on SFTP servers</h5><p class="why">Each copy is uploaded under a temporary name, size-checked, then renamed, with a .sha256 file beside it.</p></div>
+                <div class="fields">
+                  <div>
+                    <div class="dest"><span class="logo sftp">SF</span>
+                      <div><b style="font-weight:500">db-host</b> <span class="p">postgres@10.0.4.12:22</span><div class="p mono">/var/backups/pg</div></div>
+                      <span class="pin ok"><svg class="i" style="width:13px;height:13px"><use href="#lock"/></svg>Host key pinned</span><button class="btn sm ghost">Edit</button></div>
+                    <div class="dest"><span class="logo sftp">SF</span>
+                      <div><b style="font-weight:500">backup-sg</b> <span class="p">dumps@backup-sg.example.com:22</span><div class="p mono">/srv/dumps/shop</div></div>
+                      <span class="pin no"><svg class="i" style="width:13px;height:13px"><use href="#alert"/></svg>Not pinned</span><button class="btn sm ghost">Edit</button></div>
+                  </div>
+                  <div><button class="btn sm"><svg class="i"><use href="#plus"/></svg>Add SFTP server</button></div>
+                  <div class="toggle"><span class="sw"></span><div><b>Keep a copy on the dump volume</b><span>Off: the local file is deleted once every server has a verified copy.</span></div></div>
+                </div>
+              </div>
+              <div class="sec" id="s-adv">
+                <div><h5>Advanced</h5><p class="why">Rarely changed.</p></div>
+                <div class="fields">
+                  <details class="adv"><summary><svg class="i"><use href="#chev"/></svg>Ownership, privileges and consistency (2 changed)</summary></details>
+                </div>
+              </div>
+              <div class="savebar">
+                <div class="msg"><span class="dot warn"></span>2 unsaved changes: schemas, compression</div>
+                <div class="actions"><button class="btn ghost">Discard</button><button class="btn primary">Save changes</button></div>
+              </div>
+            </div>
+            <nav class="toc" aria-label="Sections"><a href="#s-src">Source database</a><a href="#s-scope" class="on">What to dump</a><a href="#s-out">File</a><a href="#s-dest">Store on SFTP servers</a><a href="#s-adv">Advanced</a></nav>
+          </div>
+        </div>
+      </main>
+
+      <!-- ===================== VIEW: runs (failed upload expanded) ===================== -->
+      <main class="detail" id="v-runs" hidden>
+        <div class="dhead">
+          <div><h3>Analytics weekly</h3><div class="meta"><span>Dump to SFTP</span><span>Every run is kept for 72 h</span></div></div>
+          <div class="actions">
+            <button class="btn primary"><svg class="i"><use href="#play"/></svg>Run dump</button>
+            <button class="btn icon ghost" aria-label="More"><svg class="i"><use href="#dots"/></svg></button>
+          </div>
+        </div>
+        <section class="route" aria-label="Route">
+          <div class="end"><span class="logo lg"><img src="pg.png" alt="PostgreSQL"></span>
+            <div style="min-width:0"><div class="role">Source</div><div class="host">analytics.internal</div><div class="db">warehouse, port 5432</div></div></div>
+          <div class="wire"><div class="line"></div>
+            <div class="steps">
+              <div class="step done"><span class="b"><svg class="i"><use href="#check"/></svg></span><span class="t">Dump</span><span class="s num">12 m 03 s</span></div>
+              <div class="step fail"><span class="b"><svg class="i"><use href="#x"/></svg></span><span class="t">Upload</span><span class="s">1 of 1 failed</span></div>
+            </div></div>
+          <div class="end right"><div style="min-width:0"><div class="role">SFTP</div><div class="host">backup-sg</div><div class="db mono">/srv/dumps/analytics</div></div><span class="logo lg sftp">SF</span></div>
+        </section>
+        <div class="tabs" role="tablist"><span class="tab">Overview</span><span class="tab">Configuration</span><span class="tab on">Runs<span class="c num">9</span></span></div>
+        <div class="pane">
+          <table class="runs num" aria-label="Runs">
+            <thead><tr><th>Result</th><th>Started</th><th>Duration</th><th>File</th><th>Stored on</th><th></th></tr></thead>
+            <tbody>
+              <tr class="open">
+                <td><span class="st warn"><svg class="i" style="width:13px;height:13px"><use href="#alert"/></svg>Upload failed</span></td>
+                <td>Yesterday 02:00</td><td>12 m 31 s</td><td>3.2 GB custom</td><td>Dump volume only</td>
+                <td style="text-align:right"><button class="btn sm"><svg class="i"><use href="#download"/></svg>Download</button></td>
+              </tr>
+              <tr class="runx"><td colspan="6"><div class="runx-in">
+                <div class="phases">
+                  <div class="ph"><div class="h"><span class="dot ok"></span>Dump</div><div class="d">142 tables in 12 m 03 s, 3.2 GB</div></div>
+                  <div class="ph"><div class="h"><span class="dot err"></span>Upload to backup-sg</div><div class="d">Failed after 28 s</div></div>
+                  <div class="ph"><div class="h"><span class="dot ok"></span>File kept</div><div class="d">On the dump volume until Thursday 02:00</div></div>
+                </div>
+                <div class="problem" role="alert">
+                  <b>backup-sg rejected the upload: permission denied on /srv/dumps/analytics</b>
+                  <div class="fix">The SFTP user dumps cannot write to that directory. Give it write access, or choose a directory it owns, then upload this file again.</div>
+                  <div><button class="btn sm"><svg class="i"><use href="#refresh"/></svg>Retry upload</button></div>
+                </div>
+                <div class="log">
+                  <div class="log-bar"><span>Log, last 6 lines</span><span style="display:flex;gap:8px"><button class="btn sm ghost"><svg class="i"><use href="#copy"/></svg>Copy</button><button class="btn sm ghost">Open full log</button></span></div>
+<pre><span class="h">pg_dump: dumping contents of table "public.events_2026_10"</span>
+<span class="h">pg_dump: dumping contents of table "public.sessions"</span>
+--- upload at 2026-11-01T02:12:31+00:00 ---
+backup-sg (dumps@backup-sg.example.com:22:/srv/dumps/analytics)
+<span class="w">host key SHA256:KXSYqostrZM+Eg70D9U92KGR6TlEcALMXzaKBzsvK9U not pinned</span>
+<span class="e">failed: PermissionError: [Errno 13] Permission denied</span></pre>
+                </div>
+              </div></td></tr>
+              <tr><td><span class="st ok"><svg class="i" style="width:13px;height:13px"><use href="#check"/></svg>Succeeded</span></td>
+                <td>25 Oct 02:00</td><td>11 m 47 s</td><td>3.1 GB custom</td><td>backup-sg</td><td></td></tr>
+              <tr><td><span class="st ok"><svg class="i" style="width:13px;height:13px"><use href="#check"/></svg>Succeeded</span></td>
+                <td>18 Oct 02:00</td><td>11 m 02 s</td><td>3.0 GB custom</td><td>backup-sg</td><td></td></tr>
+              <tr><td><span class="st err"><svg class="i" style="width:13px;height:13px"><use href="#x"/></svg>Failed</span></td>
+                <td>11 Oct 02:00</td><td>0 m 04 s</td><td>None</td><td>None</td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+<script>
+  const view = new URLSearchParams(location.search).get("view") || "overview";
+  const sel = { overview: "orders", config: "shop", runs: "analytics" }[view];
+  document.getElementById("v-" + view).hidden = false;
+  document.querySelector(`.item[data-sel="${sel}"]`)?.classList.add("on");
+</script>
+</body>
+</html>

@@ -93,9 +93,8 @@ Detailed workflow: [compendium Ch.14](docs/architecture/hyper-cdc-orchestrator-d
   [Ch.10](docs/architecture/hyper-cdc-orchestrator-design.html#function-runtime)
 - Function authoring, testing, FaaS packaging, and release methodology: compendium
   [Ch.11](docs/architecture/hyper-cdc-orchestrator-design.html#function-methodology)
-- CI: `.woodpecker/` holds one workflow per file — `test` (both Rust crates), `webui`
-  (`kafbat-webui` typecheck + build), `build` (all four images multi-arch, no push),
-  `sonar` (quality gate on push), and `main-ci` (multi-arch publish, gated on the others)
+- CI: `.woodpecker/main-ci.yml` is the only workflow — rust + webui checks, then
+  Sonar and multi-arch publish of the four images on push / `v*` tag
 
 ## Kafka-native function runtime
 

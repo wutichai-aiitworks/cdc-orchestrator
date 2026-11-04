@@ -97,4 +97,90 @@ class JdbcOpsTest {
         assertEquals("jdbc:postgresql://cdc-postgres-source:5432/demo", url);
         assertEquals("\"bookings\".\"tickets\"", JdbcUrls.qualified("postgres", "bookings", "tickets"));
     }
+
+    @Test
+    void inspectReturnsSizesDefaultsAndIndexes() throws Exception {
+        Map<String, String> conn = Map.of(
+                "jdbc_url", "jdbc:h2:mem:cdc_admin_ddl;DB_CLOSE_DELAY=-1",
+                "username", "sa",
+                "password", ""
+        );
+        JdbcOps.ddl("h2", conn, "CREATE SCHEMA IF NOT EXISTS SHOP", null);
+        JdbcOps.ddl("h2", conn, "CREATE TABLE SHOP.PRODUCT ("
+                + "ID INT PRIMARY KEY, "
+                + "SKU VARCHAR(40) NOT NULL, "
+                + "PRICE DECIMAL(10,2) DEFAULT 0, "
+                + "BRAND VARCHAR(50), "
+                + "CATEGORY VARCHAR(30), "
+                + "CONSTRAINT UQ_PRODUCT_SKU UNIQUE (SKU))", null);
+        JdbcOps.ddl("h2", conn, "CREATE INDEX IX_PRODUCT_BRAND_CAT ON SHOP.PRODUCT (BRAND, CATEGORY)", null);
+
+        JdbcOps.InspectResult inspect = JdbcOps.inspect("h2", conn, "SHOP", "PRODUCT");
+
+        JdbcOps.ColumnInfo sku = inspect.columns().stream()
+                .filter(c -> c.name().equals("SKU")).findFirst().orElseThrow();
+        assertEquals(40, sku.size());
+        assertFalse(sku.nullable());
+        assertTrue(sku.unique(), "single-column unique constraint marks the column unique");
+
+        JdbcOps.ColumnInfo price = inspect.columns().stream()
+                .filter(c -> c.name().equals("PRICE")).findFirst().orElseThrow();
+        assertEquals(10, price.size());
+        assertEquals(2, price.scale());
+        assertEquals("0", price.defaultValue());
+
+        JdbcOps.ColumnInfo brand = inspect.columns().stream()
+                .filter(c -> c.name().equals("BRAND")).findFirst().orElseThrow();
+        assertFalse(brand.unique(), "non-unique index does not mark the column unique");
+
+        JdbcOps.IndexInfo composite = inspect.indexes().stream()
+                .filter(i -> i.name().equals("IX_PRODUCT_BRAND_CAT")).findFirst().orElseThrow();
+        assertFalse(composite.unique());
+        assertEquals(List.of("BRAND", "CATEGORY"), composite.columns());
+
+        assertTrue(inspect.indexes().stream().anyMatch(i ->
+                i.unique() && i.columns().equals(List.of("SKU"))));
+    }
+
+    @Test
+    void openStreamReadsEveryRowOnceAndHonoursMaxRows() throws Exception {
+        Map<String, String> conn = Map.of(
+                "jdbc_url", "jdbc:h2:mem:cdc_admin_stream;MODE=PostgreSQL;DB_CLOSE_DELAY=-1",
+                "username", "sa",
+                "password", ""
+        );
+        JdbcOps.ddl("h2", conn, "CREATE SCHEMA IF NOT EXISTS \"s\"", "s");
+        JdbcOps.ddl(
+                "h2",
+                conn,
+                "CREATE TABLE IF NOT EXISTS \"s\".\"big\" (id INT PRIMARY KEY, name VARCHAR(16))",
+                "s"
+        );
+        JdbcOps.ddl("h2", conn, "DELETE FROM \"s\".\"big\"", null);
+        JdbcOps.ddl(
+                "h2",
+                conn,
+                "INSERT INTO \"s\".\"big\" SELECT X, 'n' || X FROM SYSTEM_RANGE(1, 2500)",
+                null
+        );
+
+        // fetch_size smaller than the table so the cursor makes several round trips.
+        try (JdbcOps.RowStream rows = JdbcOps.openStream("h2", conn, "s", "big", 0, 300)) {
+            assertEquals(2, rows.columns().size());
+            java.util.Set<Object> ids = new java.util.HashSet<>();
+            List<Object> row;
+            while ((row = rows.next()) != null) {
+                assertTrue(ids.add(row.get(0)), "row read twice: " + row);
+            }
+            assertEquals(2500, ids.size());
+        }
+
+        try (JdbcOps.RowStream rows = JdbcOps.openStream("h2", conn, "s", "big", 7, 0)) {
+            int n = 0;
+            while (rows.next() != null) {
+                n++;
+            }
+            assertEquals(7, n);
+        }
+    }
 }

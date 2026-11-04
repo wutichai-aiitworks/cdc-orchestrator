@@ -12,6 +12,8 @@ import {
   Gauge,
   GitBranch,
   HardDrive,
+  FolderSync,
+  HardDriveDownload,
   Home,
   LayoutDashboard,
   List,
@@ -53,9 +55,11 @@ const navGroups = [
     label: "Copy & Sync",
     items: [
       { label: "Postgres copy", to: "/pgcopy", icon: Copy },
+      { label: "Postgres dump", to: "/pgdump", icon: HardDriveDownload },
       { label: "Load to Postgres", to: "/pgloader", icon: Database },
       { label: "Mongo copy", to: "/mongocopy", icon: Database },
       { label: "Redis sync", to: "/redisshake", icon: ArrowRightLeft },
+      { label: "File sync", to: "/rsync", icon: FolderSync },
     ],
   },
   {

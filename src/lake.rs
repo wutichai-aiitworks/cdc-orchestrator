@@ -401,6 +401,7 @@ mod tests {
                 timestamp_column: None,
                 incrementing_column: None,
                 upsert_key_columns: vec![],
+                table_poll: vec![],
             },
             target: None,
             lake: Some(LakeDestination {

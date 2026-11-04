@@ -35,6 +35,8 @@ export type PgLoaderProfile = {
 
 export type PgLoaderJob = {
   id: string
+  /** The transfer this run belongs to (older runs: same as id). */
+  profile_id?: string | null
   name?: string
   status: string
   log_path?: string

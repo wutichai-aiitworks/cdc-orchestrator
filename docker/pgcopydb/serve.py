@@ -1,71 +1,52 @@
 #!/usr/bin/env python3
-"""Minimal HTTP sidecar to run pgcopydb clone jobs from JSON configuration."""
+"""HTTP sidecar for Postgres copy (pgcopydb clone). Contract: sidecar_common/http_api.py.
+
+One job per run (history per transfer). Passwords never reach argv, job.json or the log: the
+URIs carry no password and libpq reads it from the run's 0600 .pgpass, deleted when the run ends.
+"""
 
 from __future__ import annotations
 
-import json
 import os
-import signal
+import shutil
 import subprocess
-import threading
-import uuid
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sidecar_common"))  # local tests
+
+from http_api import Tool, serve  # noqa: E402
+from jobstore import JobStore, utc_now, write_secret  # noqa: E402
+from probes import BadRequest, norm_conn, pg_env, pg_test, pgpass_content  # noqa: E402
 
 WORK_ROOT = Path(os.environ.get("PGCOPY_WORK_ROOT", "/var/lib/pgcopydb"))
 JOBS_DIR = WORK_ROOT / "jobs"
 API_TOKEN = os.environ.get("PGCOPY_API_TOKEN", "").strip()
 HOST = os.environ.get("PGCOPY_API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PGCOPY_API_PORT", "8085"))
+PGCOPYDB = os.environ.get("PGCOPY_BIN", "pgcopydb")
+RETAIN = int(os.environ.get("PGCOPY_RETAIN_RUNS", "10"))
 
-_lock = threading.Lock()
-_procs: dict[str, subprocess.Popen[Any]] = {}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def job_dir(job_id: str) -> Path:
-    return JOBS_DIR / job_id
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    tmp.replace(path)
+STORE = JobStore(JOBS_DIR, "clone.log", retain_per_profile=RETAIN)
 
 
 def pg_uri(conn: dict[str, Any]) -> str:
-    user = conn.get("username") or conn.get("user") or ""
-    password = conn.get("password") or ""
+    """postgres://user@host:port/db — no password (it comes from PGPASSFILE)."""
+    user = quote(str(conn.get("username") or conn.get("user") or ""), safe="")
     host = conn.get("host") or "localhost"
     port = conn.get("port") or "5432"
-    database = conn.get("database") or "postgres"
-    if password:
-        return f"postgresql://{user}:{password}@{host}:{port}/{database}"
-    if user:
-        return f"postgresql://{user}@{host}:{port}/{database}"
-    return f"postgresql://{host}:{port}/{database}"
+    database = quote(str(conn.get("database") or "postgres"), safe="")
+    return f"postgresql://{user + '@' if user else ''}{host}:{port}/{database}"
 
 
 def write_filters(work: Path, include_tables: list[str]) -> Path | None:
     if not include_tables:
         return None
     path = work / "filters.ini"
-    lines = ["[include]"]
+    # pgcopydb ignores unknown sections, so "[include]" silently copied every table.
+    lines = ["[include-only-table]"]
     for item in include_tables:
         item = str(item).strip()
         if item:
@@ -125,290 +106,93 @@ def build_clone_argv(body: dict[str, Any], work: Path) -> list[str]:
     source = body.get("source") or {}
     target = body.get("target") or {}
     options = body.get("options") or {}
-    include_tables = body.get("include_tables") or []
-
-    argv = [
-        "pgcopydb",
-        "clone",
-        "--source",
-        pg_uri(source),
-        "--target",
-        pg_uri(target),
-        "--dir",
-        str(work / "clone"),
-    ]
-
-    filters = write_filters(work, include_tables)
+    argv = [PGCOPYDB, "clone", "--source", pg_uri(source), "--target", pg_uri(target), "--dir", str(work / "clone")]
+    filters = write_filters(work, body.get("include_tables") or [])
     if filters:
         argv.extend(["--filters", str(filters)])
-
     for key, flag in BOOL_FLAGS.items():
         if options.get(key):
             argv.append(flag)
-
-    for key, flag in INT_OPTS.items():
+    for key, flag in {**INT_OPTS, **STR_OPTS}.items():
         val = options.get(key)
         if val is not None and str(val).strip() != "":
             argv.extend([flag, str(val)])
-
-    for key, flag in STR_OPTS.items():
-        val = options.get(key)
-        if val is not None and str(val).strip() != "":
-            argv.extend([flag, str(val)])
-
     extra_filters = options.get("filters_file")
     if extra_filters and str(extra_filters).strip():
         argv.extend(["--filters", str(extra_filters)])
-
     return argv
 
 
-def job_status(job_id: str) -> dict[str, Any]:
-    meta_path = job_dir(job_id) / "job.json"
-    meta = read_json(meta_path)
-    if not meta:
-        return {"id": job_id, "status": "unknown"}
-
-    with _lock:
-        proc = _procs.get(job_id)
-
-    if proc is not None:
-        code = proc.poll()
-        if code is None:
-            meta["status"] = "running"
-        else:
-            meta["status"] = "succeeded" if code == 0 else "failed"
-            meta["exit_code"] = code
-            meta["finished_at"] = utc_now()
-            write_json(meta_path, meta)
-            _procs.pop(job_id, None)
-    elif meta.get("status") == "running":
-        meta["status"] = "failed"
-        meta["error"] = meta.get("error") or "process not found"
-        meta["finished_at"] = utc_now()
-        write_json(meta_path, meta)
-
-    meta["id"] = job_id
-    return meta
+def take_previous_state(work: Path, profile_id: str, options: dict[str, Any]) -> str | None:
+    """"Resume" continues the transfer's previous run: move its work dir into this run.
+    Without resume every run starts clean (state from a failed run broke the next one)."""
+    if not options.get("resume"):
+        return None
+    for meta in STORE.list(profile_id):
+        prev = JOBS_DIR / meta["id"] / "clone"
+        if meta["id"] != work.name and prev.is_dir():
+            shutil.move(str(prev), str(work / "clone"))
+            return meta["id"]
+    return None
 
 
-def tail_log(path: Path, max_bytes: int = 256_000) -> str:
-    if not path.is_file():
-        return ""
-    data = path.read_bytes()
-    if len(data) > max_bytes:
-        data = data[-max_bytes:]
-    return data.decode("utf-8", errors="replace")
+def cleanup_secrets(work: Path) -> None:
+    (work / ".pgpass").unlink(missing_ok=True)
 
 
 def start_job(body: dict[str, Any]) -> dict[str, Any]:
-    job_id = str(body.get("id") or uuid.uuid4())
-    work = job_dir(job_id)
-    work.mkdir(parents=True, exist_ok=True)
-
-    argv = build_clone_argv(body, work)
-    log_path = work / "clone.log"
-    meta = {
-        "id": job_id,
-        "name": body.get("name") or job_id,
-        "status": "starting",
-        "created_at": utc_now(),
-        "started_at": utc_now(),
-        "argv": argv,
-        "log_path": str(log_path),
-    }
-    write_json(work / "job.json", meta)
-
-    with log_path.open("ab") as log_fh:
-        log_fh.write(f"\n--- pgcopydb job {job_id} at {utc_now()} ---\n".encode())
-        log_fh.write((" ".join(argv) + "\n").encode())
-        proc = subprocess.Popen(
-            argv,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=str(work),
-            start_new_session=True,
-        )
-
-    with _lock:
-        _procs[job_id] = proc
-
-    meta["status"] = "running"
-    meta["pid"] = proc.pid
-    write_json(work / "job.json", meta)
-    return meta
-
-
-def stop_job(job_id: str) -> dict[str, Any]:
-    with _lock:
-        proc = _procs.get(job_id)
-    if proc is None or proc.poll() is not None:
-        meta = job_status(job_id)
-        if meta.get("status") == "running":
-            meta["status"] = "stopped"
-            meta["finished_at"] = utc_now()
-            write_json(job_dir(job_id) / "job.json", meta)
-        return meta
-
+    source = norm_conn(body.get("source"), "source", "5432")
+    target = norm_conn(body.get("target"), "target", "5432")
+    options = body.get("options") or {}
+    job_id, work, meta = STORE.new_job(body)
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    meta = job_status(job_id)
-    meta["status"] = "stopped"
-    meta["finished_at"] = utc_now()
-    write_json(job_dir(job_id) / "job.json", meta)
-    with _lock:
-        _procs.pop(job_id, None)
-    return meta
+        resumed_from = take_previous_state(work, meta["profile_id"], options)
+        argv = build_clone_argv(body, work)
+        passfile = write_secret(work / ".pgpass", pgpass_content([source, target]))
+        env = pg_env(dict(os.environ), passfile)
+        env["PGAPPNAME"] = "cdc-pgcopydb"
+        STORE.update(job_id, argv=argv, source=f"{source['username']}@{source['host']}:{source['port']}/{source['database']}",
+                     target=f"{target['username']}@{target['host']}:{target['port']}/{target['database']}",
+                     resumed_from=resumed_from)
+        header = f"\n--- pgcopydb job {job_id} at {utc_now()} ---\n{' '.join(argv)}\n"
+        return STORE.spawn(job_id, argv, env=env, header=header, on_exit=lambda jid, code: cleanup_secrets(work))
+    except Exception as exc:
+        cleanup_secrets(work)
+        STORE.fail_start(job_id, f"{type(exc).__name__}: {exc}")
+        raise
 
 
-def list_jobs() -> list[dict[str, Any]]:
-    if not JOBS_DIR.is_dir():
-        return []
-    jobs: list[dict[str, Any]] = []
-    for child in sorted(JOBS_DIR.iterdir(), key=lambda p: p.name, reverse=True):
-        if child.is_dir():
-            jobs.append(job_status(child.name))
-    return jobs
+def test_connection(body: dict[str, Any]) -> dict[str, Any]:
+    # Both ends are PostgreSQL; pg_dump in this image must be >= the source's major version.
+    side = body.get("side") or "source"
+    return pg_test(body.get("connection"), tmp_root=WORK_ROOT, sslmode=(body.get("options") or {}).get("sslmode"),
+                   dump_client="pg_dump" if side == "source" else None)
 
 
-CAPABILITY = {
-    "service": "cdc-pgcopydb",
-    "pgcopydb_command": "clone",
-    "options": {
-        "booleans": sorted(BOOL_FLAGS.keys()),
-        "integers": sorted(INT_OPTS.keys()),
-        "strings": sorted(STR_OPTS.keys()),
-    },
-    "connection_fields": ["host", "port", "database", "username", "password"],
-    "include_tables": "Optional list of schema.table entries; empty means entire database",
-}
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def _auth_ok(self) -> bool:
-        if not API_TOKEN:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == API_TOKEN:
-            return True
-        return self.headers.get("X-API-Token", "").strip() == API_TOKEN
-
-    def _json(self, code: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
+def versions() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, argv in (("pgcopydb_version", [PGCOPYDB, "--version"]), ("pg_dump", ["pg_dump", "--version"])):
         try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            return {}
-
-    def do_GET(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/") or "/"
-        if path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if path == "/v1/discover":
-            try:
-                ver = subprocess.check_output(["pgcopydb", "--version"], text=True).strip()
-            except subprocess.CalledProcessError:
-                ver = "unknown"
-            self._json(
-                200,
-                {
-                    "contract_version": "1",
-                    "tool_id": "pgcopy",
-                    "service": CAPABILITY["service"],
-                    "sidecar_ready": True,
-                    "orchestrator_contract": "/cdc/pgcopy/contract",
-                    "pgcopydb_version": ver,
-                    "options": CAPABILITY["options"],
-                },
-            )
-            return
-        if path == "/v1/capability":
-            try:
-                ver = subprocess.check_output(["pgcopydb", "--version"], text=True).strip()
-            except subprocess.CalledProcessError:
-                ver = "unknown"
-            out = dict(CAPABILITY)
-            out["pgcopydb_version"] = ver
-            self._json(200, out)
-            return
-        if path == "/v1/jobs":
-            self._json(200, {"jobs": list_jobs()})
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/logs"):
-            job_id = path.split("/")[3]
-            log_path = job_dir(job_id) / "clone.log"
-            self._json(200, {"id": job_id, "log": tail_log(log_path)})
-            return
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            meta = job_status(job_id)
-            if meta.get("status") == "unknown":
-                self._json(404, {"error": "job not found"})
-                return
-            self._json(200, meta)
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path == "/v1/jobs":
-            body = self._read_body()
-            if not body.get("source") or not body.get("target"):
-                self._json(400, {"error": "source and target are required"})
-                return
-            try:
-                meta = start_job(body)
-            except OSError as exc:
-                self._json(500, {"error": str(exc)})
-                return
-            self._json(202, meta)
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/stop"):
-            job_id = path.split("/")[3]
-            self._json(200, stop_job(job_id))
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_DELETE(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            stop_job(job_id)
-            self._json(200, {"id": job_id, "status": "stopped"})
-            return
-        self._json(404, {"error": "not found"})
+            out[key] = subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT, timeout=10).strip()
+        except (OSError, subprocess.SubprocessError):
+            out[key] = "unknown"
+    return out
 
 
-def main() -> None:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"cdc-pgcopydb listening on {HOST}:{PORT}", flush=True)
-    server.serve_forever()
+def capability() -> dict[str, Any]:
+    return {
+        "pgcopydb_command": "clone",
+        "options": {"booleans": sorted(BOOL_FLAGS), "integers": sorted(INT_OPTS), "strings": sorted(STR_OPTS)},
+        "connection_fields": ["host", "port", "database", "username", "password"],
+        "include_tables": "Optional list of schema.table entries; empty means entire database",
+        "retain_runs_per_profile": RETAIN,
+        **versions(),
+    }
 
+
+TOOL = Tool(tool_id="pgcopy", service="cdc-pgcopydb", store=STORE, capability=capability, start=start_job,
+            test=test_connection, api_token=API_TOKEN)
 
 if __name__ == "__main__":
-    main()
+    STORE.recover_on_start(cleanup_secrets)
+    serve(TOOL, HOST, PORT)

@@ -11,8 +11,12 @@ const DB_ICONS: Record<string, string> = {
 
 const FALLBACK = "/images/drivers/database_icon@2x.png"
 
+/** Other spellings of the same vendor used by profiles and connectors. */
+const ALIASES: Record<string, string> = { postgresql: "postgres", mssql: "sqlserver" }
+
 export function dbIconPath(type: string | null | undefined): string {
-  return DB_ICONS[(type ?? "").toLowerCase()] ?? FALLBACK
+  const key = (type ?? "").toLowerCase()
+  return DB_ICONS[ALIASES[key] ?? key] ?? FALLBACK
 }
 
 export interface DbTypeOption {

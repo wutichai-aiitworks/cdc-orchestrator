@@ -1700,13 +1700,8 @@ pub async fn profile_action(
 
     let outcome = if action == "resync" {
         validate_resync_params(&params)?;
-        reconcile::reconcile_resync(
-            &state,
-            &mut profile,
-            params.clear_target,
-            params.row_limit,
-        )
-        .await
+        reconcile::reconcile_resync(&state, &mut profile, params.clear_target, params.row_limit)
+            .await
     } else if (action == "start" || action == "restart") && params.row_limit.is_some() {
         validate_resync_params(&params)?;
         reconcile::reconcile_start_with_test_sync(
@@ -1766,6 +1761,164 @@ pub async fn profile_action(
         profile,
         timestamp: Utc::now(),
     }))
+}
+
+/// `POST /cdc/profiles/{id}/initial-load` — start a background streaming load of every
+/// row of the selected source tables into the target (see `initial_load`).
+pub async fn start_initial_load(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Option<Json<crate::initial_load::InitialLoadRequest>>,
+) -> Result<(StatusCode, Json<crate::initial_load::InitialLoadStatus>), AppError> {
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    let profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let actor = actor_from_headers(&headers);
+    let started = crate::initial_load::start(&state, &profile, &request, &actor).await;
+    let (outcome, detail) = match &started {
+        Ok(status) => (
+            "success",
+            json!({
+                "clear_target": request.clear_target,
+                "tables": status.tables.iter().map(|t| t.source.clone()).collect::<Vec<_>>(),
+            }),
+        ),
+        Err(e) => (
+            "failure",
+            json!({ "error": e.to_string_message(), "clear_target": request.clear_target }),
+        ),
+    };
+    let event = new_event(
+        &actor,
+        "profile.initial_load_start",
+        outcome,
+        &detail_json(detail),
+        Some(profile.id),
+        Some(profile.name.as_str()),
+    );
+    emit(&state, event).await;
+    Ok((StatusCode::ACCEPTED, Json(started?)))
+}
+
+/// `POST /cdc/profiles/{id}/split` — move some tables into a new Draft pipeline with the
+/// same source and target (see `split`). Nothing is started or restarted here.
+pub async fn split_profile(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<crate::split::SplitRequest>,
+) -> Result<(StatusCode, Json<crate::split::SplitResponse>), AppError> {
+    let original = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let others: Vec<crate::models::CdcProfile> = state
+        .profiles
+        .list()
+        .await?
+        .into_iter()
+        .filter(|p| p.id != id)
+        .collect();
+    let actor = actor_from_headers(&headers);
+    let planned = crate::split::plan_split(&original, &others, &request);
+    let (mut created, mut trimmed, moved) = match planned {
+        Ok(v) => v,
+        Err(e) => {
+            let event = new_event(
+                &actor,
+                "profile.split",
+                "failure",
+                &detail_json(
+                    json!({ "error": e.to_string_message(), "tables": request.tables, "name": request.name }),
+                ),
+                Some(original.id),
+                Some(original.name.as_str()),
+            );
+            emit(&state, event).await;
+            return Err(e);
+        }
+    };
+    // New pipeline first: if saving the original then fails, nothing was taken away.
+    state.profiles.upsert(&created).await?;
+    state.profiles.upsert(&trimmed).await?;
+    let restart_required = matches!(
+        trimmed.status,
+        ProfileStatus::Running | ProfileStatus::Paused
+    );
+    for (pid, pname, extra) in [
+        (
+            trimmed.id,
+            trimmed.name.clone(),
+            json!({ "role": "original", "new_pipeline": created.name, "new_pipeline_id": created.id }),
+        ),
+        (
+            created.id,
+            created.name.clone(),
+            json!({ "role": "created", "split_from": trimmed.name, "split_from_id": trimmed.id }),
+        ),
+    ] {
+        let mut detail = json!({ "tables": moved, "original_restart_required": restart_required });
+        if let (Some(d), Some(e)) = (detail.as_object_mut(), extra.as_object()) {
+            d.extend(e.clone());
+        }
+        let event = new_event(
+            &actor,
+            "profile.split",
+            "success",
+            &detail_json(detail),
+            Some(pid),
+            Some(pname.as_str()),
+        );
+        emit(&state, event).await;
+    }
+    created.redact_secrets();
+    trimmed.redact_secrets();
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::split::SplitResponse {
+            original: trimmed,
+            created,
+            moved_tables: moved,
+            original_restart_required: restart_required,
+        }),
+    ))
+}
+
+/// `GET /cdc/profiles/{id}/initial-load` — progress of the latest load on this instance.
+pub async fn get_initial_load(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crate::initial_load::InitialLoadStatus>, AppError> {
+    crate::initial_load::status(&state, id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound("no initial load has run for this pipeline".into()))
+}
+
+/// `DELETE /cdc/profiles/{id}/initial-load` — cancel a running load between batches.
+pub async fn cancel_initial_load(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::initial_load::InitialLoadStatus>, AppError> {
+    let status = crate::initial_load::cancel(&state, id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no initial load has run for this pipeline".into()))?;
+    let event = new_event(
+        &actor_from_headers(&headers),
+        "profile.initial_load_cancel",
+        "success",
+        &detail_json(json!({ "state": status.state, "rows_copied": status.rows_copied })),
+        Some(id),
+        None,
+    );
+    emit(&state, event).await;
+    Ok(Json(status))
 }
 
 pub async fn validate_source(
@@ -1895,6 +2048,7 @@ fn source_config_from_target(target: TargetConfig) -> SourceConfig {
         timestamp_column: None,
         incrementing_column: None,
         upsert_key_columns: vec![],
+        table_poll: vec![],
     }
 }
 
@@ -2155,6 +2309,228 @@ pub async fn inspect_target_table(
         }),
     )
     .await
+}
+
+/// Run generated CREATE statements on a pipeline target (wizard mapping step).
+///
+/// Statements run one at a time so Oracle/SQL Server (one statement per JDBC call)
+/// work the same as Postgres. Only creation DDL is accepted; the run stops at the
+/// first failure and the outcome is written to the audit trail.
+pub async fn create_target_tables(
+    State(state): State<AppState>,
+    Json(mut req): Json<crate::models::TargetDdlRequest>,
+) -> Result<Json<crate::models::TargetDdlResponse>, AppError> {
+    let mut profile_name: Option<String> = None;
+    if let Some(pid) = req.profile_id {
+        if let Ok(Some(profile)) = state.profiles.get(pid).await {
+            if let Some(stored_target) = &profile.target {
+                preserve_secret_fields(&mut req.target.connection, &stored_target.connection);
+            }
+            profile_name = Some(profile.name.clone());
+        }
+    }
+    if !is_supported_database_type(&req.target.target_type) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported target_type: {} (database connectors only)",
+            req.target.target_type
+        )));
+    }
+    validate_connection_fields(&req.target.connection, "target")?;
+    let statements: Vec<String> = req
+        .statements
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if statements.is_empty() {
+        return Err(AppError::BadRequest("statements must not be empty".into()));
+    }
+    if statements.len() > TARGET_DDL_MAX_STATEMENTS {
+        return Err(AppError::BadRequest(format!(
+            "at most {TARGET_DDL_MAX_STATEMENTS} statements per request"
+        )));
+    }
+    for (i, stmt) in statements.iter().enumerate() {
+        ensure_create_only_ddl(stmt)
+            .map_err(|e| AppError::BadRequest(format!("statement {}: {e}", i + 1)))?;
+    }
+
+    let mut results = Vec::with_capacity(statements.len());
+    let mut failed = false;
+    for (index, stmt) in statements.iter().enumerate() {
+        match connector_catalog::exec_ddl_on_connection(
+            &req.target.target_type,
+            &req.target.connection,
+            stmt,
+        )
+        .await
+        {
+            Ok(()) => results.push(crate::models::TargetDdlStatementResult {
+                index,
+                ok: true,
+                error: None,
+            }),
+            Err(e) => {
+                results.push(crate::models::TargetDdlStatementResult {
+                    index,
+                    ok: false,
+                    error: Some(e.to_string()),
+                });
+                failed = true;
+                break;
+            }
+        }
+    }
+    let executed = results.iter().filter(|r| r.ok).count();
+    crate::audit::emit_system(
+        &state,
+        "target.create_tables",
+        if failed { "failure" } else { "success" },
+        json!({
+            "target_type": req.target.target_type,
+            "host": req.target.connection.get("host"),
+            "database": req.target.connection.get("database"),
+            "statements": statements.len(),
+            "executed": executed,
+            "error": results.iter().find_map(|r| r.error.clone()),
+        }),
+        req.profile_id,
+        profile_name.as_deref(),
+    )
+    .await;
+    Ok(Json(crate::models::TargetDdlResponse {
+        status: !failed,
+        executed,
+        results,
+    }))
+}
+
+const TARGET_DDL_MAX_STATEMENTS: usize = 500;
+
+/// Accept only object-creation DDL: CREATE SCHEMA/TABLE/INDEX, optionally behind a
+/// SQL Server `IF ...` guard or inside an Oracle `BEGIN EXECUTE IMMEDIATE ... END;` block.
+/// Quoted identifiers and string literals are blanked before the keyword checks so
+/// a column named "DELETE" is fine, while a smuggled `; DROP TABLE` is not.
+fn ensure_create_only_ddl(statement: &str) -> Result<(), String> {
+    let bare = strip_sql_quoted(statement).to_ascii_uppercase();
+    let words: Vec<&str> = bare
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let Some(first) = words.first() else {
+        return Err("empty statement".into());
+    };
+    if !matches!(*first, "CREATE" | "IF" | "BEGIN") {
+        return Err(format!("only CREATE statements are allowed (got {first})"));
+    }
+    // IF / BEGIN wrappers may carry the DDL as a string literal (EXEC N'...',
+    // EXECUTE IMMEDIATE '...'); validate each literal as a statement of its own.
+    let wrapped = matches!(*first, "IF" | "BEGIN");
+    let literals: Vec<String> = if wrapped {
+        sql_string_literals(statement)
+            .into_iter()
+            .map(|l| l.replace("''", "'"))
+            .filter(|l| {
+                let head = l.trim_start().to_ascii_uppercase();
+                head.starts_with("CREATE")
+                    || head.starts_with("DROP")
+                    || head.starts_with("ALTER")
+                    || head.starts_with("TRUNCATE")
+                    || head.starts_with("DELETE")
+                    || head.starts_with("INSERT")
+                    || head.starts_with("UPDATE")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !words.contains(&"CREATE") && literals.is_empty() {
+        return Err("statement does not create anything".into());
+    }
+    const FORBIDDEN: &[&str] = &[
+        "DROP", "TRUNCATE", "DELETE", "UPDATE", "INSERT", "MERGE", "ALTER", "GRANT", "REVOKE",
+        "RENAME", "COPY", "CALL", "SHUTDOWN", "KILL",
+    ];
+    if let Some(bad) = words.iter().find(|w| FORBIDDEN.contains(w)) {
+        return Err(format!("{bad} is not allowed here"));
+    }
+    for literal in &literals {
+        ensure_create_only_ddl(literal)?;
+    }
+    Ok(())
+}
+
+/// Replace quoted identifiers ("x", [x], `x`) and string literals ('x') with spaces.
+fn strip_sql_quoted(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        let close = match c {
+            '"' => Some('"'),
+            '`' => Some('`'),
+            '[' => Some(']'),
+            '\'' => Some('\''),
+            _ => None,
+        };
+        let Some(close) = close else {
+            out.push(c);
+            continue;
+        };
+        out.push(' ');
+        while let Some(n) = chars.next() {
+            if n == close {
+                // Doubled quote ('' or "") is an escaped quote, not the end.
+                if (close == '\'' || close == '"') && chars.peek() == Some(&close) {
+                    chars.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        out.push(' ');
+    }
+    out
+}
+
+fn skip_delimited_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, close: char) {
+    for n in chars.by_ref() {
+        if n == close {
+            break;
+        }
+    }
+}
+
+fn read_sql_single_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut lit = String::new();
+    while let Some(n) = chars.next() {
+        if n == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                lit.push_str("''");
+                continue;
+            }
+            break;
+        }
+        lit.push(n);
+    }
+    lit
+}
+
+/// Contents of top-level '...' literals (escaped '' kept as-is).
+fn sql_string_literals(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                skip_delimited_identifier(&mut chars, close);
+            }
+            '\'' => out.push(read_sql_single_quoted(&mut chars)),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub async fn validate_target(
@@ -2661,7 +3037,11 @@ fn merge_incremental_source_fields(existing: &SourceConfig, incoming: &mut Sourc
         .map(|s| s.trim().is_empty())
         .unwrap_or(true);
     if ts_empty {
-        if let Some(ts) = existing.timestamp_column.as_ref().filter(|s| !s.trim().is_empty()) {
+        if let Some(ts) = existing
+            .timestamp_column
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
             incoming.timestamp_column = Some(ts.clone());
         }
     }
@@ -2979,6 +3359,37 @@ fn is_supported_database_type(value: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn target_ddl_guard_accepts_generated_create_statements() {
+        for ok in [
+            r#"CREATE SCHEMA IF NOT EXISTS "pandora""#,
+            r#"CREATE TABLE IF NOT EXISTS "pandora"."pm_probrand" ("delete" INTEGER NOT NULL, PRIMARY KEY ("delete"))"#,
+            r#"CREATE UNIQUE INDEX IF NOT EXISTS "uq_sku" ON "s"."t" ("sku")"#,
+            "IF OBJECT_ID(N'[dbo].[t]', N'U') IS NULL CREATE TABLE [dbo].[t] ([update] INT)",
+            "IF SCHEMA_ID(N'sales') IS NULL EXEC(N'CREATE SCHEMA [sales]')",
+            "BEGIN\n  EXECUTE IMMEDIATE 'CREATE TABLE \"S\".\"T\" (\"C\" VARCHAR2(10 CHAR) DEFAULT ''x'')';\nEXCEPTION\n  WHEN OTHERS THEN\n    IF SQLCODE != -955 THEN RAISE; END IF;\nEND;",
+            "CREATE TABLE IF NOT EXISTS `s`.`t` (`id` INT, KEY `ix` (`id`))",
+        ] {
+            assert!(ensure_create_only_ddl(ok).is_ok(), "should accept: {ok}");
+        }
+    }
+
+    #[test]
+    fn target_ddl_guard_rejects_destructive_statements() {
+        for bad in [
+            r#"DROP TABLE "s"."t""#,
+            r#"CREATE TABLE "s"."t" (id INT); DROP TABLE "s"."u""#,
+            "TRUNCATE TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE T'; END;",
+            "SELECT 1",
+            "IF 1=1 DELETE FROM t",
+            "IF SCHEMA_ID(N's') IS NULL EXEC(N'DROP SCHEMA [s]')",
+        ] {
+            assert!(ensure_create_only_ddl(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
     use super::*;
     use crate::models::{
         CaptureMode, DeliveryMode, FlowConfig, ScheduleConfig, SchemaSelectionMode,
@@ -3004,6 +3415,7 @@ mod tests {
                 timestamp_column: None,
                 incrementing_column: None,
                 upsert_key_columns: vec![],
+                table_poll: vec![],
             },
             target: Some(TargetConfig {
                 name: String::new(),
@@ -3068,9 +3480,7 @@ mod tests {
 
     #[test]
     fn merge_incremental_preserves_upsert_keys_when_omitted_on_update() {
-        use crate::models::{
-            CaptureMode, SchemaSelectionMode, SourceConfig, TableSelectionMode,
-        };
+        use crate::models::{CaptureMode, SchemaSelectionMode, SourceConfig, TableSelectionMode};
         let existing = SourceConfig {
             source_type: "oracle".into(),
             connection: HashMap::new(),
@@ -3083,6 +3493,7 @@ mod tests {
             timestamp_column: Some("UPDATE_DATE".into()),
             incrementing_column: None,
             upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
+            table_poll: vec![],
         };
         let mut incoming = existing.clone();
         incoming.upsert_key_columns = vec![];

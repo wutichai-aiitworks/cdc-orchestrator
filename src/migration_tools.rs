@@ -4,8 +4,10 @@ use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::mongocopy;
 use crate::pgcopy;
+use crate::pgdump;
 use crate::pgloader;
 use crate::redisshake;
+use crate::rsync;
 use chrono::Utc;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -87,8 +89,37 @@ pub fn tools_catalog(cfg: &AppConfig) -> Value {
                 "ui_path": "/mongocopy",
                 "orchestrator_env": ["ORCH_MONGOCOPY_URL", "ORCH_MONGOCOPY_TOKEN"],
             },
+            {
+                "id": "pgdump",
+                "title": "Postgres dump (pg_dump / pg_restore)",
+                "enabled": cfg.pgdump_url.is_some(),
+                "discover_path": "/cdc/pgdump/discover",
+                "contract_path": "/cdc/pgdump/contract",
+                "ui_path": "/pgdump",
+                "orchestrator_env": ["ORCH_PGDUMP_URL", "ORCH_PGDUMP_TOKEN"],
+            },
+            {
+                "id": "rsync",
+                "title": "File sync (rsync over SSH)",
+                "enabled": cfg.rsync_url.is_some(),
+                "discover_path": "/cdc/rsync/discover",
+                "contract_path": "/cdc/rsync/contract",
+                "ui_path": "/rsync",
+                "orchestrator_env": ["ORCH_RSYNC_URL", "ORCH_RSYNC_TOKEN"],
+            },
         ],
     })
+}
+
+async fn discover_if_enabled(
+    enabled: bool,
+    discover: impl std::future::Future<Output = Result<Value, AppError>>,
+) -> Result<Option<Value>, AppError> {
+    if enabled {
+        Ok(Some(discover.await?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn sidecar_discover(
@@ -96,62 +127,76 @@ pub async fn sidecar_discover(
     client: &Client,
     tool: &str,
 ) -> Result<Option<Value>, AppError> {
-    let out = match tool {
+    match tool {
         "pgcopy" => {
-            if cfg.pgcopy_url.is_none() {
-                None
-            } else {
-                Some(pgcopy::discover(cfg, client).await?)
-            }
+            discover_if_enabled(cfg.pgcopy_url.is_some(), pgcopy::discover(cfg, client)).await
         }
         "redisshake" => {
-            if cfg.redis_shake_url.is_none() {
-                None
-            } else {
-                Some(redisshake::discover(cfg, client).await?)
-            }
+            discover_if_enabled(
+                cfg.redis_shake_url.is_some(),
+                redisshake::discover(cfg, client),
+            )
+            .await
         }
         "pgloader" => {
-            if cfg.pgloader_url.is_none() {
-                None
-            } else {
-                Some(pgloader::discover(cfg, client).await?)
-            }
+            discover_if_enabled(cfg.pgloader_url.is_some(), pgloader::discover(cfg, client)).await
         }
         "mongocopy" => {
-            if cfg.mongocopy_url.is_none() {
-                None
-            } else {
-                Some(mongocopy::discover(cfg, client).await?)
-            }
+            discover_if_enabled(
+                cfg.mongocopy_url.is_some(),
+                mongocopy::discover(cfg, client),
+            )
+            .await
         }
-        _ => return Err(AppError::NotFound(format!("unknown migration tool {tool}"))),
-    };
-    Ok(out)
+        "pgdump" => {
+            discover_if_enabled(cfg.pgdump_url.is_some(), pgdump::discover(cfg, client)).await
+        }
+        "rsync" => discover_if_enabled(cfg.rsync_url.is_some(), rsync::discover(cfg, client)).await,
+        _ => Err(AppError::NotFound(format!("unknown migration tool {tool}"))),
+    }
+}
+
+async fn migration_tool_discover(
+    cfg: &AppConfig,
+    client: &Client,
+    tool: &str,
+    contract_path: &str,
+    enabled: bool,
+    minimal_example: Value,
+) -> Result<Value, AppError> {
+    let sidecar = sidecar_discover(cfg, client, tool).await?;
+    Ok(json!({
+        "contract_version": CONTRACT_VERSION,
+        "id": tool,
+        "enabled": enabled,
+        "contract_path": contract_path,
+        "sidecar": sidecar,
+        "minimal_profile_example": minimal_example,
+    }))
 }
 
 pub async fn pgcopy_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
-    let sidecar = sidecar_discover(cfg, client, "pgcopy").await?;
-    Ok(json!({
-        "contract_version": CONTRACT_VERSION,
-        "id": "pgcopy",
-        "enabled": cfg.pgcopy_url.is_some(),
-        "contract_path": "/cdc/pgcopy/contract",
-        "sidecar": sidecar,
-        "minimal_profile_example": pgcopy_contract_body()["minimal_profile_example"],
-    }))
+    migration_tool_discover(
+        cfg,
+        client,
+        "pgcopy",
+        "/cdc/pgcopy/contract",
+        cfg.pgcopy_url.is_some(),
+        pgcopy_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
 }
 
 pub async fn redisshake_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
-    let sidecar = sidecar_discover(cfg, client, "redisshake").await?;
-    Ok(json!({
-        "contract_version": CONTRACT_VERSION,
-        "id": "redisshake",
-        "enabled": cfg.redis_shake_url.is_some(),
-        "contract_path": "/cdc/redisshake/contract",
-        "sidecar": sidecar,
-        "minimal_profile_example": redisshake_contract_body()["minimal_profile_example"],
-    }))
+    migration_tool_discover(
+        cfg,
+        client,
+        "redisshake",
+        "/cdc/redisshake/contract",
+        cfg.redis_shake_url.is_some(),
+        redisshake_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
 }
 
 fn pgcopy_contract_body() -> Value {
@@ -267,27 +312,27 @@ pub fn redisshake_contract(_cfg: &AppConfig) -> Value {
 }
 
 pub async fn pgloader_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
-    let sidecar = sidecar_discover(cfg, client, "pgloader").await?;
-    Ok(json!({
-        "contract_version": CONTRACT_VERSION,
-        "id": "pgloader",
-        "enabled": cfg.pgloader_url.is_some(),
-        "contract_path": "/cdc/pgloader/contract",
-        "sidecar": sidecar,
-        "minimal_profile_example": pgloader_contract_body()["minimal_profile_example"],
-    }))
+    migration_tool_discover(
+        cfg,
+        client,
+        "pgloader",
+        "/cdc/pgloader/contract",
+        cfg.pgloader_url.is_some(),
+        pgloader_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
 }
 
 pub async fn mongocopy_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
-    let sidecar = sidecar_discover(cfg, client, "mongocopy").await?;
-    Ok(json!({
-        "contract_version": CONTRACT_VERSION,
-        "id": "mongocopy",
-        "enabled": cfg.mongocopy_url.is_some(),
-        "contract_path": "/cdc/mongocopy/contract",
-        "sidecar": sidecar,
-        "minimal_profile_example": mongocopy_contract_body()["minimal_profile_example"],
-    }))
+    migration_tool_discover(
+        cfg,
+        client,
+        "mongocopy",
+        "/cdc/mongocopy/contract",
+        cfg.mongocopy_url.is_some(),
+        mongocopy_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
 }
 
 fn pgloader_contract_body() -> Value {
@@ -380,6 +425,180 @@ pub fn contract_for(tool: &str, cfg: &AppConfig) -> Result<Value, AppError> {
         "redisshake" => Ok(redisshake_contract(cfg)),
         "pgloader" => Ok(pgloader_contract(cfg)),
         "mongocopy" => Ok(mongocopy_contract(cfg)),
+        "pgdump" => Ok(pgdump_contract(cfg)),
+        "rsync" => Ok(rsync_contract(cfg)),
         _ => Err(AppError::NotFound(format!("unknown migration tool {tool}"))),
     }
+}
+
+fn pgdump_operations() -> Value {
+    let mut ops = operations("pgdump");
+    if let Some(list) = ops.as_array_mut() {
+        list.push(json!({"method": "GET", "path": "/cdc/pgdump/jobs/{job_id}/file", "purpose": "download the dump file (streamed)"}));
+        list.push(json!({"method": "DELETE", "path": "/cdc/pgdump/jobs/{job_id}", "purpose": "delete a finished job and its file"}));
+        list.push(json!({"method": "POST", "path": "/cdc/pgdump/jobs/{job_id}/send", "purpose": "upload a finished job's file to one ad-hoc SFTP server (body {destination, profile_id?})"}));
+    }
+    ops
+}
+
+fn pgdump_contract_body() -> Value {
+    json!({
+        "contract_version": CONTRACT_VERSION,
+        "id": "pgdump",
+        "title": "Postgres dump (pg_dump / pg_restore)",
+        "source_db_types": ["postgres", "postgresql", "pg"],
+        "target_db_types": ["postgres", "postgresql", "pg"],
+        "modes": {
+            "dump": "pg_dump the source to a file kept on the sidecar volume; download via /jobs/{job_id}/file",
+            "dump_restore": "pg_dump -Fc the source, then pg_restore into target (seed a replica before CDC)",
+        },
+        "connection": {
+            "source": conn_fields("postgres", "5432", true),
+            "target": conn_fields("postgres", "5432", true),
+        },
+        "profile_fields": [
+            {"key": "name", "kind": "string", "required": true},
+            {"key": "mode", "kind": "string", "required": false, "default": "dump", "enum": ["dump", "dump_restore"]},
+            {"key": "source", "kind": "connection", "required": true},
+            {"key": "target", "kind": "connection", "required": false, "note": "required for dump_restore"},
+            {"key": "include_tables", "kind": "string[]", "required": false, "default": [],
+             "note": "pg_dump --table patterns; schemas they need are created on the target before restore"},
+            {"key": "options", "kind": "object", "required": false, "default": {}},
+            {"key": "destinations", "kind": "sftp_destination[]", "required": false, "default": [], "max": 5,
+             "note": "uploaded after the dump: <file>.part then rename, plus <file>.sha256; local copy removed when all succeed unless options.keep_local"},
+        ],
+        "sftp_destination_fields": [
+            {"key": "name", "kind": "string", "required": false},
+            {"key": "host", "kind": "string", "required": true},
+            {"key": "port", "kind": "string", "required": false, "default": "22"},
+            {"key": "username", "kind": "string", "required": true},
+            {"key": "auth", "kind": "string", "required": false, "enum": ["key", "password"]},
+            {"key": "password", "kind": "string", "required": false, "secret": true},
+            {"key": "private_key", "kind": "string", "required": false, "secret": true, "note": "OpenSSH/PEM text"},
+            {"key": "passphrase", "kind": "string", "required": false, "secret": true},
+            {"key": "remote_dir", "kind": "string", "required": true, "note": "created if missing; relative = under SFTP home"},
+            {"key": "host_key_fingerprint", "kind": "string", "required": false, "note": "SHA256:… pin (ssh-keygen -lf); mismatch aborts"},
+        ],
+        "options": {
+            "strings": {"format": ["custom", "plain", "tar"], "source_sslmode": "libpq sslmode", "target_sslmode": "libpq sslmode"},
+            "integers": {"compress": "0-9", "lock_wait_timeout_ms": ">=1", "restore_jobs": "1-32"},
+            "lists": ["schemas", "exclude_schemas", "exclude_tables", "exclude_table_data"],
+            "booleans": ["schema_only", "data_only", "no_owner", "no_privileges", "no_comments",
+                         "no_publications", "no_subscriptions", "clean", "if_exists", "create",
+                         "serializable_deferrable", "restore_clean", "restore_if_exists",
+                         "restore_no_owner", "restore_no_privileges", "restore_single_transaction",
+                         "restore_exit_on_error", "keep_local"],
+            "defaults": {"format": "custom"},
+        },
+        "job_statuses": ["starting", "running", "succeeded", "completed_with_errors", "failed", "stopped"],
+        "operations": pgdump_operations(),
+        "minimal_profile_example": {
+            "name": "seed-bookings",
+            "mode": "dump_restore",
+            "source": {"type": "postgres", "host": "cdc-postgres-source", "port": "5432", "database": "demo", "username": "demo", "password": "demo"},
+            "target": {"type": "postgres", "host": "cdc-postgres-target", "port": "5432", "database": "demo", "username": "demo", "password": "demo"},
+            "include_tables": [],
+            "options": {"schemas": ["bookings"], "no_owner": true, "restore_jobs": 2},
+        },
+    })
+}
+
+pub fn pgdump_contract(_cfg: &AppConfig) -> Value {
+    pgdump_contract_body()
+}
+
+pub async fn pgdump_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
+    migration_tool_discover(
+        cfg,
+        client,
+        "pgdump",
+        "/cdc/pgdump/contract",
+        cfg.pgdump_url.is_some(),
+        pgdump_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
+}
+
+fn rsync_operations() -> Value {
+    let mut ops = operations("rsync");
+    if let Some(list) = ops.as_array_mut() {
+        list.push(json!({"method": "POST", "path": "/cdc/rsync/profiles/{id}/run?dry_run=true", "purpose": "preview: itemized changes, nothing written"}));
+        list.push(json!({"method": "POST", "path": "/cdc/rsync/test-route", "purpose": "would a run go direct (source reaches target)?"}));
+        list.push(json!({"method": "DELETE", "path": "/cdc/rsync/jobs/{job_id}", "purpose": "delete a finished job"}));
+        list.push(json!({"method": "GET", "path": "/cdc/rsync/staging", "purpose": "relay staging copies and sizes"}));
+        list.push(json!({"method": "DELETE", "path": "/cdc/rsync/staging/{id}", "purpose": "free a profile's relay staging copy"}));
+    }
+    ops
+}
+
+fn ssh_endpoint_fields() -> Value {
+    json!([
+        {"key": "name", "kind": "string", "required": false},
+        {"key": "host", "kind": "string", "required": true},
+        {"key": "port", "kind": "string", "required": false, "default": "22"},
+        {"key": "username", "kind": "string", "required": true},
+        {"key": "auth", "kind": "string", "required": false, "enum": ["key", "password"]},
+        {"key": "password", "kind": "string", "required": false, "secret": true},
+        {"key": "private_key", "kind": "string", "required": false, "secret": true, "note": "OpenSSH/PEM text"},
+        {"key": "passphrase", "kind": "string", "required": false, "secret": true},
+        {"key": "path", "kind": "string", "required": true, "note": "relative = under the login's home; source trailing / copies the contents"},
+        {"key": "host_key_fingerprint", "kind": "string", "required": false, "note": "SHA256:… pin (ssh-keygen -lf); mismatch aborts"},
+        {"key": "rsync_path", "kind": "string", "required": false, "note": "auto-detected; Homebrew rsync preferred on macOS"},
+        {"key": "reach_host", "kind": "string", "required": false, "note": "target only: address the source uses in direct mode"},
+        {"key": "reach_port", "kind": "string", "required": false, "note": "target only"},
+    ])
+}
+
+fn rsync_contract_body() -> Value {
+    json!({
+        "contract_version": CONTRACT_VERSION,
+        "id": "rsync",
+        "title": "File sync (rsync over SSH)",
+        "source_host_os": ["linux", "darwin"],
+        "target_host_os": ["linux", "darwin"],
+        "transports": {
+            "auto": "direct when the source can log in to the target with the forwarded key, otherwise relay (reason recorded on the job)",
+            "direct": "the sidecar SSHes into the source (agent forwarding) and rsync there pushes to the target; data goes source → target once",
+            "relay": "the sidecar pulls source → staging volume (kept per profile, incremental), then pushes staging → target",
+        },
+        "connection": {"source": ssh_endpoint_fields(), "target": ssh_endpoint_fields()},
+        "profile_fields": [
+            {"key": "name", "kind": "string", "required": true},
+            {"key": "source", "kind": "ssh_endpoint", "required": true},
+            {"key": "target", "kind": "ssh_endpoint", "required": true, "note": "path is always a directory; created if missing. Direct mode needs auth=key"},
+            {"key": "options", "kind": "object", "required": false, "default": {}},
+        ],
+        "options": {
+            "strings": {"transport": ["auto", "direct", "relay"]},
+            "integers": {"max_delete": ">=0 (needs delete)", "bwlimit_kbps": ">=1", "io_timeout_seconds": "10-86400"},
+            "lists": ["excludes"],
+            "booleans": ["delete", "dry_run", "checksum", "compress", "no_owner", "hard_links", "acls", "xattrs",
+                         "numeric_ids", "one_file_system", "discard_staging"],
+            "defaults": {"transport": "auto", "delete": false},
+        },
+        "job_statuses": ["starting", "running", "succeeded", "completed_with_errors", "failed", "stopped"],
+        "operations": rsync_operations(),
+        "minimal_profile_example": {
+            "name": "web-assets",
+            "source": {"host": "web-01", "username": "deploy", "auth": "key", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----…", "path": "/srv/www/"},
+            "target": {"host": "mac-mini.lan", "username": "backup", "auth": "key", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----…", "path": "backups/www"},
+            "options": {"transport": "auto", "excludes": ["*.log", ".cache/"]},
+        },
+    })
+}
+
+pub fn rsync_contract(_cfg: &AppConfig) -> Value {
+    rsync_contract_body()
+}
+
+pub async fn rsync_discover(cfg: &AppConfig, client: &Client) -> Result<Value, AppError> {
+    migration_tool_discover(
+        cfg,
+        client,
+        "rsync",
+        "/cdc/rsync/contract",
+        cfg.rsync_url.is_some(),
+        rsync_contract_body()["minimal_profile_example"].clone(),
+    )
+    .await
 }

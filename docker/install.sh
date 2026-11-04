@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — complete single-host CDC stack (single docker-compose.yaml).
+# install.sh — CDC stack (core + optional overlays and profiles).
 # Runs from docker/, where .env sits next to the compose file.
 #
 # Usage:
@@ -10,12 +10,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# shellcheck source=compose.inc.sh
+source "$(dirname "$0")/compose.inc.sh"
+
 PROFILES=()
 WITH_DEMO=0
 WITH_LAKE=0
 WITH_VECTOR=0
 WITH_MCP=0
 WITH_NATIVE_UI=0
+WITH_CORE=0
+WITH_SIDECARS=1
+WITH_OPS=1
 DETACH="-d"
 
 usage() {
@@ -30,15 +36,18 @@ Options:
                   Local prompting: ALLOW_WRITE_TOOLS=true in docker/.env
                   See design compendium Ch.15 (docs/architecture/)
   --native-ui     Include native Level-3 web UI (profile: native-ui)
+  --core          Production core only (no sidecars, ksqlDB, or Kafbat UI)
+  --no-sidecars   Omit docker-compose.sidecars.yaml overlay
+  --no-ops        Omit docker-compose.ops.yaml (ksqlDB + Kafbat)
   --foreground    Run compose in foreground
   -h, --help      Show help
 
 Examples:
   ./install.sh --native-ui
-  ./install.sh --demo
+  ./install.sh --core
   ./install.sh --demo --lake --native-ui
   ./install.sh --demo --vector --native-ui
-  ORCH_ENV=prod ORCH_API_TOKEN=... ORCH_DATASERVICE_URL=... ./install.sh
+  ORCH_ENV=prod ORCH_API_TOKEN=... ./install.sh --core
 EOF
 }
 
@@ -49,6 +58,9 @@ while [[ $# -gt 0 ]]; do
     --vector) WITH_VECTOR=1; shift ;;
     --mcp) WITH_MCP=1; shift ;;
     --native-ui) WITH_NATIVE_UI=1; shift ;;
+    --core) WITH_CORE=1; shift ;;
+    --no-sidecars) WITH_SIDECARS=0; shift ;;
+    --no-ops) WITH_OPS=0; shift ;;
     --foreground) DETACH=""; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -73,12 +85,20 @@ set -a
 source ./.env
 set +a
 
+if [[ "$WITH_CORE" -eq 1 ]]; then
+  WITH_SIDECARS=0
+  WITH_OPS=0
+fi
+
+INSTALL_COMPOSE=( "${COMPOSE_CORE[@]}" )
+if [[ "$WITH_SIDECARS" -eq 1 ]]; then INSTALL_COMPOSE+=( "${COMPOSE_SIDECARS[@]}" ); fi
+if [[ "$WITH_OPS" -eq 1 ]]; then INSTALL_COMPOSE+=( "${COMPOSE_OPS[@]}" ); fi
+
 compose() {
   if [[ "${#PROFILES[@]}" -gt 0 ]]; then
-    docker compose -f docker-compose.yaml "${PROFILES[@]}" "$@"
+    docker compose "${INSTALL_COMPOSE[@]}" "${PROFILES[@]}" "$@"
   else
-    # macOS Bash 3.2 + `set -u` treats an empty array expansion as unbound.
-    docker compose -f docker-compose.yaml "$@"
+    docker compose "${INSTALL_COMPOSE[@]}" "$@"
   fi
 }
 

@@ -71,6 +71,10 @@ pub struct AppConfig {
     pub pgloader_token: Option<String>,
     pub mongocopy_url: Option<String>,
     pub mongocopy_token: Option<String>,
+    pub pgdump_url: Option<String>,
+    pub pgdump_token: Option<String>,
+    pub rsync_url: Option<String>,
+    pub rsync_token: Option<String>,
     pub rqlite_url: Option<String>,
     pub rqlite_user: Option<String>,
     pub rqlite_pass: Option<String>,
@@ -200,6 +204,26 @@ impl AppConfig {
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let pgdump_url = env::var("ORCH_PGDUMP_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let pgdump_token = env::var("ORCH_PGDUMP_TOKEN")
+            .ok()
+            .or_else(|| env::var("PGDUMP_API_TOKEN").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let rsync_url = env::var("ORCH_RSYNC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let rsync_token = env::var("ORCH_RSYNC_TOKEN")
+            .ok()
+            .or_else(|| env::var("RSYNC_API_TOKEN").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let rqlite_url = env::var("ORCH_RQLITE_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -244,8 +268,8 @@ impl AppConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty());
-        let audit_redis_key = env::var("ORCH_AUDIT_REDIS_KEY")
-            .unwrap_or_else(|_| "cdc:audit:events".to_string());
+        let audit_redis_key =
+            env::var("ORCH_AUDIT_REDIS_KEY").unwrap_or_else(|_| "cdc:audit:events".to_string());
         let audit_redis_max_len = env::var("ORCH_AUDIT_REDIS_MAX_LEN")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -323,6 +347,10 @@ impl AppConfig {
             pgloader_token,
             mongocopy_url,
             mongocopy_token,
+            pgdump_url,
+            pgdump_token,
+            rsync_url,
+            rsync_token,
             rqlite_url,
             rqlite_user,
             rqlite_pass,

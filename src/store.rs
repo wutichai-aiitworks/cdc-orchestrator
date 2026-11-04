@@ -8,12 +8,12 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::models::{
-    CdcProfile, MongoCopyProfile, PgCopyProfile, PgLoaderProfile, RedisShakeProfile,
-    SchemaCompareProfile,
+    CdcProfile, MongoCopyProfile, PgCopyProfile, PgDumpProfile, PgLoaderProfile, RedisShakeProfile,
+    RsyncProfile, SchemaCompareProfile,
 };
 use hyper_cdc_orchestrator::persist::{
-    RqliteClient, KIND_COMPARE, KIND_MONGOCOPY, KIND_PGCOPY, KIND_PGLOADER, KIND_PROFILE,
-    KIND_REDISSHAKE,
+    RqliteClient, KIND_COMPARE, KIND_MONGOCOPY, KIND_PGCOPY, KIND_PGDUMP, KIND_PGLOADER,
+    KIND_PROFILE, KIND_REDISSHAKE, KIND_RSYNC,
 };
 
 #[derive(Clone)]
@@ -493,6 +493,160 @@ impl MongoCopyProfileStore {
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
         if let Some(rq) = &self.rqlite {
             rq.delete(KIND_MONGOCOPY, &id.to_string()).await?;
+        }
+        self.memory.write().await.remove(&id);
+        Ok(())
+    }
+}
+
+// ── pgdump saved profiles ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct PgDumpProfileStore {
+    memory: Arc<RwLock<HashMap<Uuid, PgDumpProfile>>>,
+    rqlite: Option<RqliteClient>,
+}
+
+impl PgDumpProfileStore {
+    pub fn new(rqlite: Option<RqliteClient>) -> Self {
+        Self {
+            memory: Arc::new(RwLock::new(HashMap::new())),
+            rqlite,
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<PgDumpProfile>, AppError> {
+        if let Some(rq) = &self.rqlite {
+            match rq.list_json::<PgDumpProfile>(KIND_PGDUMP).await {
+                Ok(mut profiles) => {
+                    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+                    let mut map = self.memory.write().await;
+                    map.clear();
+                    for p in &profiles {
+                        map.insert(p.id, p.clone());
+                    }
+                    return Ok(profiles);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rqlite list pgdump profiles failed; using memory")
+                }
+            }
+        }
+        let mut profiles: Vec<PgDumpProfile> = self.memory.read().await.values().cloned().collect();
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(profiles)
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<Option<PgDumpProfile>, AppError> {
+        if let Some(rq) = &self.rqlite {
+            match rq
+                .get_json::<PgDumpProfile>(KIND_PGDUMP, &id.to_string())
+                .await
+            {
+                Ok(found) => {
+                    if let Some(p) = &found {
+                        self.memory.write().await.insert(p.id, p.clone());
+                    }
+                    return Ok(found);
+                }
+                Err(e) => tracing::warn!(error = %e, "rqlite get pgdump profile failed"),
+            }
+        }
+        Ok(self.memory.read().await.get(&id).cloned())
+    }
+
+    pub async fn upsert(&self, profile: &PgDumpProfile) -> Result<(), AppError> {
+        if let Some(rq) = &self.rqlite {
+            rq.put_json(KIND_PGDUMP, &profile.id.to_string(), profile)
+                .await?;
+        }
+        self.memory
+            .write()
+            .await
+            .insert(profile.id, profile.clone());
+        Ok(())
+    }
+
+    pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
+        if let Some(rq) = &self.rqlite {
+            rq.delete(KIND_PGDUMP, &id.to_string()).await?;
+        }
+        self.memory.write().await.remove(&id);
+        Ok(())
+    }
+}
+
+// ── rsync saved profiles ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct RsyncProfileStore {
+    memory: Arc<RwLock<HashMap<Uuid, RsyncProfile>>>,
+    rqlite: Option<RqliteClient>,
+}
+
+impl RsyncProfileStore {
+    pub fn new(rqlite: Option<RqliteClient>) -> Self {
+        Self {
+            memory: Arc::new(RwLock::new(HashMap::new())),
+            rqlite,
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<RsyncProfile>, AppError> {
+        if let Some(rq) = &self.rqlite {
+            match rq.list_json::<RsyncProfile>(KIND_RSYNC).await {
+                Ok(mut profiles) => {
+                    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+                    let mut map = self.memory.write().await;
+                    map.clear();
+                    for p in &profiles {
+                        map.insert(p.id, p.clone());
+                    }
+                    return Ok(profiles);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rqlite list rsync profiles failed; using memory")
+                }
+            }
+        }
+        let mut profiles: Vec<RsyncProfile> = self.memory.read().await.values().cloned().collect();
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(profiles)
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<Option<RsyncProfile>, AppError> {
+        if let Some(rq) = &self.rqlite {
+            match rq
+                .get_json::<RsyncProfile>(KIND_RSYNC, &id.to_string())
+                .await
+            {
+                Ok(found) => {
+                    if let Some(p) = &found {
+                        self.memory.write().await.insert(p.id, p.clone());
+                    }
+                    return Ok(found);
+                }
+                Err(e) => tracing::warn!(error = %e, "rqlite get rsync profile failed"),
+            }
+        }
+        Ok(self.memory.read().await.get(&id).cloned())
+    }
+
+    pub async fn upsert(&self, profile: &RsyncProfile) -> Result<(), AppError> {
+        if let Some(rq) = &self.rqlite {
+            rq.put_json(KIND_RSYNC, &profile.id.to_string(), profile)
+                .await?;
+        }
+        self.memory
+            .write()
+            .await
+            .insert(profile.id, profile.clone());
+        Ok(())
+    }
+
+    pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
+        if let Some(rq) = &self.rqlite {
+            rq.delete(KIND_RSYNC, &id.to_string()).await?;
         }
         self.memory.write().await.remove(&id);
         Ok(())

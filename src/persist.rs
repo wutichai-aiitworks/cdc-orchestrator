@@ -16,6 +16,8 @@ pub const KIND_PGCOPY: &str = "pgcopy_profile";
 pub const KIND_REDISSHAKE: &str = "redisshake_profile";
 pub const KIND_PGLOADER: &str = "pgloader_profile";
 pub const KIND_MONGOCOPY: &str = "mongocopy_profile";
+pub const KIND_PGDUMP: &str = "pgdump_profile";
+pub const KIND_RSYNC: &str = "rsync_profile";
 
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_config (
   kind TEXT NOT NULL,
@@ -135,6 +137,7 @@ impl RqliteClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_audit_event(
         &self,
         audit_id: &str,
@@ -163,18 +166,8 @@ impl RqliteClient {
 
     /// Drop oldest rows when the table grows past `max_rows`.
     pub async fn trim_audit_events(&self, max_rows: usize) -> Result<(), PersistError> {
-        if max_rows == 0 {
-            return Ok(());
-        }
-        let max = max_rows as i64;
-        self.execute(json!([[
-            "DELETE FROM cdc_audit_events WHERE audit_id IN (\
-               SELECT audit_id FROM cdc_audit_events ORDER BY timestamp ASC \
-               LIMIT MAX(0, (SELECT COUNT(*) FROM cdc_audit_events) - ?)\
-             )",
-            max
-        ]]))
-        .await
+        self.trim_oldest_by_timestamp("cdc_audit_events", "audit_id", max_rows)
+            .await
     }
 
     pub async fn list_audit_events(
@@ -186,42 +179,23 @@ impl RqliteClient {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<AuditEventRow>, PersistError> {
-        let cap = limit.clamp(1, 2000) as i64;
-        let mut sql = String::from(
+        self.query_event_rows(
             "SELECT audit_id, timestamp, actor, action, outcome, detail, profile_id, profile_name \
-             FROM cdc_audit_events WHERE 1=1",
-        );
-        let mut params: Vec<Value> = Vec::new();
-        if let Some(v) = action {
-            sql.push_str(" AND action=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = profile_id {
-            sql.push_str(" AND profile_id=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = outcome {
-            sql.push_str(" AND outcome=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = since {
-            sql.push_str(" AND timestamp>=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = until {
-            sql.push_str(" AND timestamp<=?");
-            params.push(json!(v));
-        }
-        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
-        params.push(json!(cap));
-        let mut stmt: Vec<Value> = vec![json!(sql)];
-        stmt.extend(params);
-        let rows = self.query(json!([stmt])).await?;
-        rows.into_iter()
-            .map(|row| decode_audit_row(&row))
-            .collect()
+             FROM cdc_audit_events",
+            limit,
+            |sql, params| {
+                push_eq_filter(sql, params, "action", action);
+                push_eq_filter(sql, params, "profile_id", profile_id);
+                push_eq_filter(sql, params, "outcome", outcome);
+                push_ge_filter(sql, params, "timestamp", since);
+                push_le_filter(sql, params, "timestamp", until);
+            },
+            decode_audit_row,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_pipeline_log(
         &self,
         log_id: &str,
@@ -253,20 +227,11 @@ impl RqliteClient {
     }
 
     pub async fn trim_pipeline_logs(&self, max_rows: usize) -> Result<(), PersistError> {
-        if max_rows == 0 {
-            return Ok(());
-        }
-        let max = max_rows as i64;
-        self.execute(json!([[
-            "DELETE FROM cdc_pipeline_logs WHERE log_id IN (\
-               SELECT log_id FROM cdc_pipeline_logs ORDER BY timestamp ASC \
-               LIMIT MAX(0, (SELECT COUNT(*) FROM cdc_pipeline_logs) - ?)\
-             )",
-            max
-        ]]))
-        .await
+        self.trim_oldest_by_timestamp("cdc_pipeline_logs", "log_id", max_rows)
+            .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_pipeline_logs(
         &self,
         limit: usize,
@@ -278,48 +243,22 @@ impl RqliteClient {
         level: Option<&str>,
         phase: Option<&str>,
     ) -> Result<Vec<PipelineLogRow>, PersistError> {
-        let cap = limit.clamp(1, 2000) as i64;
-        let mut sql = String::from(
+        self.query_event_rows(
             "SELECT log_id, timestamp, profile_id, profile_name, level, phase, action, outcome, message, detail \
-             FROM cdc_pipeline_logs WHERE 1=1",
-        );
-        let mut params: Vec<Value> = Vec::new();
-        if let Some(v) = action {
-            sql.push_str(" AND action=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = profile_id {
-            sql.push_str(" AND profile_id=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = outcome {
-            sql.push_str(" AND outcome=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = since {
-            sql.push_str(" AND timestamp>=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = until {
-            sql.push_str(" AND timestamp<=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = level {
-            sql.push_str(" AND level=?");
-            params.push(json!(v));
-        }
-        if let Some(v) = phase {
-            sql.push_str(" AND phase=?");
-            params.push(json!(v));
-        }
-        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
-        params.push(json!(cap));
-        let mut stmt: Vec<Value> = vec![json!(sql)];
-        stmt.extend(params);
-        let rows = self.query(json!([stmt])).await?;
-        rows.into_iter()
-            .map(|row| decode_pipeline_log_row(&row))
-            .collect()
+             FROM cdc_pipeline_logs",
+            limit,
+            |sql, params| {
+                push_eq_filter(sql, params, "action", action);
+                push_eq_filter(sql, params, "profile_id", profile_id);
+                push_eq_filter(sql, params, "outcome", outcome);
+                push_ge_filter(sql, params, "timestamp", since);
+                push_le_filter(sql, params, "timestamp", until);
+                push_eq_filter(sql, params, "level", level);
+                push_eq_filter(sql, params, "phase", phase);
+            },
+            decode_pipeline_log_row,
+        )
+        .await
     }
 
     pub async fn put_json<T: Serialize>(
@@ -389,6 +328,48 @@ impl RqliteClient {
         Ok(())
     }
 
+    async fn query_event_rows<T, F, G>(
+        &self,
+        select_from: &str,
+        limit: usize,
+        apply_filters: F,
+        decode_row: G,
+    ) -> Result<Vec<T>, PersistError>
+    where
+        F: FnOnce(&mut String, &mut Vec<Value>),
+        G: Fn(&[Value]) -> Result<T, PersistError>,
+    {
+        let cap = limit.clamp(1, 2000) as i64;
+        let mut sql = format!("{select_from} WHERE 1=1");
+        let mut params: Vec<Value> = Vec::new();
+        apply_filters(&mut sql, &mut params);
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        params.push(json!(cap));
+        let mut stmt: Vec<Value> = vec![json!(sql)];
+        stmt.extend(params);
+        let rows = self.query(json!([stmt])).await?;
+        rows.into_iter().map(|row| decode_row(&row)).collect()
+    }
+
+    async fn trim_oldest_by_timestamp(
+        &self,
+        table: &str,
+        id_column: &str,
+        max_rows: usize,
+    ) -> Result<(), PersistError> {
+        if max_rows == 0 {
+            return Ok(());
+        }
+        let max = max_rows as i64;
+        let sql = format!(
+            "DELETE FROM {table} WHERE {id_column} IN (\
+               SELECT {id_column} FROM {table} ORDER BY timestamp ASC \
+               LIMIT MAX(0, (SELECT COUNT(*) FROM {table}) - ?)\
+             )"
+        );
+        self.execute(json!([[sql, max]])).await
+    }
+
     async fn execute(&self, body: Value) -> Result<(), PersistError> {
         let url = format!("{}/db/execute?level=strong", self.base);
         let resp = self
@@ -441,6 +422,27 @@ impl RqliteClient {
         }
         first_result_error(&payload).map_err(PersistError::Upstream)?;
         Ok(result_values(&payload))
+    }
+}
+
+fn push_eq_filter(sql: &mut String, params: &mut Vec<Value>, column: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        sql.push_str(&format!(" AND {column}=?"));
+        params.push(json!(v));
+    }
+}
+
+fn push_ge_filter(sql: &mut String, params: &mut Vec<Value>, column: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        sql.push_str(&format!(" AND {column}>=?"));
+        params.push(json!(v));
+    }
+}
+
+fn push_le_filter(sql: &mut String, params: &mut Vec<Value>, column: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        sql.push_str(&format!(" AND {column}<=?"));
+        params.push(json!(v));
     }
 }
 
@@ -521,7 +523,8 @@ fn decode_pipeline_log_row(row: &[Value]) -> Result<PipelineLogRow, PersistError
         })
     };
     Ok(PipelineLogRow {
-        log_id: col(0).ok_or_else(|| PersistError::Internal("pipeline log missing log_id".into()))?,
+        log_id: col(0)
+            .ok_or_else(|| PersistError::Internal("pipeline log missing log_id".into()))?,
         timestamp: col(1)
             .ok_or_else(|| PersistError::Internal("pipeline log missing timestamp".into()))?,
         profile_id: col(2),
@@ -544,8 +547,10 @@ fn decode_audit_row(row: &[Value]) -> Result<AuditEventRow, PersistError> {
         })
     };
     Ok(AuditEventRow {
-        audit_id: col(0).ok_or_else(|| PersistError::Internal("audit row missing audit_id".into()))?,
-        timestamp: col(1).ok_or_else(|| PersistError::Internal("audit row missing timestamp".into()))?,
+        audit_id: col(0)
+            .ok_or_else(|| PersistError::Internal("audit row missing audit_id".into()))?,
+        timestamp: col(1)
+            .ok_or_else(|| PersistError::Internal("audit row missing timestamp".into()))?,
         actor: col(2).unwrap_or_default(),
         action: col(3).unwrap_or_default(),
         outcome: col(4).unwrap_or_default(),

@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""HTTP sidecar to run RedisShake sync jobs from JSON configuration."""
+"""HTTP sidecar for Redis sync (RedisShake). Contract: sidecar_common/http_api.py.
+
+One job per run (history per transfer); a sync runs until it is stopped. The shake.toml holds
+both passwords: 0600 and deleted, with the staging data, when the sync ends.
+"""
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import signal
-import subprocess
-import threading
-import uuid
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
+import ssl
+import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sidecar_common"))  # local tests
+
+from http_api import Tool, serve  # noqa: E402
+from jobstore import JobStore, fmt_bytes, plural, utc_now, write_secret  # noqa: E402
+from probes import BadRequest, describe, hint_for, norm_conn  # noqa: E402
 
 WORK_ROOT = Path(os.environ.get("REDIS_SHAKE_WORK_ROOT", "/var/lib/redisshake"))
 JOBS_DIR = WORK_ROOT / "jobs"
@@ -23,39 +28,10 @@ HOST = os.environ.get("REDIS_SHAKE_API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("REDIS_SHAKE_API_PORT", "8086"))
 SHAKE_BIN = os.environ.get("REDIS_SHAKE_BIN", "/app/redis-shake")
 MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("REDIS_SHAKE_MAX_CONCURRENT_JOBS", "1")))
-RETAIN_TERMINAL_JOBS = max(1, int(os.environ.get("REDIS_SHAKE_RETAIN_JOBS", "15")))
-CLEANUP_STAGING = os.environ.get("REDIS_SHAKE_CLEANUP_STAGING", "true").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+RETAIN = max(1, int(os.environ.get("REDIS_SHAKE_RETAIN_JOBS", "15")))
+CLEANUP_STAGING = os.environ.get("REDIS_SHAKE_CLEANUP_STAGING", "true").strip().lower() in ("1", "true", "yes", "on")
 
-_lock = threading.Lock()
-_procs: dict[str, subprocess.Popen[Any]] = {}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def job_dir(job_id: str) -> Path:
-    return JOBS_DIR / job_id
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    tmp.replace(path)
+STORE = JobStore(JOBS_DIR, "sync.log", retain_per_profile=RETAIN, max_active=MAX_CONCURRENT_JOBS)
 
 
 def toml_str(value: str) -> str:
@@ -121,318 +97,154 @@ def write_shake_toml(work: Path, body: dict[str, Any]) -> Path:
             ]
         )
 
-    path = work / "shake.toml"
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+    # Holds both passwords: 0600, deleted when the sync ends.
+    return write_secret(work / "shake.toml", "\n".join(lines))
 
 
-def job_status(job_id: str) -> dict[str, Any]:
-    meta_path = job_dir(job_id) / "job.json"
-    meta = read_json(meta_path)
-    if not meta:
-        return {"id": job_id, "status": "unknown"}
-
-    with _lock:
-        proc = _procs.get(job_id)
-
-    if proc is not None:
-        code = proc.poll()
-        if code is None:
-            meta["status"] = "running"
-        else:
-            meta["status"] = "succeeded" if code == 0 else "failed"
-            meta["exit_code"] = code
-            meta["finished_at"] = utc_now()
-            write_json(meta_path, meta)
-            cleanup_staging(job_id)
-            _procs.pop(job_id, None)
-    elif meta.get("status") == "running":
-        meta["status"] = "failed"
-        meta["error"] = meta.get("error") or "process not found"
-        meta["finished_at"] = utc_now()
-        write_json(meta_path, meta)
-        cleanup_staging(job_id)
-
-    meta["id"] = job_id
-    return meta
-
-
-def running_job_count() -> int:
-    count = 0
-    if not JOBS_DIR.is_dir():
-        return 0
-    for child in JOBS_DIR.iterdir():
-        if child.is_dir() and job_status(child.name).get("status") == "running":
-            count += 1
-    return count
-
-
-def cleanup_staging(job_id: str) -> None:
-    if not CLEANUP_STAGING:
-        return
-    data = job_dir(job_id) / "data"
-    if data.is_dir():
-        shutil.rmtree(data, ignore_errors=True)
-
-
-def prune_terminal_jobs() -> None:
-    if not JOBS_DIR.is_dir():
-        return
-    terminal: list[tuple[float, Path]] = []
-    for child in JOBS_DIR.iterdir():
-        if not child.is_dir():
-            continue
-        meta = read_json(child / "job.json")
-        status = meta.get("status")
-        if status in ("running", "starting"):
-            continue
-        if status in ("succeeded", "failed", "stopped", "unknown"):
-            terminal.append((child.stat().st_mtime, child))
-    terminal.sort(key=lambda item: item[0], reverse=True)
-    for _, path in terminal[RETAIN_TERMINAL_JOBS:]:
-        shutil.rmtree(path, ignore_errors=True)
-
-
-class JobBusyError(Exception):
-    pass
-
-
-def tail_log(path: Path, max_bytes: int = 256_000) -> str:
-    if not path.is_file():
-        return ""
-    data = path.read_bytes()
-    if len(data) > max_bytes:
-        data = data[-max_bytes:]
-    return data.decode("utf-8", errors="replace")
+def cleanup(work: Path) -> None:
+    (work / "shake.toml").unlink(missing_ok=True)
+    if CLEANUP_STAGING:
+        shutil.rmtree(work / "data", ignore_errors=True)
 
 
 def start_job(body: dict[str, Any]) -> dict[str, Any]:
-    if running_job_count() >= MAX_CONCURRENT_JOBS:
-        raise JobBusyError(
-            f"at most {MAX_CONCURRENT_JOBS} sync job(s) may run; stop the current job first"
-        )
-    prune_terminal_jobs()
-    job_id = str(body.get("id") or uuid.uuid4())
-    work = job_dir(job_id)
-    work.mkdir(parents=True, exist_ok=True)
-    (work / "data").mkdir(exist_ok=True)
-
-    config_path = write_shake_toml(work, body)
-    argv = [SHAKE_BIN, config_path.name]
-    log_path = work / "sync.log"
-    meta = {
-        "id": job_id,
-        "name": body.get("name") or job_id,
-        "status": "starting",
-        "created_at": utc_now(),
-        "started_at": utc_now(),
-        "argv": argv,
-        "config_path": str(config_path),
-        "log_path": str(log_path),
-    }
-    write_json(work / "job.json", meta)
-
-    with log_path.open("ab") as log_fh:
-        log_fh.write(f"\n--- redis-shake job {job_id} at {utc_now()} ---\n".encode())
-        log_fh.write((" ".join(argv) + "\n").encode())
-        proc = subprocess.Popen(
-            argv,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=str(work),
-            start_new_session=True,
-        )
-
-    with _lock:
-        _procs[job_id] = proc
-
-    meta["status"] = "running"
-    meta["pid"] = proc.pid
-    write_json(work / "job.json", meta)
-    return meta
-
-
-def stop_job(job_id: str) -> dict[str, Any]:
-    with _lock:
-        proc = _procs.get(job_id)
-    if proc is None or proc.poll() is not None:
-        meta = job_status(job_id)
-        if meta.get("status") == "running":
-            meta["status"] = "stopped"
-            meta["finished_at"] = utc_now()
-            write_json(job_dir(job_id) / "job.json", meta)
-            cleanup_staging(job_id)
-        return meta
-
+    job_id, work, meta = STORE.new_job(body)
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    meta = job_status(job_id)
-    meta["status"] = "stopped"
-    meta["finished_at"] = utc_now()
-    write_json(job_dir(job_id) / "job.json", meta)
-    cleanup_staging(job_id)
-    with _lock:
-        _procs.pop(job_id, None)
-    return meta
+        (work / "data").mkdir(exist_ok=True)
+        config = write_shake_toml(work, body)
+        argv = [SHAKE_BIN, config.name]
+        STORE.update(job_id, argv=argv, config_path=str(config))
+        header = f"\n--- redis-shake job {job_id} at {utc_now()} ---\n{' '.join(argv)}\n"
+        return STORE.spawn(job_id, argv, header=header, on_exit=lambda jid, code: cleanup(work))
+    except Exception as exc:
+        cleanup(work)
+        STORE.fail_start(job_id, f"{type(exc).__name__}: {exc}")
+        raise
 
 
-def list_jobs() -> list[dict[str, Any]]:
-    if not JOBS_DIR.is_dir():
-        return []
-    jobs: list[dict[str, Any]] = []
-    for child in sorted(JOBS_DIR.iterdir(), key=lambda p: p.name, reverse=True):
-        if child.is_dir():
-            jobs.append(job_status(child.name))
-    return jobs
+# ── connection test: a few RESP commands over a plain (or TLS) socket ────────
 
 
-CAPABILITY = {
-    "service": "cdc-redisshake",
-    "mode": "sync_reader",
-    "options": {
-        "booleans": [
-            "source_cluster",
-            "target_cluster",
-            "source_tls",
-            "target_tls",
-            "sync_rdb",
-            "sync_aof",
-            "prefer_replica",
-            "try_diskless",
-            "off_reply",
-        ],
-        "strings": ["rdb_restore_command_behavior"],
-    },
-    "connection_fields": ["host", "port", "username", "password"],
-    "notes": "Uses RedisShake sync_reader + redis_writer; jobs run until stopped or source disconnects.",
-    "limits": {
+def _encode(*args: str) -> bytes:
+    out = [f"*{len(args)}\r\n".encode()]
+    for a in args:
+        b = a.encode()
+        out.append(f"${len(b)}\r\n".encode() + b + b"\r\n")
+    return b"".join(out)
+
+
+class RespError(Exception):
+    pass
+
+
+def _read(f: Any) -> Any:
+    line = f.readline()
+    if not line:
+        raise ConnectionError("connection closed by the server")
+    kind, rest = line[:1], line[1:].rstrip(b"\r\n")
+    if kind == b"+":
+        return rest.decode()
+    if kind == b"-":
+        raise RespError(rest.decode())
+    if kind == b":":
+        return int(rest)
+    if kind == b"$":
+        n = int(rest)
+        if n < 0:
+            return None
+        data = f.read(n + 2)
+        return data[:-2].decode("utf-8", errors="replace")
+    if kind == b"*":
+        return [_read(f) for _ in range(max(0, int(rest)))]
+    raise RespError(f"unexpected reply {line[:40]!r}")
+
+
+def parse_info(text: str) -> dict[str, str]:
+    out = {}
+    for line in (text or "").splitlines():
+        if ":" in line and not line.startswith("#"):
+            k, v = line.split(":", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def keyspace_keys(info: dict[str, str]) -> int:
+    total = 0
+    for k, v in info.items():
+        if k.startswith("db") and "keys=" in v:
+            total += int(v.split("keys=", 1)[1].split(",", 1)[0])
+    return total
+
+
+def redis_test(conn: dict[str, str], tls: bool, cluster: bool, timeout: float = 8) -> dict[str, Any]:
+    target = f"{conn['host']}:{conn['port']}"
+    try:
+        sock = socket.create_connection((conn["host"], int(conn["port"])), timeout=timeout)
+        if tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE  # same as RedisShake's tls = true
+            sock = ctx.wrap_socket(sock, server_hostname=conn["host"])
+        with sock, sock.makefile("rwb") as f:
+            def cmd(*args: str) -> Any:
+                f.write(_encode(*args))
+                f.flush()
+                return _read(f)
+
+            if conn["password"]:
+                cmd(*(["AUTH", conn["username"], conn["password"]] if conn["username"] else ["AUTH", conn["password"]]))
+            cmd("PING")
+            server = parse_info(cmd("INFO", "server"))
+            keys = keyspace_keys(parse_info(cmd("INFO", "keyspace")))
+            memory = parse_info(cmd("INFO", "memory"))
+    except RespError as exc:
+        msg = str(exc)
+        return {"ok": False, "target": target, "error": msg, "hint": hint_for(msg) or ("The server needs a password." if "NOAUTH" in msg else None)}
+    except ssl.SSLError as exc:
+        return {"ok": False, "target": target, "error": f"TLS: {exc}", "hint": "The TLS setting does not match the server. Turn TLS on or off to match it."}
+    except (OSError, ConnectionError) as exc:
+        msg = str(exc) or type(exc).__name__
+        return {"ok": False, "target": target, "error": msg, "hint": hint_for(msg) or hint_for("connection refused")}
+    mode = server.get("redis_mode", "standalone")
+    out: dict[str, Any] = {
+        "ok": True,
+        "target": target,
+        "server_version": server.get("redis_version"),
+        "keys": keys,
+        "facts": [f"Redis {server.get('redis_version', '?')}", mode, plural(keys, "key"), fmt_bytes(memory.get("used_memory"))],
+    }
+    if cluster and mode != "cluster":
+        out["warning"] = "“Cluster” is on, but this server is not a cluster node. Turn it off."
+    elif not cluster and mode == "cluster":
+        out["warning"] = "This server is a cluster node. Turn on “Cluster” so every shard is synced."
+    return out
+
+
+def test_connection(body: dict[str, Any]) -> dict[str, Any]:
+    conn = norm_conn(body.get("connection"), default_port="6379", need_database=False, need_user=False)
+    side = body.get("side") or "source"
+    if side not in ("source", "target"):
+        raise BadRequest("side must be source or target")
+    options = body.get("options") or {}
+    out = redis_test(conn, bool(options.get(f"{side}_tls")), bool(options.get(f"{side}_cluster")))
+    if out.get("ok") and side == "target" and out.get("keys"):
+        out.setdefault("warning", "The target already has keys. Choose below what happens when a key exists on both.")
+    out["target"] = describe(conn) if conn["username"] else out["target"]
+    return out
+
+
+def capability() -> dict[str, Any]:
+    return {
+        "connection_fields": ["host", "port", "username", "password"],
         "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
-        "retain_terminal_jobs": RETAIN_TERMINAL_JOBS,
-        "cleanup_staging_on_finish": CLEANUP_STAGING,
-    },
-}
+        "retain_runs_per_profile": RETAIN,
+        "redisshake_bin": SHAKE_BIN,
+    }
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def _auth_ok(self) -> bool:
-        if not API_TOKEN:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == API_TOKEN:
-            return True
-        return self.headers.get("X-API-Token", "").strip() == API_TOKEN
-
-    def _json(self, code: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            return {}
-
-    def do_GET(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/") or "/"
-        if path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if path == "/v1/discover":
-            out = {
-                "contract_version": "1",
-                "tool_id": "redisshake",
-                "service": CAPABILITY["service"],
-                "sidecar_ready": True,
-                "orchestrator_contract": "/cdc/redisshake/contract",
-                "redisshake_binary": SHAKE_BIN if Path(SHAKE_BIN).is_file() else None,
-                "limits": CAPABILITY.get("limits"),
-            }
-            self._json(200, out)
-            return
-        if path == "/v1/capability":
-            out = dict(CAPABILITY)
-            out["redisshake_image"] = "ghcr.io/tair-opensource/redisshake"
-            if Path(SHAKE_BIN).is_file():
-                out["redisshake_binary"] = SHAKE_BIN
-            self._json(200, out)
-            return
-        if path == "/v1/jobs":
-            self._json(200, {"jobs": list_jobs()})
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/logs"):
-            job_id = path.split("/")[3]
-            log_path = job_dir(job_id) / "sync.log"
-            self._json(200, {"id": job_id, "log": tail_log(log_path)})
-            return
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            meta = job_status(job_id)
-            if meta.get("status") == "unknown":
-                self._json(404, {"error": "job not found"})
-                return
-            self._json(200, meta)
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path == "/v1/jobs":
-            body = self._read_body()
-            if not body.get("source") or not body.get("target"):
-                self._json(400, {"error": "source and target are required"})
-                return
-            try:
-                meta = start_job(body)
-            except JobBusyError as exc:
-                self._json(409, {"error": str(exc)})
-                return
-            except OSError as exc:
-                self._json(500, {"error": str(exc)})
-                return
-            self._json(202, meta)
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/stop"):
-            job_id = path.split("/")[3]
-            self._json(200, stop_job(job_id))
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_DELETE(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            stop_job(job_id)
-            self._json(200, {"id": job_id, "status": "stopped"})
-            return
-        self._json(404, {"error": "not found"})
-
-
-def main() -> None:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"cdc-redisshake listening on {HOST}:{PORT}", flush=True)
-    server.serve_forever()
-
+TOOL = Tool(tool_id="redisshake", service="cdc-redisshake", store=STORE, capability=capability, start=start_job,
+            test=test_connection, api_token=API_TOKEN)
 
 if __name__ == "__main__":
-    main()
+    STORE.recover_on_start(cleanup)
+    serve(TOOL, HOST, PORT)

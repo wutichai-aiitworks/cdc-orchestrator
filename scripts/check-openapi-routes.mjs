@@ -15,7 +15,7 @@ const cdcStart = main.search(/let\s+cdc\s*=/)
 const cdcBlock = cdcStart >= 0 ? main.slice(cdcStart, main.indexOf("\n    let ", cdcStart + 10)) : main
 
 // Copy tools share one templated block in the spec: /cdc/{tool}/...
-const TOOLS = ["pgcopy", "pgloader", "redisshake", "mongocopy"]
+const TOOLS = ["pgcopy", "pgloader", "redisshake", "mongocopy", "pgdump", "rsync"]
 const norm = (p) => {
   let path = p.replace(/:([A-Za-z_]+)/g, "{param}").replace(/\{[^}]+\}/g, "{param}")
   const first = path.split("/")[1]

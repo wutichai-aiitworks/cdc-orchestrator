@@ -1,10 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { API, expectStatus, json } from "./helpers";
 
-// One-shot migration tools share one contract (pgcopydb, pgloader, redis-shake, mongo copy).
+// One-shot migration tools share one contract (pgcopydb, pgloader, redis-shake, mongo copy, pg_dump).
 // Read-only: no profiles are created and no jobs are run.
 
-const TOOLS = ["pgcopy", "pgloader", "redisshake", "mongocopy"] as const;
+const TOOLS = ["pgcopy", "pgloader", "redisshake", "mongocopy", "pgdump"] as const;
 
 test("GET /migration-tools/discover lists every tool with resolvable paths", async ({ request }) => {
   const res = await request.get(`${API}/migration-tools/discover`);

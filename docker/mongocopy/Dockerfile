@@ -7,6 +7,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY serve.py /app/serve.py
+COPY --from=common jobstore.py probes.py http_api.py /app/
 
 RUN mkdir -p /var/lib/mongocopy/jobs
 

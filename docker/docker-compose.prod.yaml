@@ -7,12 +7,14 @@
 # retaining --overprovisioned and --check=false for virtualized/shared hosts.
 # Dedicated Linux hosts can add docker-compose.prod-linux.yaml in Phase 3B.
 #
-# Usage:
+# Usage (production core — add sidecars/ops overlays only if you need them):
 #   docker compose \
 #     --env-file .env.production \
 #     -f docker-compose.yaml \
 #     -f docker-compose.prod.yaml \
 #     config
+#
+#   # optional: -f docker-compose.sidecars.yaml -f docker-compose.ops.yaml
 #
 # Do not run `up` until production-preflight.sh passes and a maintenance window
 # is approved. Applying this overlay can recreate Redpanda and Kafka Connect.

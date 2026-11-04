@@ -31,6 +31,8 @@ Instructions for AI coding agents working with the CDC control plane.
 | `mcp/README.md` | MCP crate / tool list |
 | `INSTALL.md` | Compose install (`--mcp --demo`) + `docker/` layout |
 | `.woodpecker/README.md` | CI workflows, published images, required secrets |
+| `docs/adr/0004-incremental-rolling-window-and-initial-load.md` | Incremental per-table poll strategy (rolling window / full copy), streaming initial load, why not COALESCE/triggers |
+| `docs/adr/0007-rsync-file-sync-sidecar.md` | File sync (rsync over SSH): direct via forwarded key, relay fallback, host-key pinning, macOS rsync detection |
 | `docs/adr/0002-native-ui-local-auth.md` | Native WebUI login (`AUTH_MODE=local`), threat model, decisions |
 | `docs/testing/api-test-plan.md` | How to run tests, coverage map, **known-bug register** (B-xx) and fix order |
 
@@ -46,14 +48,16 @@ Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`,
 4. **Orchestrator token:** `docker/install.sh` generates `ORCH_API_TOKEN` into `docker/.env` if missing. Host-side callers of `:9788` need `Authorization: Bearer $ORCH_API_TOKEN`.
 5. **UI conventions:** icons `class="h-4 w-4" :stroke-width="1.75"`; brand chips `bg-brand-500/10 text-primary`; focus `ring-1 ring-ring`; popovers teleport to body (see `AppInfoHint`, `AppUserMenu`); reuse `.icon-button`, `.avatar`, `.menu-panel`, `.menu-item`, `.auth-input`, `.btn-primary`, `.alert-*` instead of ad-hoc classes.
 6. **Verify:** `npm run build` then run `.output` with `AUTH_MODE=local node map-env.mjs ./.output/server/index.mjs` and exercise `/api/auth/login`, `/api/auth/me`, `/api/auth/logout`. Don't commit unless asked.
+7. **Target DDL ("Create table" in the mapping step):** one generator, `utils/targetDdl.ts` (types via `utils/dbTypeTranslator.ts`), shared by both trees. Runs through `POST /cdc/profiles/catalog/target/ddl` (create-only guard, one statement per call, audited as `target.create_tables`). Rules (ADR 0003): Oracle → Postgres lowercases every name like `fold_oracle_postgres_target`; identity/sequence defaults dropped; no foreign keys; expression/partial indexes become `-- NOTE` lines, never guesses. New source metadata (size/scale/default/indexes) needs a rebuilt `cdc-jdbc-admin` image.
 
 ## Testing
 
-1. **Offline gate:** `npm run check` — OpenAPI route coverage (`scripts/check-openapi-routes.mjs`), native-UI parity, Rust unit tests (orchestrator + `mcp/`). Must pass before finishing any change.
+1. **Offline gate:** `npm run check` — OpenAPI route coverage (`scripts/check-openapi-routes.mjs`), native-UI parity, UI unit tests (`npm run test:unit`: `node --test` on `tests/unit/*.test.ts`, no framework), Rust unit tests (orchestrator + `mcp/`). jdbc-admin: `cd docker/jdbc-admin && mvn -q test` (H2). Must pass before finishing any change.
 2. **Live API:** `npm run test:api` (strict, self-cleaning `pw-` fixtures). `npm run test:api:e2e` also starts pipelines against demo DBs. Engine up/restart/down only with `ORCH_TEST_ALLOW_ENGINE=true` — never on a shared stack.
-3. **New `/cdc` route ⇒ document it** in `docs/openapi.yaml` (the route check fails otherwise), then regenerate JSON in both UI trees (`node scripts/generate-openapi.mjs`).
+3. **New `/cdc` route ⇒ document it** in `docs/openapi.yaml` (the route check fails otherwise), then `scripts/generate-openapi.sh` (rewrites `docs/openapi.json` + both trees' `public/openapi.json`).
 4. **Known bugs are `test.fail(...)`** tied to IDs in `docs/testing/api-test-plan.md`. When you fix one, remove its annotation (the test turns red until you do) and update the register.
 5. Never point tests at objects you didn't create; the stack may hold real customer profiles.
+6. **Testing undeployed backend changes:** run an isolated orchestrator — memory-only store (no `ORCH_RQLITE_URL` ⇒ zero profiles, nothing to reconcile), Connect/ksql/registry on a dead port, no Docker socket — plus `java -jar docker/jdbc-admin/target/cdc-jdbc-admin-1.0.0.jar` with `JDBC_ADMIN_HOST=127.0.0.1 JDBC_ADMIN_PORT=18084`. Launch from a **bash** script with explicit `env -i VAR=…` (zsh does not word-split `$vars`, so a packed env string silently falls back to the real `localhost:28083` Connect). Check the startup line shows `connect_base_url=http://127.0.0.1:9` before sending requests. Then `ORCH_TEST_BASE_URL=http://127.0.0.1:<port> ORCH_TEST_DB_HOST=localhost npx playwright test <spec>`.
 
 ### Short prompts that work
 

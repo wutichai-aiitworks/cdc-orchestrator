@@ -1,0 +1,197 @@
+# Copy & Sync + pgdump + rsync sidecars (optional overlay).
+#
+# Usage (from docker/):
+#   docker compose -f docker-compose.yaml -f docker-compose.sidecars.yaml up -d --build
+#
+# install.sh includes this overlay by default; use install.sh --core for production-only core.
+
+volumes:
+  cdc-pgcopydb-data:
+  cdc-redisshake-data:
+  cdc-pgloader-data:
+  cdc-mongocopy-data:
+  cdc-pgdump-data:
+  cdc-rsync-data:
+
+services:
+  cdc-pgcopydb:
+    image: ${CDC_PGCOPY_IMAGE:-cdc-pgcopydb:local}
+    build:
+      context: ./pgcopydb
+      dockerfile: Dockerfile
+      additional_contexts:
+        common: ./sidecar_common
+      args:
+        PG_MAJOR: ${CDC_PGCOPY_PG_MAJOR:-18}
+    container_name: cdc-pgcopydb
+    environment:
+      PGCOPY_API_HOST: 0.0.0.0
+      PGCOPY_API_PORT: "8085"
+      PGCOPY_API_TOKEN: ${ORCH_PGCOPY_TOKEN:-}
+      PGCOPY_WORK_ROOT: /var/lib/pgcopydb
+    volumes:
+      - cdc-pgcopydb-data:/var/lib/pgcopydb
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8085/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  cdc-redisshake:
+    image: ${CDC_REDIS_SHAKE_IMAGE:-cdc-redisshake:local}
+    build:
+      context: ./redisshake
+      dockerfile: Dockerfile
+      additional_contexts:
+        common: ./sidecar_common
+    container_name: cdc-redisshake
+    environment:
+      REDIS_SHAKE_API_HOST: 0.0.0.0
+      REDIS_SHAKE_API_PORT: "8086"
+      REDIS_SHAKE_API_TOKEN: ${ORCH_REDIS_SHAKE_TOKEN:-}
+      REDIS_SHAKE_WORK_ROOT: /var/lib/redisshake
+      REDIS_SHAKE_MAX_CONCURRENT_JOBS: ${REDIS_SHAKE_MAX_CONCURRENT_JOBS:-1}
+      REDIS_SHAKE_RETAIN_JOBS: ${REDIS_SHAKE_RETAIN_JOBS:-15}
+      REDIS_SHAKE_CLEANUP_STAGING: ${REDIS_SHAKE_CLEANUP_STAGING:-true}
+    volumes:
+      - cdc-redisshake-data:/var/lib/redisshake
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8086/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  cdc-pgloader:
+    image: ${CDC_PGLOADER_IMAGE:-cdc-pgloader:local}
+    build:
+      context: ./pgloader
+      dockerfile: Dockerfile
+      additional_contexts:
+        common: ./sidecar_common
+    container_name: cdc-pgloader
+    environment:
+      PGLOADER_API_HOST: 0.0.0.0
+      PGLOADER_API_PORT: "8087"
+      PGLOADER_API_TOKEN: ${ORCH_PGLOADER_TOKEN:-}
+      PGLOADER_WORK_ROOT: /var/lib/pgloader
+    volumes:
+      - cdc-pgloader-data:/var/lib/pgloader
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8087/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  cdc-mongocopy:
+    image: ${CDC_MONGOCOPY_IMAGE:-cdc-mongocopy:local}
+    build:
+      context: ./mongocopy
+      dockerfile: Dockerfile
+      additional_contexts:
+        common: ./sidecar_common
+    container_name: cdc-mongocopy
+    environment:
+      MONGOCOPY_API_HOST: 0.0.0.0
+      MONGOCOPY_API_PORT: "8088"
+      MONGOCOPY_API_TOKEN: ${ORCH_MONGOCOPY_TOKEN:-}
+      MONGOCOPY_WORK_ROOT: /var/lib/mongocopy
+    volumes:
+      - cdc-mongocopy-data:/var/lib/mongocopy
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8088/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  cdc-pgdump:
+    image: ${CDC_PGDUMP_IMAGE:-cdc-pgdump:local}
+    build:
+      context: ./pgdump
+      dockerfile: Dockerfile
+      args:
+        PG_MAJOR: ${CDC_PGDUMP_PG_MAJOR:-18}
+    container_name: cdc-pgdump
+    environment:
+      PGDUMP_API_HOST: 0.0.0.0
+      PGDUMP_API_PORT: "8089"
+      PGDUMP_API_TOKEN: ${ORCH_PGDUMP_TOKEN:-}
+      PGDUMP_WORK_ROOT: /var/lib/pgdump
+      PGDUMP_MAX_CONCURRENT: ${PGDUMP_MAX_CONCURRENT:-2}
+      PGDUMP_MIN_FREE_MB: ${PGDUMP_MIN_FREE_MB:-1024}
+      PGDUMP_TIMEOUT_SECONDS: ${PGDUMP_TIMEOUT_SECONDS:-0}
+      PGDUMP_RETENTION_HOURS: ${PGDUMP_RETENTION_HOURS:-72}
+    volumes:
+      - cdc-pgdump-data:/var/lib/pgdump
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8089/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # Host-to-host file sync over SSH (ADR 0007). Needs outbound SSH (22 or the profile port) to the
+  # source and, for relay, the target. Relay copies live in cdc-rsync-data (one per profile).
+  cdc-rsync:
+    image: ${CDC_RSYNC_IMAGE:-cdc-rsync:local}
+    build:
+      context: ./rsync
+      dockerfile: Dockerfile
+    container_name: cdc-rsync
+    environment:
+      RSYNC_API_HOST: 0.0.0.0
+      RSYNC_API_PORT: "8090"
+      RSYNC_API_TOKEN: ${ORCH_RSYNC_TOKEN:-}
+      RSYNC_WORK_ROOT: /var/lib/rsync
+      RSYNC_MAX_CONCURRENT: ${RSYNC_MAX_CONCURRENT:-2}
+      RSYNC_MIN_FREE_MB: ${RSYNC_MIN_FREE_MB:-1024}
+      RSYNC_TIMEOUT_SECONDS: ${RSYNC_TIMEOUT_SECONDS:-0}
+      RSYNC_RETENTION_HOURS: ${RSYNC_RETENTION_HOURS:-168}
+      RSYNC_STAGING_RETENTION_DAYS: ${RSYNC_STAGING_RETENTION_DAYS:-14}
+      RSYNC_SSH_TIMEOUT_SECONDS: ${RSYNC_SSH_TIMEOUT_SECONDS:-15}
+    volumes:
+      - cdc-rsync-data:/var/lib/rsync
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  cdc-vector:
+    image: timberio/vector:0.41.1-alpine
+    container_name: cdc-vector
+    profiles: ["vector"]
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    command: ["--config", "/etc/vector/vector.toml"]
+    environment:
+      O2_URL: ${O2_URL:-http://openobserve-core:5080}
+      O2_ORG: ${O2_ORG:-default}
+      O2_STREAM: ${O2_STREAM:-cdc-copy}
+      O2_USER: ${O2_USER:-}
+      O2_PASSWORD: ${O2_PASSWORD:-}
+    volumes:
+      - ./config/vector.toml:/etc/vector/vector.toml:ro
+      - cdc-pgcopydb-data:/var/lib/pgcopydb:ro
+      - cdc-redisshake-data:/var/lib/redisshake:ro
+      - cdc-pgloader-data:/var/lib/pgloader:ro
+      - cdc-mongocopy-data:/var/lib/mongocopy:ro
+    networks: [server_zone]
+    restart: unless-stopped

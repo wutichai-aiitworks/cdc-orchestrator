@@ -15,6 +15,21 @@ export type SourceTableColumn = {
   primary_key: boolean
   pk_position?: number | null
   unique: boolean
+  /** Character length or numeric precision (jdbc-admin COLUMN_SIZE). */
+  size?: number | null
+  /** Numeric scale (jdbc-admin DECIMAL_DIGITS). */
+  scale?: number | null
+  default_value?: string | null
+  auto_increment?: boolean
+}
+
+export type SourceTableIndex = {
+  name: string
+  unique: boolean
+  columns: string[]
+  descending?: string[]
+  filter?: string | null
+  expression?: boolean
 }
 
 export type SourceTableInspect = {
@@ -23,6 +38,8 @@ export type SourceTableInspect = {
   row_count?: number | null
   primary_key: string[]
   columns: SourceTableColumn[]
+  /** Absent when the inspector does not report indexes (older cdc-jdbc-admin). */
+  indexes?: SourceTableIndex[]
   rows: Array<Record<string, unknown>>
   limit: number
 }
@@ -107,6 +124,7 @@ export type ProfilePayload = {
     timestamp_column?: string | null
     incrementing_column?: string | null
     upsert_key_columns?: string[]
+    table_poll?: TablePollRule[]
   }
   target?: {
     name?: string
@@ -127,6 +145,44 @@ export type ProfilePayload = {
   }
   /** When true (default), orchestrator restarts this pipeline after boot if it was running. */
   autostart?: boolean
+}
+
+/** Incremental capture: how one table is polled (see docs/openapi.yaml TablePollRule). */
+export type TablePollStrategy = "watermark" | "rolling_window" | "full_copy"
+
+export type TablePollRule = {
+  table: string
+  strategy: TablePollStrategy
+  window_column?: string | null
+  window_days?: number | null
+}
+
+export type InitialLoadTable = {
+  source: string
+  target: string
+  state: "pending" | "running" | "done" | "failed" | "skipped"
+  rows_copied: number
+  error?: string
+}
+
+export type SplitProfileResult = {
+  original: CdcProfile
+  created: CdcProfile
+  moved_tables: string[]
+  /** Original is running/paused: restart it after starting the new pipeline. */
+  original_restart_required: boolean
+}
+
+export type InitialLoadStatus = {
+  profile_id: string
+  state: "running" | "succeeded" | "failed" | "cancelled"
+  started_at: string
+  finished_at?: string
+  clear_target: boolean
+  actor: string
+  error?: string
+  rows_copied: number
+  tables: InitialLoadTable[]
 }
 
 export type CdcProfile = ProfilePayload & {
@@ -232,6 +288,16 @@ export const useProfilesM3 = () => {
       method: "POST",
       body,
     })
+  const createTargetTables = (body: {
+    target: NonNullable<ProfilePayload["target"]>
+    statements: string[]
+    profile_id?: string | null
+  }) =>
+    $fetch<{
+      status: boolean
+      executed: number
+      results: Array<{ index: number; ok: boolean; error?: string }>
+    }>("/api/cdc/profiles/catalog/target/ddl", { method: "POST", body })
   const previewSourceTriggers = (body: {
     source: ProfilePayload["source"]
     tables?: string[]
@@ -296,7 +362,23 @@ export const useProfilesM3 = () => {
     )
   }
 
+  const initialLoadPath = (id: string) => `/api/cdc/profiles/${encodeURIComponent(id)}/initial-load`
+  /// Start a background streaming copy of every source row (one SELECT per table).
+  const startInitialLoad = (id: string, body: { clear_target: boolean; tables: string[] }) =>
+    $fetch<InitialLoadStatus>(initialLoadPath(id), { method: "POST", body })
+  const getInitialLoad = (id: string) => $fetch<InitialLoadStatus>(initialLoadPath(id))
+  const cancelInitialLoad = (id: string) =>
+    $fetch<InitialLoadStatus>(initialLoadPath(id), { method: "DELETE" })
+
+  /** Move tables into a new Draft pipeline with the same source and target. */
+  const splitProfile = (id: string, body: { name: string; description?: string; tables: string[] }) =>
+    $fetch<SplitProfileResult>(`/api/cdc/profiles/${encodeURIComponent(id)}/split`, { method: "POST", body })
+
   return {
+    splitProfile,
+    startInitialLoad,
+    getInitialLoad,
+    cancelInitialLoad,
     fetchProfiles,
     createProfile,
     updateProfile,
@@ -309,6 +391,7 @@ export const useProfilesM3 = () => {
     browseTargetCatalog,
     inspectSourceTable,
     inspectTargetTable,
+    createTargetTables,
     previewSourceTriggers,
     installSourceTriggers,
     sourceTriggerStatus,

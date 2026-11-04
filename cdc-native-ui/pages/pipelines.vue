@@ -12,6 +12,7 @@ import {
   Save,
   Search,
   TriangleAlert,
+  Wand2,
   Trash2,
   Waves,
   Zap,
@@ -32,6 +33,7 @@ import type {
   SourceTableColumn,
   TableFormat,
   TableMapping,
+  TablePollRule,
 } from "~/composables/useProfilesM3"
 import { formatApiError } from "~/utils/apiError"
 import { DB_TYPE_OPTIONS, dbIconPath } from "~/utils/dbIcon"
@@ -109,6 +111,7 @@ const form = reactive({
   timestampColumn: "",
   incrementingColumn: "",
   upsertKeyColumns: "",
+  tablePoll: [] as TablePollRule[],
   targetName: "",
   targetType: "postgres" as DatabaseType,
   targetHost: "",
@@ -383,7 +386,28 @@ const applyIncrementalSourceToForm = (profile: CdcProfile) => {
   form.timestampColumn = profile.source.timestamp_column ?? ""
   form.incrementingColumn = profile.source.incrementing_column ?? ""
   form.upsertKeyColumns = upsertKeysForForm(profile)
+  form.tablePoll = [...(profile.source.table_poll ?? [])]
 }
+
+/** Non-watermark poll rules for tables that are still selected (dropped tables lose their rule). */
+const activeTablePoll = (): TablePollRule[] => {
+  const selected = splitList(form.tables).map((t) => t.toLowerCase())
+  return form.tablePoll.filter(
+    (rule) => rule.strategy !== "watermark" && selected.includes(rule.table.toLowerCase()),
+  )
+}
+
+/** True when every selected table has a rolling-window / full-copy rule (no watermark needed). */
+const everyTableCustomPolled = () => {
+  const tables = splitList(form.tables)
+  if (!tables.length) return false
+  const rules = activeTablePoll()
+  return tables.every((t) => rules.some((r) => r.table.toLowerCase() === t.toLowerCase()))
+}
+
+/** Rolling-window rules missing their date column. */
+const incompleteRollingRules = () =>
+  activeTablePoll().filter((r) => r.strategy === "rolling_window" && !filled(r.window_column ?? ""))
 
 const buildSourceWatermarkFields = () => {
   const timestamp_column = textValue(form.timestampColumn) || null
@@ -429,7 +453,12 @@ const incrementalWatermarkFields = () => {
 
 const incrementalSourceReady = () => {
   if (!filled(form.tables)) return false
+  if (incompleteRollingRules().length) return false
   const { incrementing_column, upsert_key_columns } = incrementalWatermarkFields()
+  if (everyTableCustomPolled()) {
+    // No watermark poll: only the sink upsert key is needed for a replica.
+    return form.pattern !== "source_to_target" || upsert_key_columns.length > 0 || Boolean(incrementing_column)
+  }
   if (incrementing_column) return true
   if (filled(form.timestampColumn) && upsert_key_columns.length > 0) return true
   if (filled(form.timestampColumn) && form.pattern !== "source_to_target") return true
@@ -449,6 +478,13 @@ const schemaPickerHint = computed(() => {
 const incrementalSourceHint = computed(() => {
   if (!isIncrementalCapture() || incrementalSourceReady()) return ""
   if (!filled(form.tables)) return "Select at least one table for incremental capture."
+  const missingColumn = incompleteRollingRules()
+  if (missingColumn.length) {
+    return `Set the date column for the rolling window on ${missingColumn.map((r) => r.table).join(", ")}.`
+  }
+  if (everyTableCustomPolled()) {
+    return "Set Upsert key columns (e.g. BRANCH_NO, PRO_CODE) so the target can upsert the re-read rows."
+  }
   if (form.pattern === "source_to_target") {
     if (!filled(form.timestampColumn)) {
       return "For replica: set Timestamp column, then Upsert key columns (e.g. BRANCH_NO, PRO_CODE), or a single numeric Incrementing column."
@@ -483,6 +519,8 @@ const lastCountAt = ref<number | null>(null)
 const countDeltas = ref<Record<string, number>>({})
 const inspectTable = ref<{ side: "source" | "target"; schema: string; name: string } | null>(null)
 const structureDiff = ref<{ source_schema: string; source_table: string; target_schema: string; target_table: string } | null>(null)
+// Mapping step: generate/run CREATE TABLE scripts for target tables that do not exist yet.
+const ddlTables = ref<Array<{ source_schema: string; source_table: string; target_schema: string; target_table: string }> | null>(null)
 const pipelineSearch = ref("")
 const pipelineStatusFilter = ref("all")
 const mappingBulkSchema = ref("")
@@ -814,7 +852,10 @@ const loadSourceCatalog = async () => {
   catalogError.value = ""
   try {
     const profileId = selectedId.value || undefined
-    const result = await browseSourceCatalog({ ...buildPayload().source, profile_id: profileId })
+    // Browse every schema, not just the saved selection: when editing a pipeline the
+    // payload carries its selected schemas, which the API treats as a filter — the
+    // picker would then show only what is already chosen. Selection state lives in the form.
+    const result = await browseSourceCatalog({ ...buildPayload().source, schemas: [], profile_id: profileId })
     catalogSchemas.value = result.schemas || []
     catalogTables.value = result.tables || []
     countDeltas.value = {}
@@ -899,9 +940,11 @@ const refreshTableCounts = async (silent = false) => {
   if (!canBrowseSource.value || !sourceLiveCatalogSupported.value || catalogLoading.value || countRefreshing.value) return
   countRefreshing.value = true
   try {
-    const result = await browseSourceCatalog(buildPayload().source)
+    // Counts only for the selected schemas (cheap); keep the full schema list from loadSourceCatalog.
+    const result = await browseSourceCatalog({ ...buildPayload().source, profile_id: selectedId.value || undefined })
     applyCountUpdates(result.tables || [])
-    if (result.schemas?.length) catalogSchemas.value = result.schemas
+    const fresh = new Map((result.schemas || []).map((schema) => [schema.name, schema]))
+    catalogSchemas.value = catalogSchemas.value.map((schema) => ({ ...schema, ...(fresh.get(schema.name) ?? {}) }))
   } catch (e: any) {
     if (!silent) catalogError.value = formatApiError(e, "Failed to refresh record counts")
   } finally {
@@ -919,6 +962,7 @@ const resetCatalog = () => {
   countRefreshing.value = false
   inspectTable.value = null
   structureDiff.value = null
+  ddlTables.value = null
   triggerKeys.value = []
   triggerInstalling.value = ""
   triggerMessage.value = ""
@@ -1060,6 +1104,7 @@ const buildPayload = (): ProfilePayload => {
     timestamp_column: watermarks.timestamp_column,
     incrementing_column: watermarks.incrementing_column,
     upsert_key_columns: watermarks.upsert_key_columns,
+    table_poll: incrementalCapture ? activeTablePoll() : [],
   },
   target:
     form.pattern === "source_to_target"
@@ -1174,6 +1219,7 @@ const resetForm = () => {
     timestampColumn: "",
     incrementingColumn: "",
     upsertKeyColumns: "",
+  tablePoll: [] as TablePollRule[],
     targetName: "",
     targetType: "postgres",
     targetHost: "cdc-postgres-target",
@@ -1274,6 +1320,7 @@ const editSelected = () => {
     timestampColumn: profile.source.timestamp_column || "",
     incrementingColumn: profile.source.incrementing_column || "",
     upsertKeyColumns: upsertKeysForForm(profile),
+    tablePoll: [...(profile.source.table_poll ?? [])],
     targetName: profile.target?.name || "",
     targetType: (profile.target?.target_type as DatabaseType) || "postgres",
     targetHost: profile.target?.connection.host || "",
@@ -1497,6 +1544,23 @@ const execute = async (action: LifecycleAction) => {
 }
 
 const resyncOpen = ref(false)
+const initialLoadOpen = ref(false)
+
+// ── Split tables into a new pipeline ─────────────────────────────────────────
+const splitOpen = ref(false)
+
+/** Show the new (draft) pipeline after a split. */
+const openSplitResult = async (id: string) => {
+  splitOpen.value = false
+  await load()
+  selectPipeline(id)
+}
+
+/** Restart the original so it stops capturing the moved tables. */
+const restartAfterSplit = async () => {
+  splitOpen.value = false
+  await execute("restart")
+}
 const resyncClearTarget = ref(true)
 const resyncRowLimit = ref("")
 const resyncing = ref(false)
@@ -1743,6 +1807,24 @@ const targetTablesForSchema = (schema: string) =>
 
 const targetTableExists = (schema: string, table: string) =>
   targetTablesForSchema(schema).some((item) => item.name.toLowerCase() === table.trim().toLowerCase())
+
+const mappingTargetMissing = (mapping: TableMapping) =>
+  filled(mapping.target_table) &&
+  !targetTableExists(mapping.target_schema || mapping.source_schema, mapping.target_table)
+
+const missingTargetMappings = computed(() => form.mappings.filter(mappingTargetMissing))
+
+const ddlRef = (mapping: TableMapping) => ({
+  source_schema: mapping.source_schema,
+  source_table: mapping.source_table,
+  target_schema: mapping.target_schema || mapping.source_schema,
+  target_table: mapping.target_table || mapping.source_table,
+})
+
+const openCreateTables = (mappings: TableMapping[]) => {
+  if (!mappings.length || !buildPayload().target) return
+  ddlTables.value = mappings.map(ddlRef)
+}
 
 const mappingStatus = (mapping: TableMapping) => {
   if (!filled(mapping.target_table)) return { label: "Need name", tone: "badge-warning" }
@@ -2064,6 +2146,12 @@ const onDetailAction = (action: PipelineDetailAction) => {
     case "resync":
       resyncOpen.value = true
       return
+    case "initial-load":
+      initialLoadOpen.value = true
+      return
+    case "split":
+      splitOpen.value = true
+      return
     default:
       void execute(action)
   }
@@ -2291,6 +2379,11 @@ onUnmounted(() => {
                 />
                 <AppInput v-model="form.incrementingColumn" placeholder="id" />
               </label>
+              <TablePollEditor
+                v-model="form.tablePoll"
+                class="md:col-span-2"
+                :tables="splitList(form.tables)"
+              />
               <div class="md:col-span-2 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:items-end">
                 <label>
                   <AppFormLabel
@@ -2983,9 +3076,10 @@ onUnmounted(() => {
               <label class="min-w-[220px] flex-1">
                 <span class="auth-label">Target schema for all</span>
                 <div class="flex gap-2">
-                  <AppInput
+                  <AppCombobox
                     v-model="mappingBulkSchema"
-                    list="mapping-schema-options"
+                    class="flex-1"
+                    :options="mappingSchemaOptions"
                     placeholder="public"
                     aria-label="Target schema for all mapped tables"
                   />
@@ -3002,11 +3096,16 @@ onUnmounted(() => {
                   {{ targetCatalogLoading ? "Loading..." : "Refresh target tables" }}
                 </AppButton>
                 <AppButton @click="applySameNames">Use same names</AppButton>
+                <AppButton
+                  :disabled="!missingTargetMappings.length || targetCatalogLoading || !canLoadTargetCatalog"
+                  title="Generate CREATE TABLE scripts (primary key, unique constraints and indexes) in the target database's syntax"
+                  @click="openCreateTables(missingTargetMappings)"
+                >
+                  <Wand2 class="h-4 w-4" :stroke-width="1.75" />
+                  Create missing tables{{ missingTargetMappings.length ? ` (${missingTargetMappings.length})` : "" }}
+                </AppButton>
               </div>
             </div>
-            <datalist id="mapping-schema-options">
-              <option v-for="schema in mappingSchemaOptions" :key="`schema-opt-${schema}`" :value="schema" />
-            </datalist>
             <p v-if="targetCatalogError" class="text-sm text-red-700 dark:text-red-400">{{ targetCatalogError }}</p>
             <p v-else-if="targetCatalogLoading" class="text-sm text-muted-foreground">Loading target catalog…</p>
             <p class="text-xs text-muted-foreground">
@@ -3036,24 +3135,23 @@ onUnmounted(() => {
                       <p class="mt-0.5 font-mono text-xs text-muted-foreground">{{ mapping.source_schema }}</p>
                     </td>
                     <td>
-                      <AppInput
+                      <AppCombobox
                         v-model="mapping.target_schema"
-                        list="mapping-schema-options"
+                        :options="mappingSchemaOptions"
                         :placeholder="mapping.source_schema"
                         :aria-label="`Target schema for ${mapping.source_table}`"
                         @update:model-value="refreshMappingMode"
                       />
                     </td>
                     <td>
-                      <AppInput
+                      <AppCombobox
                         v-model="mapping.target_table"
-                        :list="`target-tables-${mapping.source_schema}-${mapping.source_table}`"
+                        :options="targetTablesForSchema(mapping.target_schema || mapping.source_schema).map((table) => table.name)"
                         :placeholder="mapping.source_table"
+                        :aria-label="`Target table for ${mapping.source_table}`"
+                        empty-text="No tables in this target schema yet — type a new name"
                         @update:model-value="refreshMappingMode"
                       />
-                      <datalist :id="`target-tables-${mapping.source_schema}-${mapping.source_table}`">
-                        <option v-for="table in targetTablesForSchema(mapping.target_schema)" :key="table.name" :value="table.name" />
-                      </datalist>
                     </td>
                     <td>
                       <span :class="mappingStatus(mapping).tone">{{ mappingStatus(mapping).label }}</span>
@@ -3092,6 +3190,15 @@ onUnmounted(() => {
                           @click="openStructureDiff(mapping)"
                         >
                           Compare
+                        </button>
+                        <button
+                          v-if="mappingTargetMissing(mapping) && canLoadTargetCatalog"
+                          type="button"
+                          class="btn-secondary !h-8 !min-h-8 !px-3 !text-xs"
+                          title="Script to create this table on the target with the source's primary key, unique constraints and indexes"
+                          @click="openCreateTables([mapping])"
+                        >
+                          Create table
                         </button>
                       </div>
                     </td>
@@ -3284,10 +3391,15 @@ onUnmounted(() => {
               @click="selectPipeline(profile.id)"
             >
               <td>
-                <p class="font-medium">{{ profile.name }}</p>
-                <p v-if="profile.description" class="mt-0.5 truncate text-xs text-muted-foreground">
-                  {{ profile.description }}
-                </p>
+                <div class="flex items-center gap-1.5">
+                  <p class="font-medium">{{ profile.name }}</p>
+                  <!-- Description sits behind an icon so long notes don't widen the table. -->
+                  <AppInfoHint
+                    v-if="profile.description"
+                    :text="profile.description"
+                    :aria-label="`About ${profile.name}`"
+                  />
+                </div>
               </td>
               <td>
                 <div class="flex items-center gap-1.5">
@@ -3450,6 +3562,22 @@ onUnmounted(() => {
       </label>
     </AppConfirmDialog>
 
+    <SplitPipelineDialog
+      :open="splitOpen"
+      :profile="selected"
+      @update:open="(open) => (splitOpen = open)"
+      @done="load()"
+      @open-created="openSplitResult"
+      @restart-original="restartAfterSplit"
+    />
+
+    <InitialLoadDialog
+      :open="initialLoadOpen"
+      :profile="selected"
+      @update:open="(open) => (initialLoadOpen = open)"
+      @finished="load()"
+    />
+
     <AppConfirmDialog
       :open="Boolean(pendingDelete)"
       title="Delete this pipeline?"
@@ -3493,6 +3621,16 @@ onUnmounted(() => {
       :target-table="structureDiff.target_table"
       :profile-id="selectedId || undefined"
       @update:open="(open) => { if (!open) structureDiff = null }"
+    />
+    <TargetTableDdlDialog
+      v-if="ddlTables && buildPayload().target"
+      :open="Boolean(ddlTables)"
+      :source="buildPayload().source"
+      :target="buildPayload().target!"
+      :tables="ddlTables"
+      :profile-id="selectedId || undefined"
+      @created="loadTargetCatalog"
+      @update:open="(open) => { if (!open) ddlTables = null }"
     />
   </div>
 </template>

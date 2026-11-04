@@ -1,15 +1,57 @@
+# Single pipeline: rust + webui → sonar → multi-arch image push → Discord.
 when:
-  event: [push, manual]
-
-depends_on:
-  - test
-  - webui
-  - build
-  - sonar
+  - event: [push, manual]
+    branch:
+      exclude: [main]
+  - event: tag
+    tag: v*
 
 steps:
+  test-orchestrator:
+    image: rust:1.97-bookworm
+    commands:
+      # rdkafka builds librdkafka from source (cmake-build feature).
+      - apt-get update && apt-get install -y --no-install-recommends cmake zlib1g-dev
+      - cargo fmt --all -- --check
+      - cargo test --locked --all-targets
+      - cargo clippy --all-targets -- -D warnings
+
+  test-mcp:
+    image: rust:1.97-bookworm
+    depends_on: [test-orchestrator]
+    commands:
+      # mcp/ is a standalone crate, not a workspace member, so the root
+      # cargo invocations above do not cover it.
+      - cd mcp
+      - cargo fmt --all -- --check
+      - cargo test --locked --all-targets
+      - cargo clippy --all-targets -- -D warnings
+
+  webui:
+    image: node:22-bookworm
+    commands:
+      - cd cdc-native-ui
+      - npm ci
+      - npm run openapi:check
+      - npm run typecheck
+      - npm run build
+
+  sonar:
+    image: sonarsource/sonar-scanner-cli:11
+    depends_on: [test-orchestrator, test-mcp]
+    environment:
+      SONAR_HOST_URL: https://sonarqube.b-quik-connect.com
+      SONAR_TOKEN:
+        from_secret: SONAR_TOKEN
+    commands:
+      - |
+        set -e
+        echo "SonarQube at $${SONAR_HOST_URL}"
+        sonar-scanner -Dsonar.qualitygate.wait=true
+
   build-and-push:
     image: docker:27-cli
+    depends_on: [sonar, webui]
     environment:
       DOCKERHUB_USERNAME:
         from_secret: DOCKERHUB_USERNAME
@@ -20,15 +62,24 @@ steps:
     commands:
       - |
         set -e
+        mkdir -p .ci-status
+        chmod a+rwx .ci-status || true
+        echo running > .ci-status/build
+        echo running > .ci-status/publish
 
         SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
-        BRANCH="$${CI_COMMIT_BRANCH:-$${CI_COMMIT_TAG:-$${CI_REPO_DEFAULT_BRANCH:-unknown}}}"
-        BRANCH_SAFE="$$(echo "$${BRANCH}" | tr '/' '-')"
-        VERSION="$${BRANCH_SAFE}-$${SHORT_SHA}"
+        BRANCH="$${CI_COMMIT_BRANCH:-}"
+        BRANCH_SLUG="$$(echo "$${BRANCH}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9_.-]#-#g' | sed 's#-\\{2,\\}#-#g' | sed 's#^-##; s#-$##')"
+        if [ -n "$${CI_COMMIT_TAG:-}" ]; then
+          VERSION="$${CI_COMMIT_TAG}"
+        elif [ "$${BRANCH}" = "main" ] || [ -z "$${BRANCH_SLUG}" ]; then
+          VERSION="sha-$${SHORT_SHA}"
+        else
+          VERSION="$${BRANCH_SLUG}-$${SHORT_SHA}"
+        fi
 
         echo "Commit: $${CI_COMMIT_SHA}"
         echo "Short: $${SHORT_SHA}"
-        echo "Branch: $${BRANCH_SAFE}"
         echo "VERSION=$${VERSION}"
 
         echo "$${DOCKERHUB_TOKEN}" | docker login -u "$${DOCKERHUB_USERNAME}" --password-stdin
@@ -58,8 +109,11 @@ steps:
             -t "$${IMAGE_NAME}:latest" \
             -t "$${IMAGE_NAME}:$${VERSION}" \
             --push \
-            "$${CONTEXT}"v 
+            "$${CONTEXT}"
         done
+
+        echo success > .ci-status/build
+        echo success > .ci-status/publish
 
   notify-discord:
     image: curlimages/curl:8.7.1
@@ -75,9 +129,16 @@ steps:
       - |
         set -e
         SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
-        BRANCH="$${CI_COMMIT_BRANCH:-$${CI_COMMIT_TAG:-$${CI_REPO_DEFAULT_BRANCH:-unknown}}}"
-        BRANCH_SAFE="$$(echo "$${BRANCH}" | tr '/' '-')"
-        VERSION="$${BRANCH_SAFE}-$${SHORT_SHA}"
+        BRANCH="$${CI_COMMIT_BRANCH:-}"
+        BRANCH_SLUG="$$(echo "$${BRANCH}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9_.-]#-#g' | sed 's#-\\{2,\\}#-#g' | sed 's#^-##; s#-$##')"
+        if [ -n "$${CI_COMMIT_TAG:-}" ]; then
+          VERSION="$${CI_COMMIT_TAG}"
+        elif [ "$${BRANCH}" = "main" ] || [ -z "$${BRANCH_SLUG}" ]; then
+          VERSION="sha-$${SHORT_SHA}"
+        else
+          VERSION="$${BRANCH_SLUG}-$${SHORT_SHA}"
+        fi
+        REF="$${CI_COMMIT_TAG:-$${BRANCH_SLUG:-unknown}}"
         BUILD_NO="$${CI_PIPELINE_NUMBER:-n/a}"
         RUN_URL="$${CI_PIPELINE_URL:-$${CI_BUILD_LINK}}"
         COMMIT_URL="$${CI_COMMIT_LINK:-$${CI_REPO_LINK}/commit/$${CI_COMMIT_SHA}}"
@@ -94,7 +155,7 @@ steps:
               "color": 5763719,
               "fields": [
                 { "name": "Project", "value": "$${CI_REPO_NAME}", "inline": true },
-                { "name": "Branch", "value": "$${BRANCH_SAFE}", "inline": true },
+                { "name": "Branch", "value": "$${REF}", "inline": true },
                 { "name": "Triggered by", "value": "$${CI_COMMIT_AUTHOR}", "inline": true },
                 { "name": "Images", "value": "\`$${NS}/hyper-cdc-orchestrator\`\n\`$${NS}/hyper-cdc-connect\`\n\`$${NS}/hyper-cdc-webui\`\n\`$${NS}/hyper-cdc-mcp\`", "inline": false },
                 { "name": "Tags", "value": "\`latest\`, \`$${VERSION}\`", "inline": true },

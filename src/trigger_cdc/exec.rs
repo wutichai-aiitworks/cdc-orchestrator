@@ -548,6 +548,7 @@ async fn oracle_preview_columns(
                 timestamp_column: None,
                 incrementing_column: None,
                 upsert_key_columns: vec![],
+                table_poll: vec![],
             },
             schema: table.source_schema.clone(),
             name: table.source_table.clone(),

@@ -16,6 +16,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
 
 public final class Main {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -34,7 +35,10 @@ public final class Main {
         server.createContext("/v1/count", exchange -> handle(exchange, token, Main::count));
         server.createContext("/v1/query", exchange -> handle(exchange, token, Main::query));
         server.createContext("/v1/ddl", exchange -> handle(exchange, token, Main::ddl));
-        server.setExecutor(null);
+        server.createContext("/v1/stream", exchange -> stream(exchange, token));
+        // A streaming copy can hold its request for many minutes; the default executor runs
+        // every request on one thread and would block catalog/preview/count meanwhile.
+        server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         System.out.println("cdc-jdbc-admin listening on " + host + ":" + port);
     }
@@ -70,13 +74,28 @@ public final class Main {
             row.put("primary_key", col.primaryKey());
             row.put("pk_position", col.pkPosition());
             row.put("unique", col.unique());
+            row.put("size", col.size());
+            row.put("scale", col.scale());
+            row.put("default_value", col.defaultValue());
+            row.put("auto_increment", col.autoIncrement());
             columns.add(row);
+        }
+        List<Map<String, Object>> indexes = new ArrayList<>();
+        for (JdbcOps.IndexInfo ix : result.indexes()) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("name", ix.name());
+            row.put("unique", ix.unique());
+            row.put("columns", ix.columns());
+            row.put("descending", ix.descending());
+            row.put("filter", ix.filter());
+            indexes.add(row);
         }
         return Map.of(
                 "schema", result.schema(),
                 "name", result.name(),
                 "primary_key", result.primaryKey(),
-                "columns", columns
+                "columns", columns,
+                "indexes", indexes
         );
     }
 
@@ -118,6 +137,67 @@ public final class Main {
         require(req.statement, "statement");
         long updateCount = JdbcOps.ddl(req.dbType, req.connection, req.statement, req.schema);
         return Map.of("ok", true, "update_count", updateCount);
+    }
+
+    /**
+     * {@code POST /v1/stream}: one {@code SELECT *} over {@code schema.table}, streamed as
+     * NDJSON. Line 1 is {@code {"columns":[...]}}, then one JSON array per row, then a
+     * trailer: {@code {"done":true,"rows":N}} on success or {@code {"error":"..."}} if the
+     * read fails mid-stream. A stream without a trailer was cut off and must be treated as
+     * failed. Optional {@code max_rows} caps the read; {@code fetch_size} sets the cursor
+     * batch (default 1000). Errors before the first row return a normal JSON error status.
+     */
+    private static void stream(HttpExchange exchange, String token) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            write(exchange, 405, Map.of("error", "POST required"));
+            return;
+        }
+        if (!authorized(exchange, token)) {
+            write(exchange, 401, Map.of("error", "unauthorized"));
+            return;
+        }
+        AdminRequest req;
+        JdbcOps.RowStream rows;
+        try {
+            req = readRequest(exchange.getRequestBody());
+            require(req.schema, "schema");
+            require(req.table, "table");
+            rows = JdbcOps.openStream(
+                    req.dbType, req.connection, req.schema, req.table, req.maxRows, req.fetchSize
+            );
+        } catch (IllegalArgumentException e) {
+            write(exchange, 400, Map.of("error", e.getMessage()));
+            return;
+        } catch (Exception e) {
+            write(exchange, 502, Map.of("error", e.getMessage() == null ? e.toString() : e.getMessage()));
+            return;
+        }
+        try (rows) {
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, 0);
+            try (OutputStream out = new java.io.BufferedOutputStream(exchange.getResponseBody(), 1 << 16)) {
+                writeLine(out, Map.of("columns", rows.columns()));
+                long count = 0;
+                try {
+                    List<Object> row;
+                    while ((row = rows.next()) != null) {
+                        writeLine(out, row);
+                        count++;
+                        if (count % 1000 == 0) {
+                            out.flush();
+                        }
+                    }
+                    writeLine(out, Map.of("done", true, "rows", count));
+                } catch (Exception e) {
+                    writeLine(out, Map.of("error", e.getMessage() == null ? e.toString() : e.getMessage()));
+                }
+            }
+        }
+    }
+
+    private static void writeLine(OutputStream out, Object value) throws IOException {
+        out.write(JSON.writeValueAsBytes(value));
+        out.write('\n');
     }
 
     private static void handle(HttpExchange exchange, String token, Handler handler) throws IOException {
@@ -190,7 +270,9 @@ public final class Main {
                 text(root, "search"),
                 filter,
                 root.path("page").asLong(0),
-                root.path("page_size").asLong(50)
+                root.path("page_size").asLong(50),
+                root.path("max_rows").asLong(0),
+                root.path("fetch_size").asInt(JdbcOps.STREAM_FETCH_SIZE)
         );
     }
 
@@ -242,7 +324,9 @@ public final class Main {
             String search,
             List<String> schemaFilter,
             long page,
-            long pageSize
+            long pageSize,
+            long maxRows,
+            int fetchSize
     ) {}
 
     @FunctionalInterface

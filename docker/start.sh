@@ -24,7 +24,7 @@ cd "$DIR"
 
 # Compose runs from docker/ so it picks up docker/.env automatically.
 compose() {
-  (cd "$DOCKER_DIR" && docker compose -f docker-compose.yaml "$@")
+  (cd "$DOCKER_DIR" && source ./compose.inc.sh && docker compose "${COMPOSE_FILES[@]}" "$@")
 }
 
 load_env_file() {

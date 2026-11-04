@@ -83,7 +83,8 @@ pub fn parse_qualified_tables(profile: &CdcProfile) -> Result<Vec<CapturedTable>
             ),
             _ => (schema.clone(), table.clone()),
         };
-        let (target_schema, target_table) = fold_oracle_postgres_target(profile, &target_schema, &target_table);
+        let (target_schema, target_table) =
+            fold_oracle_postgres_target(profile, &target_schema, &target_table);
         quote_ident(&schema)?;
         quote_ident(&table)?;
         quote_ident(&target_schema)?;
@@ -123,7 +124,8 @@ fn split_qualified(qualified: &str) -> Result<(String, String), AppError> {
 }
 
 /// Oracle sources use uppercase schema/table names; Postgres replicas use lowercase identifiers.
-fn fold_oracle_postgres_target(
+/// Oracle → Postgres targets use folded-lowercase identifiers (copy, sink and status agree).
+pub(crate) fn fold_oracle_postgres_target(
     profile: &CdcProfile,
     target_schema: &str,
     target_table: &str,
@@ -133,10 +135,12 @@ fn fold_oracle_postgres_target(
         .source_type
         .trim()
         .eq_ignore_ascii_case("oracle")
-        && profile
-            .target
-            .as_ref()
-            .is_some_and(|t| matches!(t.target_type.trim().to_ascii_lowercase().as_str(), "postgres" | "postgresql"));
+        && profile.target.as_ref().is_some_and(|t| {
+            matches!(
+                t.target_type.trim().to_ascii_lowercase().as_str(),
+                "postgres" | "postgresql"
+            )
+        });
     if oracle_to_postgres {
         (
             target_schema.to_ascii_lowercase(),
@@ -545,7 +549,8 @@ pub async fn install_target_apply(profile: &CdcProfile) -> Result<(), AppError> 
         .await
         .map_err(|e| {
             AppError::BadRequest(format!(
-                "failed to install target apply (hyper_cdc.inbox + apply_inbox trigger): {e}"
+                "failed to install target apply (hyper_cdc.inbox + apply_inbox trigger): {}",
+                crate::connector_catalog::postgres_ddl_detail(&e)
             ))
         })?;
     Ok(())
@@ -640,7 +645,12 @@ pub async fn prune_changelog_postgres(
     let deleted = client
         .execute(stmt.as_str(), &[&(older_than_hours as i32)])
         .await
-        .map_err(|e| AppError::BadRequest(format!("failed to prune changelog: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "failed to prune changelog: {}",
+                crate::connector_catalog::postgres_ddl_detail(&e)
+            ))
+        })?;
     Ok(deleted)
 }
 
@@ -684,7 +694,12 @@ pub async fn list_capture_triggers(
             &[&TRIGGER_NAME],
         )
         .await
-        .map_err(|e| AppError::BadRequest(format!("failed to list capture triggers: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "failed to list capture triggers: {}",
+                crate::connector_catalog::postgres_ddl_detail(&e)
+            ))
+        })?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -707,7 +722,12 @@ pub async fn change_log_present(client: &tokio_postgres::Client) -> Result<bool,
             &[&CAPTURE_SCHEMA, &CHANGE_LOG],
         )
         .await
-        .map_err(|e| AppError::BadRequest(format!("failed to check change_log: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "failed to check change_log: {}",
+                crate::connector_catalog::postgres_ddl_detail(&e)
+            ))
+        })?;
     Ok(row.try_get::<_, bool>(0).unwrap_or(false))
 }
 
@@ -729,7 +749,8 @@ pub async fn install_source_triggers(
         .await
         .map_err(|e| {
             AppError::BadRequest(format!(
-                "failed to create changelog triggers (need CREATE TRIGGER on each table): {e}"
+                "failed to create changelog triggers (need CREATE TRIGGER on each table): {}",
+                crate::connector_catalog::postgres_ddl_detail(&e)
             ))
         })?;
     let mut installed = Vec::new();
@@ -806,7 +827,7 @@ fn push_installed_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::models::{
         DeliveryMode, FlowConfig, ProfilePattern, ProfileStatus, ScheduleConfig,
@@ -815,7 +836,7 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    fn profile() -> CdcProfile {
+    pub(crate) fn profile() -> CdcProfile {
         CdcProfile {
             autostart: true,
             id: Uuid::new_v4(),
@@ -842,6 +863,7 @@ mod tests {
                 timestamp_column: None,
                 incrementing_column: None,
                 upsert_key_columns: vec![],
+                table_poll: vec![],
             },
             target: Some(TargetConfig {
                 name: "replica".into(),

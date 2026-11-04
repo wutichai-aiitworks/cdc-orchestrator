@@ -13,7 +13,7 @@ use crate::connector_meta::{ConnectorConnectionView, ConnectorInsight, Connector
 use crate::error::AppError;
 use crate::models::{
     SchemaCountsResponse, SourceTableColumn, SourceTableInspectRequest, SourceTableInspectResponse,
-    TableCountResponse, TablePreviewResponse,
+    TableCountResponse, TableIndex, TablePreviewResponse,
 };
 
 const SYSTEM_SCHEMAS: &[&str] = &[
@@ -55,6 +55,11 @@ pub async fn load_live_catalog(insight: &ConnectorInsight) -> Result<LiveCatalog
 
 fn jdbc_admin() -> Option<JdbcAdminClient> {
     JdbcAdminClient::from_env()
+}
+
+/// True when `ORCH_JDBC_ADMIN_URL` points at a cdc-jdbc-admin instance.
+pub(crate) fn jdbc_admin_configured() -> bool {
+    jdbc_admin().is_some()
 }
 
 fn require_jdbc_admin(db_type: &str) -> Result<JdbcAdminClient, AppError> {
@@ -297,11 +302,13 @@ async fn exec_ddl_native(
     }
 }
 
-fn postgres_ddl_detail(err: &tokio_postgres::Error) -> String {
+/// Readable text for a PostgreSQL error. `tokio_postgres::Error`'s `Display` is just
+/// "db error"; the server's message, SQLSTATE, detail and hint live in `as_db_error()`.
+pub(crate) fn postgres_ddl_detail(err: &tokio_postgres::Error) -> String {
     let Some(db) = err.as_db_error() else {
         return err.to_string();
     };
-    let mut msg = db.message().to_string();
+    let mut msg = format!("{} [SQLSTATE {}]", db.message(), db.code().code());
     if let Some(d) = db.detail() {
         msg.push_str(&format!(" — {d}"));
     }
@@ -457,7 +464,7 @@ pub(crate) fn postgres_json_row(columns: &[String], row: &[Value]) -> Value {
     Value::Object(obj)
 }
 
-/// Copy rows from a JDBC-only source to PostgreSQL via cdc-jdbc-admin preview pages.
+/// Copy rows from a JDBC-only source to PostgreSQL via one cdc-jdbc-admin stream.
 #[allow(clippy::too_many_arguments)]
 async fn copy_via_jdbc_admin_to_postgres(
     src_type: &str,
@@ -471,6 +478,63 @@ async fn copy_via_jdbc_admin_to_postgres(
     truncate_before_copy: bool,
     max_rows: Option<u64>,
 ) -> Result<i64, AppError> {
+    stream_jdbc_admin_to_postgres(
+        src_type,
+        src_conn,
+        tgt_conn,
+        src_schema,
+        src_table,
+        tgt_schema,
+        tgt_table,
+        &StreamCopyOptions {
+            truncate_before_copy,
+            max_rows,
+            batch_rows: batch_size,
+            skip_existing: false,
+            progress: None,
+            cancel: None,
+        },
+    )
+    .await
+}
+
+/// How [`stream_jdbc_admin_to_postgres`] writes into the target.
+#[derive(Default, Clone)]
+pub(crate) struct StreamCopyOptions {
+    /// `TRUNCATE` the target table before the first row.
+    pub truncate_before_copy: bool,
+    /// Stop after this many rows (pushed down to the source as a row cap).
+    pub max_rows: Option<u64>,
+    /// Rows per target `INSERT` (clamped to 1..=5000).
+    pub batch_rows: usize,
+    /// `ON CONFLICT DO NOTHING`: keep rows already in the target. Lets an initial load
+    /// run (or re-run) beside a live pipeline without overwriting fresher upserts.
+    pub skip_existing: bool,
+    /// Rows written so far, for progress reporting.
+    pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    /// Checked between batches; when set the copy stops with an error.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Copy a JDBC source table into PostgreSQL through a single cdc-jdbc-admin stream.
+///
+/// The source runs exactly one forward-only `SELECT *` (optionally row-capped); rows are
+/// inserted in batches as they arrive, so memory stays flat and the read is linear.
+/// The previous implementation paged through `preview`, which re-read every earlier row
+/// for each page — quadratic and unsafe against large production tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_jdbc_admin_to_postgres(
+    src_type: &str,
+    src_conn: &HashMap<String, String>,
+    tgt_conn: &HashMap<String, String>,
+    src_schema: &str,
+    src_table: &str,
+    tgt_schema: &str,
+    tgt_table: &str,
+    opts: &StreamCopyOptions,
+) -> Result<i64, AppError> {
+    use std::sync::atomic::Ordering;
+
     let admin = require_jdbc_admin(src_type)?;
     let tgt_qualified = quote_qualified(tgt_schema, tgt_table)?;
 
@@ -479,7 +543,16 @@ async fn copy_via_jdbc_admin_to_postgres(
         .await
         .map_err(|e| AppError::BadRequest(format!("target connection failed: {e}")))?;
 
-    if truncate_before_copy {
+    if opts.max_rows == Some(0) {
+        return Ok(0);
+    }
+    let mut stream = admin
+        .open_stream(src_type, src_conn, src_schema, src_table, opts.max_rows)
+        .await?;
+    let columns = stream.columns().to_vec();
+
+    // Truncate only once the source read is open, so a bad source never empties the target.
+    if opts.truncate_before_copy {
         tgt_client
             .execute(&format!("TRUNCATE TABLE {tgt_qualified}"), &[])
             .await
@@ -491,47 +564,36 @@ async fn copy_via_jdbc_admin_to_postgres(
             })?;
     }
 
+    let conflict = if opts.skip_existing {
+        " ON CONFLICT DO NOTHING"
+    } else {
+        ""
+    };
     let insert_sql = format!(
         "INSERT INTO {tgt_qualified} \
          SELECT (json_populate_record(NULL::{tgt_qualified}, value)).* \
-         FROM json_array_elements($1::text::json)"
+         FROM json_array_elements($1::text::json){conflict}"
     );
-
-    let effective_batch = batch_size.clamp(1, 5000) as u64;
-    let mut page: u64 = 0;
+    let batch_rows = opts.batch_rows.clamp(1, 5000);
     let mut copied: i64 = 0;
 
     loop {
-        let remaining = max_rows.map(|max| max.saturating_sub(copied as u64));
-        if remaining == Some(0) {
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            return Err(AppError::BadRequest(format!(
+                "copy of {src_schema}.{src_table} cancelled after {copied} row(s)"
+            )));
+        }
+        let rows = stream.next_batch(batch_rows).await?;
+        if rows.is_empty() {
             break;
         }
-        let page_size = remaining
-            .map(|n| n.min(effective_batch).max(1))
-            .unwrap_or(effective_batch);
-        let preview = admin
-            .preview(
-                src_type,
-                src_conn,
-                src_schema,
-                src_table,
-                page,
-                page_size,
-                None,
-            )
-            .await?;
-        if preview.rows.is_empty() {
-            break;
-        }
-        let row_slice = if let Some(max) = max_rows {
-            let take = (max - copied as u64).min(preview.rows.len() as u64) as usize;
-            &preview.rows[..take]
-        } else {
-            preview.rows.as_slice()
-        };
-        let objects: Vec<Value> = row_slice
+        let objects: Vec<Value> = rows
             .iter()
-            .map(|row| postgres_json_row(&preview.columns, row))
+            .map(|row| postgres_json_row(&columns, row))
             .collect();
         let batch_len = objects.len();
         let json_array_str = Value::Array(objects).to_string();
@@ -539,16 +601,15 @@ async fn copy_via_jdbc_admin_to_postgres(
             .execute(insert_sql.as_str(), &[&json_array_str])
             .await
             .map_err(|e| {
-                AppError::BadRequest(format!("INSERT into {tgt_qualified} failed: {e}"))
+                AppError::BadRequest(format!(
+                    "INSERT into {tgt_qualified} failed after {copied} row(s): {}",
+                    postgres_ddl_detail(&e)
+                ))
             })?;
         copied += batch_len as i64;
-        if max_rows.is_some_and(|max| copied as u64 >= max) {
-            break;
+        if let Some(progress) = &opts.progress {
+            progress.store(copied, Ordering::Relaxed);
         }
-        if !preview.has_more {
-            break;
-        }
-        page += 1;
     }
 
     Ok(copied)
@@ -614,7 +675,9 @@ async fn copy_postgres_to_postgres(
             ))
         })?
         .get(0);
-    let copy_limit = max_rows.map(|max| max.min(row_count as u64)).unwrap_or(row_count as u64);
+    let copy_limit = max_rows
+        .map(|max| max.min(row_count as u64))
+        .unwrap_or(row_count as u64);
 
     if truncate_before_copy {
         tgt_client
@@ -1026,7 +1089,7 @@ async fn load_postgres_catalog(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut schemas: Vec<String> = schema_rows
+    let schemas: Vec<String> = schema_rows
         .into_iter()
         .filter_map(|row| row.try_get::<_, String>(0).ok())
         .filter(|name| !is_system_schema(name))
@@ -1135,10 +1198,15 @@ async fn inspect_postgres_table(
                     ), 0), \
                     EXISTS ( \
                       SELECT 1 FROM pg_index i \
-                      WHERE i.indrelid = a.attrelid AND i.indisunique AND a.attnum = ANY(i.indkey) \
-                    ) \
+                      WHERE i.indrelid = a.attrelid AND i.indisunique AND i.indpred IS NULL \
+                        AND i.indnkeyatts = 1 AND i.indkey[0] = a.attnum \
+                    ), \
+                    pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
+                    (a.attidentity <> '' \
+                      OR COALESCE(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%') \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 \
                AND c.relname = $2 \
@@ -1165,6 +1233,8 @@ async fn inspect_postgres_table(
         let position: i16 = row.try_get(3).unwrap_or(0);
         let pk_position: i32 = row.try_get(4).unwrap_or(0);
         let unique: bool = row.try_get(5).unwrap_or(false);
+        let default_value: Option<String> = row.try_get(6).ok().flatten();
+        let auto_increment: bool = row.try_get(7).unwrap_or(false);
         if pk_position > 0 {
             primary_key.push((pk_position, name.clone()));
         }
@@ -1180,9 +1250,14 @@ async fn inspect_postgres_table(
                 None
             },
             unique,
+            size: None,
+            scale: None,
+            default_value,
+            auto_increment,
         });
     }
     primary_key.sort_by_key(|(position, _)| *position);
+    let indexes = load_postgres_indexes(&client, schema, table).await;
     let primary_key: Vec<String> = primary_key.into_iter().map(|(_, name)| name).collect();
 
     let mut row_count = None;
@@ -1214,10 +1289,64 @@ async fn inspect_postgres_table(
         row_count,
         primary_key,
         columns,
+        indexes,
         rows,
         limit,
         timestamp: chrono::Utc::now(),
     })
+}
+
+/// Indexes and unique constraints for one table (key columns only, INCLUDE columns skipped).
+/// Best effort: `None` when the catalog query fails.
+async fn load_postgres_indexes(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    table: &str,
+) -> Option<Vec<TableIndex>> {
+    let rows = client
+        .query(
+            "SELECT ic.relname::text, \
+                    i.indisunique, \
+                    pg_catalog.pg_get_expr(i.indpred, i.indrelid), \
+                    EXISTS (SELECT 1 FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
+                            WHERE k.ord <= i.indnkeyatts AND k.attnum = 0), \
+                    ARRAY( \
+                      SELECT a.attname::text \
+                      FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                      WHERE k.ord <= i.indnkeyatts \
+                      ORDER BY k.ord \
+                    ), \
+                    ARRAY( \
+                      SELECT a.attname::text \
+                      FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                      WHERE k.ord <= i.indnkeyatts \
+                        AND (i.indoption::int2[])[k.ord - 1] & 1 = 1 \
+                      ORDER BY k.ord \
+                    ) \
+             FROM pg_index i \
+             JOIN pg_class ic ON ic.oid = i.indexrelid \
+             JOIN pg_class c ON c.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+             ORDER BY ic.relname",
+            &[&schema, &table],
+        )
+        .await
+        .ok()?;
+    Some(
+        rows.into_iter()
+            .map(|row| TableIndex {
+                name: row.try_get(0).unwrap_or_default(),
+                unique: row.try_get(1).unwrap_or(false),
+                filter: row.try_get(2).ok().flatten(),
+                expression: row.try_get(3).unwrap_or(false),
+                columns: row.try_get(4).unwrap_or_default(),
+                descending: row.try_get(5).unwrap_or_default(),
+            })
+            .collect(),
+    )
 }
 
 async fn fill_primary_keys(client: &tokio_postgres::Client, tables: &mut [LiveTable]) {

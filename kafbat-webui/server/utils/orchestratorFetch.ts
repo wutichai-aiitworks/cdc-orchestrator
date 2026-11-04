@@ -41,14 +41,24 @@ export const orchestratorFetch = async <T>(
               ? "The orchestrator is unavailable or returned an internal error."
               : "The orchestrator rejected the request.")
 
+    // The orchestrator answers 502/504 when *its* dependency (Kafka Connect, a database)
+    // failed. Forwarded as-is, front-door gateways (Cloudflare, HAProxy error pages)
+    // replace the body of a 502/504 and the browser sees only "502". When the
+    // orchestrator did answer with a reason, surface it as 424 Failed Dependency so the
+    // message survives; an unreachable orchestrator (no response) stays a 502.
+    const answered = Boolean(error?.response) && Boolean(detail)
+    const clientStatus = answered && (status === 502 || status === 504) ? 424 : status
+
     throw createError({
-      statusCode: status,
+      statusCode: clientStatus,
       statusMessage: message,
       message,
       data: {
         upstream_status: status,
         upstream_path: path,
         audit_id: error?.data?.audit_id,
+        // Where the failure is + how to fix it (orchestrator ≥ diagnose module).
+        diagnosis: error?.data?.diagnosis,
       },
     })
   }

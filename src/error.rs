@@ -28,6 +28,9 @@ impl fmt::Display for AppError {
 #[derive(Serialize)]
 struct ErrorPayload {
     error: String,
+    /// Where the failure is and how to fix it, when the message is recognised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<crate::diagnose::Diagnosis>,
 }
 
 impl AppError {
@@ -61,6 +64,14 @@ impl IntoResponse for AppError {
             Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
 
-        (status, Json(ErrorPayload { error: message })).into_response()
+        let diagnosis = crate::diagnose::diagnose(&message, crate::diagnose::Side::Unknown);
+        (
+            status,
+            Json(ErrorPayload {
+                error: message,
+                diagnosis,
+            }),
+        )
+            .into_response()
     }
 }

@@ -83,7 +83,7 @@ function normalizeOracle(u: string): CanonicalType {
 function normalizePostgres(u: string): CanonicalType {
   if (/^(?:CHARACTER VARYING|VARCHAR)(\s*\(|$)/.test(u))
                                              return { kind: "varchar",   length: arg1(u) }
-  if (/^(?:CHARACTER|CHAR)(\s*\(|$)/.test(u))
+  if (/^(?:CHARACTER|CHAR|BPCHAR)(\s*\(|$)/.test(u))
                                              return { kind: "char",      length: arg1(u) }
   if (/^TEXT$/.test(u))                     return { kind: "text" }
   if (/^SMALLINT$|^INT2$/.test(u))          return { kind: "int", bits: 2 }

@@ -1,432 +1,252 @@
 <script setup lang="ts">
-import { Copy, Play, RefreshCw, Save, Square, Trash2 } from "@lucide/vue"
-import {
-  defaultPgCopyOptions,
-  type PgCopyConn,
-  type PgCopyJob,
-  type PgCopyProfile,
-  usePgCopy,
-} from "~/composables/usePgCopy"
+import { transferTester } from "~/composables/useTransferTest"
+// Postgres copy (pgcopydb clone) on the shared Copy & Sync workspace.
+import { ChevronRight, Copy } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
-import { formatApiError } from "~/utils/apiError"
+import { defaultPgCopyOptions, type PgCopyConn, type PgCopyJob, type PgCopyProfile, usePgCopy } from "~/composables/usePgCopy"
+import * as rules from "~/utils/transferTools/pgcopy"
+import type { TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
 
-const toast = useToast()
-const {
-  fetchContract,
-  fetchCapability,
-  fetchProfiles,
-  createProfile,
-  updateProfile,
-  deleteProfile,
-  runProfile,
-  fetchJobs,
-  fetchJobLogs,
-  stopJob,
-  validateConnection,
-} = usePgCopy()
+const api = usePgCopy()
+const contract = ref<Record<string, unknown> | null>(null)
+onMounted(() => api.fetchContract().then((c) => (contract.value = c)).catch(() => {}))
 
-const BOOL_OPTIONS: Array<{ key: keyof ReturnType<typeof defaultPgCopyOptions>; label: string }> = [
-  { key: "drop_if_exists", label: "Drop if exists on target" },
-  { key: "roles", label: "Copy roles" },
-  { key: "no_role_passwords", label: "Skip role passwords" },
-  { key: "no_owner", label: "Skip owner restore" },
-  { key: "no_acl", label: "Skip ACL restore" },
-  { key: "no_comments", label: "Skip comments" },
-  { key: "no_tablespaces", label: "Skip tablespaces" },
-  { key: "skip_large_objects", label: "Skip large objects" },
-  { key: "skip_extensions", label: "Skip extensions" },
-  { key: "skip_ext_comments", label: "Skip extension comments" },
-  { key: "skip_collations", label: "Skip collations" },
-  { key: "skip_vacuum", label: "Skip VACUUM" },
-  { key: "skip_analyze", label: "Skip ANALYZE" },
-  { key: "skip_db_properties", label: "Skip DB properties" },
-  { key: "skip_split_by_ctid", label: "Skip CTID split" },
-  { key: "fail_fast", label: "Fail fast" },
-  { key: "restart", label: "Restart (reuse temp files)" },
-  { key: "resume", label: "Resume after failure" },
-  { key: "not_consistent", label: "Allow new snapshot (not consistent)" },
-  { key: "follow", label: "Follow (logical decoding after copy)" },
-  { key: "create_slot", label: "Create replication slot" },
-  { key: "wal2json_numeric_as_string", label: "wal2json numeric as string" },
-  { key: "use_copy_binary", label: "COPY binary format" },
-  { key: "all_databases", label: "All databases on instance" },
-  { key: "estimate_table_sizes", label: "Estimate table sizes" },
-]
-
-const emptyConn = (): PgCopyConn => ({
-  type: "postgres",
-  host: "",
-  port: "5432",
-  database: "",
-  username: "",
-  password: "",
-  schema: "",
+const emptyConn = (): PgCopyConn => ({ type: "postgres", host: "", port: "5432", database: "", username: "", password: "", schema: "" })
+const toPayload = (d: any) => ({
+  name: d.name.trim(),
+  source: { ...d.source, type: "postgres" },
+  target: { ...d.target, type: "postgres" },
+  include_tables: [...d.include_tables],
+  options: Object.fromEntries(Object.entries(d.options).map(([k, v]) => [k, typeof v === "string" ? v.trim() || undefined : v])),
+})
+const test = transferTester("pgcopy")
+const pgEnd = (role: string, c: PgCopyConn, overwrite?: string) => ({
+  engine: "postgres",
+  role,
+  title: c.host,
+  detail: c.database ? `${c.database}, port ${c.port || "5432"}` : "",
+  overwrite,
 })
 
-const profiles = ref<PgCopyProfile[]>([])
-const jobs = ref<PgCopyJob[]>([])
-const selectedId = ref("")
-const loading = ref(false)
-const saving = ref(false)
-const running = ref(false)
-const sidecarVersion = ref("")
-const includeTablesText = ref("")
-const logText = ref("")
-const logJobId = ref("")
-const error = ref("")
+/** ", PostgreSQL 17" once a connection test has run (the route then names the server). */
+const ver = (check: any, name: string) => (check?.ok && check.raw?.server_version ? `, ${name} ${String(check.raw.server_version).split(" ")[0]}` : "")
 
-const form = reactive({
-  name: "",
-  source: emptyConn(),
-  target: emptyConn(),
-  options: defaultPgCopyOptions(),
-  plugin: "",
-  slot_name: "",
-  origin: "",
-})
-
-const selectedProfile = computed(() => profiles.value.find((p) => p.id === selectedId.value) || null)
-
-const loadAll = async () => {
-  loading.value = true
-  error.value = ""
-  try {
-    const [cap, profs, jobList] = await Promise.all([
-      fetchCapability().catch(() => ({})),
-      fetchProfiles(),
-      fetchJobs(),
-    ])
-    sidecarVersion.value = String((cap as any)?.pgcopydb_version || "")
-    profiles.value = profs
-    jobs.value = jobList
-    if (!selectedId.value && profs.length) selectProfile(profs[0].id)
-  } catch (e: any) {
-    error.value = formatApiError(e, "Failed to load pgcopy")
-  } finally {
-    loading.value = false
-  }
+const tool: TransferTool<PgCopyProfile, any, PgCopyJob> = {
+  key: "pgcopy",
+  title: "Postgres copy",
+  icon: Copy,
+  intro: "Copy a whole PostgreSQL database into another one in parallel, and optionally keep following its changes.",
+  emptyText: "A transfer copies schema, data and indexes from one PostgreSQL database into another with pgcopydb. Use it to seed a replica or move a database.",
+  namePlaceholder: "Orders replica seed",
+  api: {
+    fetchProfiles: api.fetchProfiles,
+    createProfile: api.createProfile,
+    updateProfile: api.updateProfile,
+    deleteProfile: api.deleteProfile,
+    runProfile: api.runProfile,
+    fetchJobs: api.fetchJobs,
+    fetchJobLogs: api.fetchJobLogs,
+    stopJob: api.stopJob,
+    fetchCapability: api.fetchCapability,
+  },
+  newDraft: () => ({
+    name: "",
+    source: emptyConn(),
+    target: emptyConn(),
+    include_tables: [],
+    options: applyContractOptionDefaults(defaultPgCopyOptions(), contract.value ?? undefined),
+  }),
+  toDraft: (p) => ({
+    name: p.name,
+    source: { ...emptyConn(), ...p.source },
+    target: { ...emptyConn(), ...p.target },
+    include_tables: [...(p.include_tables || [])],
+    options: { ...defaultPgCopyOptions(), ...p.options },
+  }),
+  toPayload,
+  changeLabels: rules.changeLabels,
+  verb: rules.verb,
+  startedToast: rules.startedToast,
+  modeLabel: (p) => (p.options.follow ? "Copy, then follow changes" : "One-time copy"),
+  runResult: rules.runResult,
+  steps: (p, job, log) => rules.steps(p, job, log),
+  summary: rules.summary,
+  effects: rules.effects,
+  problems: rules.problems,
+  // Runs before per-run job ids used the profile id as the job id.
+  jobsOf: (jobs, id) => jobs.filter((j) => (j.profile_id || j.id) === id),
+  routeSource: (p, checks) => pgEnd(`Source${ver(checks.source, "PostgreSQL")}`, p.source),
+  routeDestinations: (p, checks) => [pgEnd(`Target${ver(checks.target, "PostgreSQL")}`, p.target, p.options.drop_if_exists ? "Replaces existing objects" : undefined)],
+  railRoute: (p) => `${p.source.host}/${p.source.database} → ${p.target.host}/${p.target.database}`,
+  railEngines: () => ["postgres", "postgres"],
+  sections: (p) => [
+    { id: "pc-source", label: "Source database" },
+    { id: "pc-target", label: "Target database" },
+    { id: "pc-scope", label: "What to copy" },
+    { id: "pc-target-behaviour", label: "Target behaviour" },
+    { id: "pc-speed", label: "Speed" },
+    { id: "pc-follow", label: "Follow changes" },
+    { id: "pc-advanced", label: "Recovery and advanced" },
+  ],
+  // pg_dump/pg_restore inside the image must be at least the source's major version.
+  capabilityLine: (c) => {
+    const pg = String(c.pg_dump || c.pgcopydb_version || "").match(/PostgreSQL\)? (\d+)/)
+    return pg ? `pgcopydb with a PostgreSQL ${pg[1]} client` : ""
+  },
 }
-
-const selectProfile = (id: string) => {
-  selectedId.value = id
-  const p = profiles.value.find((item) => item.id === id)
-  if (!p) return
-  form.name = p.name
-  form.source = { ...emptyConn(), ...p.source }
-  form.target = { ...emptyConn(), ...p.target }
-  form.options = { ...defaultPgCopyOptions(), ...p.options }
-  form.plugin = p.options.plugin || ""
-  form.slot_name = p.options.slot_name || ""
-  form.origin = p.options.origin || ""
-  includeTablesText.value = (p.include_tables || []).join("\n")
-}
-
-const payloadFromForm = () => {
-  const include_tables = includeTablesText.value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const options = {
-    ...form.options,
-    plugin: form.plugin.trim() || undefined,
-    slot_name: form.slot_name.trim() || undefined,
-    origin: form.origin.trim() || undefined,
-  }
-  return {
-    name: form.name.trim(),
-    source: form.source,
-    target: form.target,
-    include_tables,
-    options,
-  }
-}
-
-const saveProfile = async () => {
-  if (!form.name.trim()) {
-    toast.error("Profile name is required")
-    return
-  }
-  saving.value = true
-  try {
-    const body = payloadFromForm()
-    if (selectedId.value) {
-      const updated = await updateProfile(selectedId.value, body)
-      const idx = profiles.value.findIndex((p) => p.id === updated.id)
-      if (idx >= 0) profiles.value[idx] = updated
-      toast.success("Profile saved")
-    } else {
-      const created = await createProfile(body as any)
-      profiles.value.push(created)
-      selectProfile(created.id)
-      toast.success("Profile created")
-    }
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    saving.value = false
-  }
-}
-
-const contractDefaults = ref<Record<string, unknown> | null>(null)
-
-const newProfile = () => {
-  selectedId.value = ""
-  form.name = ""
-  form.source = emptyConn()
-  form.target = emptyConn()
-  form.options = applyContractOptionDefaults(
-    defaultPgCopyOptions(),
-    contractDefaults.value ?? undefined,
-  )
-  form.plugin = ""
-  form.slot_name = ""
-  form.origin = ""
-  includeTablesText.value = ""
-}
-
-const removeProfile = async () => {
-  if (!selectedId.value) return
-  if (!confirm("Delete this pgcopy profile?")) return
-  try {
-    await deleteProfile(selectedId.value)
-    profiles.value = profiles.value.filter((p) => p.id !== selectedId.value)
-    newProfile()
-    toast.success("Profile deleted")
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const runSelected = async () => {
-  if (!selectedId.value) {
-    toast.error("Save a profile before running")
-    return
-  }
-  running.value = true
-  try {
-    await saveProfile()
-    const job = await runProfile(selectedId.value)
-    toast.success(`Clone job started (${job.id})`)
-    await loadAll()
-    if (job.id) await showLogs(job.id)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    running.value = false
-  }
-}
-
-const showLogs = async (jobId: string) => {
-  logJobId.value = jobId
-  try {
-    const res = await fetchJobLogs(jobId)
-    logText.value = res.log || ""
-  } catch (e: any) {
-    logText.value = formatApiError(e, "Failed to load logs")
-  }
-}
-
-const stopRunningJob = async (jobId: string) => {
-  try {
-    await stopJob(jobId)
-    toast.success("Stop requested")
-    await loadAll()
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const testConn = async (which: "source" | "target") => {
-  const connection = which === "source" ? form.source : form.target
-  try {
-    const res = await validateConnection(connection)
-    toast[res.valid ? "success" : "error"](res.message)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-let pollTimer: ReturnType<typeof setInterval> | null = null
-
-onMounted(async () => {
-  fetchContract()
-    .then((c) => {
-      contractDefaults.value = c
-    })
-    .catch(() => {})
-  loadAll()
-  pollTimer = setInterval(() => {
-    fetchJobs().then((j) => (jobs.value = j)).catch(() => {})
-    if (logJobId.value) showLogs(logJobId.value)
-  }, 8000)
-})
-
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
-})
+const CHECK_NOTE = "Tested from the pgcopydb container, the same way a run connects."
+// The API takes bytes; people think in GB.
+const GB = 1024 ** 3
+const gbOf = (bytes?: number | null) => (bytes ? Math.round((bytes / GB) * 100) / 100 : "")
+const setGb = (options: Record<string, any>, value: string) =>
+  (options.split_tables_larger_than = value.trim() === "" || Number.isNaN(Number(value)) ? undefined : Math.round(Number(value) * GB))
 </script>
 
 <template>
-  <div class="space-y-6 animate-fade-in">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-xl font-semibold text-foreground flex items-center gap-2">
-          <Copy class="h-5 w-5 text-primary" />
-          Postgres copy (pgcopydb)
-        </h1>
-        <div class="mt-1 flex items-center gap-1.5">
-          <span class="text-sm font-medium text-foreground">pgcopydb clone</span>
-          <AppInfoHint
-            :text="`Configure parallel Postgres copy from source to target.${sidecarVersion ? ` Sidecar ${sidecarVersion}.` : ''}`"
-          />
-        </div>
-      </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap inline-flex items-center gap-2" @click="loadAll">
-          <RefreshCw class="h-4 w-4" :class="loading ? 'animate-spin' : ''" />
-          Refresh
-        </button>
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap" @click="newProfile">New profile</button>
-      </div>
-    </div>
+  <TransferWorkspace :tool="tool">
+    <template #config="{ draft, checks, savedLogin, selectedId, isNew }">
+      <TransferSection id="pc-source" title="Source database" why="The database to copy from. A role that can read every table is enough; following changes needs the REPLICATION privilege.">
+        <TransferConnection
+          :key="`src-${selectedId}`"
+          v-model="draft.source"
+          v-model:result="checks.source"
+          engine="postgres"
+          default-port="5432"
+          username-placeholder="copy_reader"
+          :database="{ label: 'Database', placeholder: 'shop' }"
+          :check="test('source', () => ({}), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :saved-login="savedLogin('source', '5432')"
+          :start-editing="isNew || !draft.source.host"
+        />
+      </TransferSection>
 
-    <p v-if="error" class="alert-error text-sm">{{ error }}</p>
+      <TransferSection id="pc-target" title="Target database" why="Where the copy goes. The role needs to create schemas, tables and indexes there.">
+        <TransferConnection
+          :key="`tgt-${selectedId}`"
+          v-model="draft.target"
+          v-model:result="checks.target"
+          engine="postgres"
+          default-port="5432"
+          username-placeholder="copy_writer"
+          :database="{ label: 'Database', placeholder: 'shop_copy' }"
+          :check="test('target', () => ({}), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :saved-login="savedLogin('target', '5432')"
+          :start-editing="isNew || !draft.target.host"
+        />
+      </TransferSection>
 
-    <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
-      <aside class="xl:col-span-3 card p-4 space-y-2">
-        <h2 class="text-sm font-medium text-muted-foreground">Saved profiles</h2>
-        <button
-          v-for="p in profiles"
-          :key="p.id"
-          type="button"
-          class="w-full text-left rounded-xl px-3 py-2 text-sm border transition-colors"
-          :class="selectedId === p.id ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/40'"
-          @click="selectProfile(p.id)"
-        >
-          <div class="font-medium truncate">{{ p.name }}</div>
-          <div class="text-xs text-muted-foreground truncate">{{ p.source.host }} → {{ p.target.host }}</div>
-        </button>
-        <p v-if="!profiles.length" class="text-sm text-muted-foreground italic">No profiles yet.</p>
-      </aside>
+      <TransferSection id="pc-scope" title="What to copy" why="Leave tables empty to copy the whole database.">
+        <TransferTokens v-model="draft.include_tables" label="Only these tables" help="schema.table, one per entry. Everything else is left out." placeholder="All tables" />
+        <TransferSwitch v-model="draft.options.roles" label="Copy roles" help="Creates the source's roles on the target server before copying." />
+        <TransferSwitch v-model="draft.options.no_role_passwords" label="Leave out role passwords" help="Roles are created without passwords; set them on the target afterwards." :disabled="!draft.options.roles" />
+        <TransferSwitch v-model="draft.options.skip_large_objects" label="Leave out large objects" help="Skips pg_largeobject data. Faster when large objects are not used." />
+        <TransferSwitch v-model="draft.options.skip_extensions" label="Leave out extensions" help="Extensions are not created on the target; install them yourself first." />
+      </TransferSection>
 
-      <section class="xl:col-span-9 space-y-4">
-        <div class="card p-5 space-y-4">
-          <input
-            v-model="form.name"
-            type="text"
-            placeholder="Profile name"
-            class="auth-input w-full"
-          />
+      <TransferSection id="pc-target-behaviour" title="Target behaviour" why="What happens to objects that already exist in the target database.">
+        <TransferSwitch
+          v-model="draft.options.drop_if_exists"
+          label="Drop existing objects first"
+          help="Each copied object that already exists on the target is dropped and recreated. Off: the copy stops when an object already exists."
+          danger
+        />
+        <TransferSwitch v-model="draft.options.no_owner" label="Do not set owners" help="Objects are owned by the target user. Use this when the source roles do not exist on the target." />
+        <TransferSwitch v-model="draft.options.no_acl" label="Leave out privileges" help="No GRANT or REVOKE statements are restored." />
+        <TransferSwitch v-model="draft.options.no_comments" label="Leave out comments" />
+        <TransferSwitch v-model="draft.options.no_tablespaces" label="Ignore tablespaces" help="Everything goes into the target's default tablespace." />
+        <TransferSwitch v-model="draft.options.skip_db_properties" label="Leave database settings alone" help="Settings made with ALTER DATABASE on the source are not copied." />
+      </TransferSection>
 
-          <div class="grid md:grid-cols-2 gap-4">
-            <div v-for="side in (['source', 'target'] as const)" :key="side" class="space-y-2 rounded-xl border border-border p-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold capitalize">{{ side }}</h3>
-                <button type="button" class="text-xs text-primary underline" @click="testConn(side)">Validate</button>
-              </div>
-              <input v-model="form[side].host" class="auth-input w-full" placeholder="Host" />
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model="form[side].port" class="auth-input" placeholder="Port" />
-                <input v-model="form[side].database" class="auth-input" placeholder="Database" />
-              </div>
-              <input v-model="form[side].username" class="auth-input w-full" placeholder="Username" />
-              <input v-model="form[side].password" type="password" class="auth-input w-full" placeholder="Password" />
+      <TransferSection id="pc-speed" title="Speed" why="More parallel jobs copy faster but use more connections and CPU on both servers.">
+        <div class="grid max-w-xl gap-3 sm:grid-cols-2">
+          <label>
+            <span class="auth-label !mb-1.5">Tables at a time</span>
+            <input v-model.number="draft.options.table_jobs" type="number" min="1" max="64" class="auth-input tabular-nums" placeholder="4" />
+          </label>
+          <label>
+            <span class="auth-label !mb-1.5">Indexes at a time</span>
+            <input v-model.number="draft.options.index_jobs" type="number" min="1" max="64" class="auth-input tabular-nums" placeholder="2" />
+          </label>
+          <label>
+            <span class="auth-label !mb-1.5">Split tables larger than</span>
+            <div class="flex items-center gap-2">
+              <input
+                :value="gbOf(draft.options.split_tables_larger_than)"
+                type="number"
+                min="0"
+                step="0.5"
+                class="auth-input tabular-nums"
+                placeholder="Never"
+                @input="setGb(draft.options, ($event.target as HTMLInputElement).value)"
+              />
+              <span class="text-sm text-muted-foreground">GB</span>
             </div>
-          </div>
-
-          <div>
-            <label class="auth-label">Include tables (optional, one per line: schema.table)</label>
-            <textarea v-model="includeTablesText" rows="3" class="auth-input w-full font-mono text-xs" />
-          </div>
-
-          <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            <label class="text-xs text-muted-foreground">Table jobs
-              <input v-model.number="form.options.table_jobs" type="number" min="1" class="auth-input w-full mt-1" />
-            </label>
-            <label class="text-xs text-muted-foreground">Index jobs
-              <input v-model.number="form.options.index_jobs" type="number" min="1" class="auth-input w-full mt-1" />
-            </label>
-            <label class="text-xs text-muted-foreground">Restore jobs
-              <input v-model.number="form.options.restore_jobs" type="number" min="1" class="auth-input w-full mt-1" />
-            </label>
-            <label class="text-xs text-muted-foreground">Large object jobs
-              <input v-model.number="form.options.large_objects_jobs" type="number" min="1" class="auth-input w-full mt-1" />
-            </label>
-          </div>
-
-          <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
-            <label v-for="opt in BOOL_OPTIONS" :key="String(opt.key)" class="flex items-center gap-2 text-sm">
-              <input v-model="(form.options as any)[opt.key]" type="checkbox" class="rounded border-border" />
-              {{ opt.label }}
-            </label>
-          </div>
-
-          <div class="grid sm:grid-cols-3 gap-3">
-            <input v-model="form.plugin" class="auth-input" placeholder="Plugin (pgoutput, wal2json…)" />
-            <input v-model="form.slot_name" class="auth-input" placeholder="Slot name" />
-            <input v-model="form.origin" class="auth-input" placeholder="Origin name" />
-          </div>
-
-          <div class="flex flex-wrap gap-2 pt-2">
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="saving" @click="saveProfile">
-              <Save class="h-4 w-4" />
-              Save
-            </button>
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="running || !selectedId" @click="runSelected">
-              <Play class="h-4 w-4" />
-              Run clone
-            </button>
-            <button v-if="selectedId" type="button" class="btn-secondary inline-flex items-center gap-2" @click="removeProfile">
-              <Trash2 class="h-4 w-4" />
-              Delete
-            </button>
-          </div>
+          </label>
+          <label>
+            <span class="auth-label !mb-1.5">Split into at most</span>
+            <input v-model.number="draft.options.split_max_parts" type="number" min="1" class="auth-input tabular-nums" placeholder="Parts" :disabled="!draft.options.split_tables_larger_than" />
+          </label>
         </div>
+        <TransferSwitch v-model="draft.options.use_copy_binary" label="Copy in binary format" help="Usually faster. Both servers must have the same data types and versions of extensions." />
+        <TransferSwitch v-model="draft.options.skip_vacuum" label="Skip VACUUM after loading" help="Faster, but the visibility map stays empty until autovacuum runs." />
+        <TransferSwitch v-model="draft.options.skip_analyze" label="Skip ANALYZE after loading" help="Faster, but the planner has no statistics until autovacuum runs." />
+      </TransferSection>
 
-        <div class="card p-5 space-y-3">
-          <h2 class="text-sm font-semibold">Jobs</h2>
-          <div class="overflow-x-auto">
-            <table class="data-table w-full text-sm">
-              <thead>
-                <tr class="text-left text-muted-foreground">
-                  <th class="p-2">ID</th>
-                  <th class="p-2">Status</th>
-                  <th class="p-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="job in jobs" :key="job.id" class="border-t border-border">
-                  <td class="p-2 font-mono text-xs">{{ job.id.slice(0, 8) }}…</td>
-                  <td class="p-2">
-                    <span
-                      class="badge-neutral"
-                      :class="{
-                        'badge-success': job.status === 'succeeded',
-                        'badge-error': job.status === 'failed',
-                        'badge-warning': job.status === 'running',
-                      }"
-                    >{{ job.status }}</span>
-                  </td>
-                  <td class="p-2 flex gap-2">
-                    <button type="button" class="text-xs text-primary underline" @click="showLogs(job.id)">Logs</button>
-                    <button
-                      v-if="job.status === 'running'"
-                      type="button"
-                      class="text-xs text-red-400 inline-flex items-center gap-1"
-                      @click="stopRunningJob(job.id)"
-                    >
-                      <Square class="h-3 w-3" /> Stop
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+      <TransferSection id="pc-follow" title="Follow changes" why="After the copy, keep applying the source's changes to the target with logical decoding, until you stop the run.">
+        <TransferSwitch v-model="draft.options.follow" label="Keep following changes" help="The run stays live after the copy. The source needs wal_level = logical." />
+        <template v-if="draft.options.follow">
+          <TransferSwitch v-model="draft.options.create_slot" label="Create the replication slot" help="A slot keeps WAL on the source until it is dropped. Drop it when you are done, or disk fills up." danger="Keeps WAL on the source" />
+          <div class="grid max-w-xl gap-3 sm:grid-cols-2">
+            <label>
+              <span class="auth-label !mb-1.5">Decoding plugin</span>
+              <AppSelect :model-value="draft.options.plugin || ''" aria-label="Decoding plugin" @update:model-value="draft.options.plugin = $event || undefined">
+                <option value="">test_decoding (default)</option>
+                <option value="wal2json">wal2json</option>
+              </AppSelect>
+            </label>
+            <label>
+              <span class="auth-label !mb-1.5">Slot name</span>
+              <input v-model="draft.options.slot_name" class="auth-input font-mono !text-xs" placeholder="pgcopydb" spellcheck="false" />
+            </label>
+            <label>
+              <span class="auth-label !mb-1.5">Replication origin</span>
+              <input v-model="draft.options.origin" class="auth-input font-mono !text-xs" placeholder="pgcopydb" spellcheck="false" />
+            </label>
+            <label>
+              <span class="auth-label !mb-1.5">Stop at LSN</span>
+              <input v-model="draft.options.endpos" class="auth-input font-mono !text-xs" placeholder="Never" spellcheck="false" />
+            </label>
           </div>
-          <pre v-if="logText" class="code-block text-xs max-h-80 overflow-auto whitespace-pre-wrap">{{ logText }}</pre>
-        </div>
-      </section>
-    </div>
-  </div>
+          <TransferSwitch v-if="draft.options.plugin === 'wal2json'" v-model="draft.options.wal2json_numeric_as_string" label="Send numbers as text" help="Keeps numeric precision with wal2json." />
+        </template>
+      </TransferSection>
+
+      <TransferSection id="pc-advanced" title="Recovery and advanced" why="Rarely changed.">
+        <details class="group rounded-lg border border-border">
+          <summary class="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm font-medium text-foreground">
+            <ChevronRight class="h-4 w-4 transition-transform group-open:rotate-90" :stroke-width="1.75" />
+            Recovery, consistency and scope
+          </summary>
+          <div class="space-y-4 border-t border-border p-3">
+            <TransferSwitch v-model="draft.options.fail_fast" label="Stop at the first error" help="Off: other tables continue when one fails, and the run fails at the end." />
+            <TransferSwitch v-model="draft.options.resume" label="Resume the previous run" help="Continue where the last run stopped, reusing its work files." />
+            <TransferSwitch v-model="draft.options.restart" label="Start over" help="Discard the previous run's work files and start from scratch." />
+            <TransferSwitch v-model="draft.options.not_consistent" label="Allow a new snapshot when resuming" help="Resumes even though the data may not match a single point in time." danger="Data may be inconsistent" />
+            <TransferSwitch v-model="draft.options.all_databases" label="Copy every database on the server" help="Ignores the database names and copies all of them." danger="Copies every database" />
+            <TransferSwitch v-model="draft.options.skip_collations" label="Leave out collations" />
+            <TransferSwitch v-model="draft.options.estimate_table_sizes" label="Estimate table sizes" help="Faster start on very large databases; sizes come from statistics instead of counting." />
+            <TransferSwitch v-model="draft.options.skip_split_by_ctid" label="Do not split tables by CTID" help="Use when tables have no usable key and splitting is slow." />
+            <label class="block max-w-md">
+              <span class="auth-label !mb-1.5">Use snapshot</span>
+              <input v-model="draft.options.snapshot" class="auth-input font-mono !text-xs" placeholder="Exported snapshot id (optional)" spellcheck="false" />
+            </label>
+          </div>
+        </details>
+      </TransferSection>
+    </template>
+  </TransferWorkspace>
 </template>

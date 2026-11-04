@@ -1254,6 +1254,30 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SourceTableInspectResponse"
+  /cdc/profiles/catalog/target/ddl:
+    post:
+      summary: Create target tables (mapping step "Create table")
+      description: >-
+        Runs generated CREATE statements on the pipeline target one at a time, stopping at the
+        first failure. Only creation DDL is accepted. Every call is written to the audit trail
+        as `target.create_tables`.
+      operationId: createProfileTargetTables
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TargetDdlRequest"
+      responses:
+        "200":
+          description: Per-statement results (status false when a statement failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TargetDdlResponse"
+        "400":
+          description: Unsupported target, empty/too many statements, or a non-CREATE statement
   /cdc/profiles/validate/target:
     post:
       summary: Validate target connection
@@ -1412,6 +1436,11 @@ paths:
         incremental `source_to_target` pipelines only.
 
         `resync` with `row_limit` copies a capped sample and keeps the pipeline running.
+
+        `clear_target` is rejected (400) on pipelines with any `rolling_window` table: the
+        window only re-reads recent rows, so older rows would stay missing. Use
+        `POST /cdc/profiles/{id}/initial-load` to rebuild the target instead. This also
+        applies to the scheduled full refresh.
       operationId: profileAction
       tags: [Profiles]
       parameters:
@@ -1442,6 +1471,113 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProfileResponse"
+  /cdc/profiles/{id}/split:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: Move some tables into a new Draft pipeline with the same source and target
+      description: |
+        Creates a copy of the pipeline restricted to the selected tables (their mappings and
+        per-table poll rules move with them), saved as a **Draft** — never started. The new
+        pipeline gets its own connector/sink names, Kafka topic prefix and replication slot
+        (a slot pinned in `source.connection.slot` is dropped from the copy). The selected
+        tables are removed from the original's saved configuration; if the original is
+        running/paused its connectors keep them until it is restarted
+        (`original_restart_required`) — start the new pipeline first, then restart the
+        original. Rejected for trigger capture, OLake, pipelines without an explicit table
+        list, moving every table, or a name whose connector / topic prefix is already used.
+        Audit: `profile.split` on both pipelines.
+      operationId: splitProfile
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, tables]
+              properties:
+                name: { type: string, description: Name of the new pipeline }
+                description: { type: string }
+                tables:
+                  type: array
+                  items: { type: string, description: "schema.table as in source.tables (case-insensitive)" }
+      responses:
+        "201":
+          description: New pipeline created; original updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  original: { type: object, additionalProperties: true, description: Original pipeline after the split (secrets redacted) }
+                  created: { type: object, additionalProperties: true, description: New Draft pipeline (secrets redacted) }
+                  moved_tables: { type: array, items: { type: string } }
+                  original_restart_required: { type: boolean }
+        "400":
+          description: Invalid split (see `error`; may include `diagnosis`)
+        "404":
+          description: Pipeline not found
+  /cdc/profiles/{id}/initial-load:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: Start a background initial load (streaming copy of every source row)
+      description: |
+        Copies every row of the selected source tables into the PostgreSQL target, in the
+        background. Each table is read with **one** forward-only `SELECT *` through
+        cdc-jdbc-admin (`/v1/stream`) and inserted in batches with `ON CONFLICT DO NOTHING`,
+        so it can run beside a live pipeline (fresher upserts win) and can be re-run after a
+        failure. Use it for rows a rolling window never re-reads (e.g. legacy rows with a NULL
+        UPDATE_DATE). One load per pipeline at a time; job state lives in memory on the
+        orchestrator instance, and the outcome is written to the profile history
+        (`profile_initial_load*`) and audit log (`profile.initial_load`).
+      operationId: startInitialLoad
+      tags: [Profiles]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InitialLoadRequest" }
+      responses:
+        "202":
+          description: Load started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InitialLoadStatus" }
+        "400":
+          description: Not a source_to_target pipeline, non-PostgreSQL target, jdbc-admin not configured, unknown table, or a load is already running
+    get:
+      summary: Progress of the latest initial load
+      operationId: getInitialLoad
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Load status with per-table row counts
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InitialLoadStatus" }
+        "404":
+          description: No initial load has run for this pipeline on this instance
+    delete:
+      summary: Cancel a running initial load
+      description: Stops between insert batches. Rows already copied are kept.
+      operationId: cancelInitialLoad
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Current status (state becomes cancelled once the copy stops)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InitialLoadStatus" }
+        "404":
+          description: No initial load has run for this pipeline on this instance
   /cdc/processing-pipelines:
     get:
       summary: List Kafka-native processing pipelines
@@ -1993,7 +2129,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
   /cdc/migration-tools/discover:
     get:
-      summary: Discover enabled one-shot migration tools (pgcopy, pgloader, redisshake, mongocopy)
+      summary: Discover enabled one-shot migration tools (pgcopy, pgloader, redisshake, mongocopy, pgdump, rsync)
       operationId: discoverMigrationTools
       tags: [Migration Tools]
       responses:
@@ -2046,7 +2182,7 @@ paths:
         "200": { description: Discovery, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
   /cdc/{tool}/validate:
     post:
-      summary: Validate a tool profile without saving (pgcopy, redisshake, mongocopy)
+      summary: Validate a tool profile without saving (pgcopy, redisshake, mongocopy, pgdump, rsync)
       operationId: validateToolProfile
       tags: [Migration Tools]
       parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
@@ -2054,6 +2190,37 @@ paths:
       responses:
         "200": { description: Validation result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/{tool}/test-connection:
+    post:
+      summary: Test a connection from the tool's sidecar
+      description: |
+        Connects from the sidecar container (where the tool runs), so it proves the same network
+        path and login a run will use. pgcopy: PostgreSQL (warns when the image's pg_dump is older
+        than the server); pgloader: PostgreSQL target, MySQL/SQL Server source (pgloader --dry-run),
+        SQLite/CSV files inside the container; mongocopy: mongosh ping/version; redisshake: AUTH,
+        PING and INFO (warns when the Cluster switch does not match). A failed connection is a
+        normal answer `{ok: false, target, error, hint}`; success is `{ok: true, target, facts[],
+        warning?}`. `********` is replaced by the saved password from `profile_id` (`side`) only
+        when engine, host, port and username are unchanged; otherwise 400.
+      operationId: testToolConnection
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connection]
+              properties:
+                connection: { type: object, additionalProperties: true, description: "type, host, port, database (or file path), username, password" }
+                side: { type: string, enum: [source, target], default: source }
+                profile_id: { type: string, format: uuid }
+                options: { type: object, additionalProperties: true, description: "TLS/cluster switches, auth database, CSV separator, sslmode" }
+      responses:
+        "200": { description: Test result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /cdc/{tool}/profiles:
     parameters: [{ $ref: "#/components/parameters/MigrationTool" }]
     get:
@@ -2106,6 +2273,11 @@ paths:
   /cdc/{tool}/profiles/{id}/run:
     post:
       summary: Start a job from a saved profile
+      description: |
+        Every run is a new job with its own id; the job carries `profile_id`, and the profile's
+        `last_job_id` points at it. Sidecars keep the newest runs per profile (default 10; Redis 15).
+        A profile can have one active run: starting another returns 400 with the sidecar's
+        "already running" message.
       operationId: runToolProfile
       tags: [Migration Tools]
       parameters:
@@ -2148,6 +2320,194 @@ paths:
       parameters: [{ $ref: "#/components/parameters/MigrationTool" }, { $ref: "#/components/parameters/JobId" }]
       responses:
         "200": { description: Stopped, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/pgdump/jobs/{job_id}:
+    get:
+      summary: Get one pgdump job
+      description: |
+        Status is starting | running | succeeded | completed_with_errors | failed | stopped.
+        Carries artifact {name, format, bytes, sha256, local_deleted}, tables_dumped / tables_restored,
+        uploads[] (one per SFTP destination: status pending|uploading|uploaded|failed|stopped,
+        bytes_sent, remote_path, host_key_fingerprint, host_key_verified, error, hint), and on failure
+        error, first_error and an operator hint. download_path is set while the local file exists.
+        A failed upload makes the job completed_with_errors and keeps the local file.
+      operationId: getPgDumpJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Job, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a finished pgdump job and its dump file
+      operationId: deletePgDumpJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/pgdump/jobs/{job_id}/file:
+    get:
+      summary: Download the pgdump artifact (streamed)
+      description: |
+        Streams the dump file from the cdc-pgdump sidecar. Headers Content-Disposition and
+        X-Dump-Sha256. 400 while the job is running (sidecar 409) or when no file exists (sidecar 410),
+        including after the local copy was removed because every SFTP destination has it.
+      operationId: downloadPgDumpFile
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200":
+          description: Dump file
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/pgdump/test-connection:
+    post:
+      summary: Test a Postgres connection from the pgdump sidecar and describe the database
+      description: |
+        Connects from the cdc-pgdump container (where pg_dump runs), so it proves the same network
+        path and credentials a dump will use. A failed connection is a normal answer:
+        `{ok: false, target, error, hint}`. On success: `{ok: true, target, latency_ms, server_version,
+        server_major, client_version, client_major, compatible, current_user, database_bytes, ssl,
+        schemas: [{name, tables, bytes}]}`; `compatible` is false (with a hint) when the server is
+        newer than pg_dump. A password of `********` is replaced by the saved one from `profile_id`
+        (`side` source|target) only when host, port and username are unchanged; otherwise 400.
+      operationId: testPgDumpConnection
+      tags: [Migration Tools]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connection]
+              properties:
+                connection: { type: object, additionalProperties: true, description: "type, host, port, database, username, password" }
+                sslmode: { type: string, enum: [disable, allow, prefer, require, verify-ca, verify-full] }
+                profile_id: { type: string, format: uuid }
+                side: { type: string, enum: [source, target], default: source }
+      responses:
+        "200": { description: Test result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/rsync/test-connection:
+    post:
+      summary: Log in to an SSH host from the rsync sidecar and describe it
+      description: |
+        Logs in from the cdc-rsync container (where relay runs and where direct runs start) and
+        probes the host: `{ok, target, side, os, arch, rsync_path, rsync_version, gnu_rsync,
+        path_kind (dir|file|missing), free_bytes, writable, ssh_client, latency_ms,
+        host_key_fingerprint, host_key_verified, warning?}`. rsync is auto-detected, Homebrew
+        first (macOS ships openrsync, which lacks progress, ACLs and xattrs). A failed login is a
+        normal answer: `{ok: false, error, hint}`. Secrets sent as `********` are taken from
+        `profile_id` only when host, port and username are unchanged; otherwise 400.
+      operationId: testRsyncConnection
+      tags: [Migration Tools]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint]
+              properties:
+                endpoint: { type: object, additionalProperties: true, description: "host, port, username, auth (key|password), password, private_key, passphrase, path, host_key_fingerprint, rsync_path" }
+                side: { type: string, enum: [source, target], default: source }
+                profile_id: { type: string, format: uuid }
+      responses:
+        "200": { description: Test result, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/rsync/test-route:
+    post:
+      summary: Check whether a sync would run direct (source → target) or fall back to relay
+      description: |
+        Logs in to the source with the target key in a forwarded ssh-agent and, from the source,
+        logs in to the target (`reach_host`/`reach_port` when set). Answers `{direct: true,
+        transport: direct, target: {os, rsync_path, …}, target_host_key_fingerprint}` or
+        `{direct: false, transport: relay, error, hint}`. A password target is never direct.
+      operationId: testRsyncRoute
+      tags: [Migration Tools]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, target]
+              properties:
+                source: { type: object, additionalProperties: true }
+                target: { type: object, additionalProperties: true }
+                profile_id: { type: string, format: uuid }
+      responses:
+        "200": { description: Route check, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /cdc/rsync/profiles/{id}/run:
+    post:
+      summary: Run (or preview) an rsync profile
+      description: |
+        Starts a sidecar job. With `dry_run=true` the run is a preview (`--dry-run
+        --itemize-changes`): nothing is written on the target and the job carries
+        `changes: {counts: {create, update, delete, attrs}, items: [{op, kind, path}] (first 500),
+        truncated}`. In relay mode a preview still refreshes the relay copy (pull), then dry-runs the push.
+      operationId: runRsyncProfile
+      tags: [Migration Tools]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: dry_run, required: false, schema: { type: boolean } }
+      responses:
+        "200": { description: Job started, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/rsync/jobs/{job_id}:
+    get:
+      summary: Get one rsync job
+      description: |
+        Status is starting | running | succeeded | completed_with_errors | failed | stopped.
+        `phase` connect|route|sync|pull|push; `transport` direct|relay with `transport_reason`
+        (why auto fell back); `progress {bytes, percent, rate, eta, files_transferred,
+        files_to_check, files_total}` while running; `stats` (rsync --stats, snake_case keys, of the
+        sync or push) and `stats_pull` (relay); `hosts.{source,target}` facts; `host_keys` with
+        fingerprints and whether they were pinned; `changes` for previews; on failure `error`,
+        `first_error` and an operator `hint`. rsync exits 23/24/25 (partial, vanished, max_delete)
+        are completed_with_errors.
+      operationId: getRsyncJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Job, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a finished rsync job record
+      operationId: deleteRsyncJob
+      tags: [Migration Tools]
+      parameters: [{ $ref: "#/components/parameters/JobId" }]
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/rsync/staging:
+    get:
+      summary: Relay staging copies on the rsync sidecar
+      description: "One per profile (`id` = profile id), kept so relay runs stay incremental. Answer: `{staging: [{id, bytes, modified_at}], free_mb}`."
+      operationId: listRsyncStaging
+      tags: [Migration Tools]
+      responses:
+        "200": { description: Staging copies, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/rsync/staging/{id}:
+    delete:
+      summary: Free a profile's relay staging copy
+      description: "The next relay run of that profile pulls everything again. 400 while the profile is running. Deleting a profile also removes its staging copy."
+      operationId: deleteRsyncStaging
+      tags: [Migration Tools]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
   /cdc/connectors/plugins:
     get:
@@ -2259,7 +2619,7 @@ components:
       in: path
       name: tool
       required: true
-      schema: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy] }
+      schema: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy, pgdump, rsync] }
     AuditLimit:
       in: query
       name: limit
@@ -2725,6 +3085,82 @@ components:
         incrementing_column:
           type: string
           description: "Incremental capture. Strictly incrementing column, usually the primary key (e.g. id). Required for replica upsert. Append-only tables can use this without a timestamp column."
+        upsert_key_columns:
+          type: array
+          items: { type: string }
+          description: "Incremental replica upsert key on the target (text/composite allowed), e.g. [BRANCH_NO, PRO_CODE]."
+        table_poll:
+          type: array
+          items: { $ref: "#/components/schemas/TablePollRule" }
+          description: |
+            Incremental capture: per-table poll strategy overrides. Tables without a rule poll
+            on timestamp_column / incrementing_column (watermark). Each rolling_window /
+            full_copy table runs its own query-mode, mode=bulk JDBC source connector
+            (`{connector}-poll-{schema-table}`; the first one takes the pipeline connector
+            name when no table uses a watermark) and publishes to the same topic as table mode.
+    TablePollRule:
+      type: object
+      required: [table, strategy]
+      properties:
+        table:
+          type: string
+          description: "SCHEMA.TABLE, one of source.tables."
+        strategy:
+          type: string
+          enum: [watermark, rolling_window, full_copy]
+          description: |
+            watermark = JDBC offset on the watermark columns (default).
+            rolling_window = every poll re-reads rows whose window_column is today or within
+            the previous window_days days; no offset is kept, so date-only or non-unique
+            timestamps cannot skip same-day changes. Rows older than the window reach the
+            target only through an initial load.
+            full_copy = every poll re-reads the whole table (small tables only).
+        window_column:
+          type: string
+          description: "rolling_window only: date/timestamp column, e.g. UPDATE_DATE."
+        window_days:
+          type: integer
+          minimum: 0
+          maximum: 31
+          default: 1
+          description: "rolling_window only: previous days included besides today (1 = today + yesterday)."
+    InitialLoadRequest:
+      type: object
+      properties:
+        clear_target:
+          type: boolean
+          default: false
+          description: Truncate each target table just before copying into it.
+        tables:
+          type: array
+          items: { type: string }
+          description: "Subset of source.tables (SCHEMA.TABLE) to load. Empty = every selected table."
+    InitialLoadTable:
+      type: object
+      properties:
+        source: { type: string }
+        target: { type: string }
+        state:
+          type: string
+          enum: [pending, running, done, failed, skipped]
+        rows_copied: { type: integer }
+        error: { type: string }
+    InitialLoadStatus:
+      type: object
+      properties:
+        profile_id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [running, succeeded, failed, cancelled]
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        clear_target: { type: boolean }
+        actor: { type: string }
+        error: { type: string }
+        rows_copied: { type: integer }
+        tables:
+          type: array
+          items: { $ref: "#/components/schemas/InitialLoadTable" }
     TargetConfig:
       type: object
       required: [target_type, connection]
@@ -3025,6 +3461,53 @@ components:
         schema: { type: string }
         name: { type: string }
         limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    TableIndex:
+      type: object
+      required: [name, unique, columns]
+      properties:
+        name: { type: string }
+        unique: { type: boolean }
+        columns:
+          type: array
+          description: Key columns in index order (INCLUDE columns excluded). Expression indexes may carry expression text or be empty.
+          items: { type: string }
+        descending:
+          type: array
+          items: { type: string }
+        filter: { type: string, nullable: true, description: Partial-index predicate }
+        expression: { type: boolean, description: Index has expression keys (omitted when false) }
+    TargetDdlRequest:
+      type: object
+      required: [target, statements]
+      properties:
+        target: { $ref: "#/components/schemas/TargetConfig" }
+        statements:
+          type: array
+          maxItems: 500
+          description: >-
+            Creation DDL only (CREATE SCHEMA/TABLE/INDEX, optionally behind a SQL Server IF guard
+            or inside an Oracle BEGIN EXECUTE IMMEDIATE … END; block). DROP/ALTER/TRUNCATE/DML are rejected.
+          items: { type: string }
+        profile_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Merge the saved profile's target credentials (masked password in the wizard)
+    TargetDdlResponse:
+      type: object
+      required: [status, executed, results]
+      properties:
+        status: { type: boolean, description: All statements succeeded }
+        executed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            required: [index, ok]
+            properties:
+              index: { type: integer }
+              ok: { type: boolean }
+              error: { type: string }
     SourceTableInspectResponse:
       type: object
       required: [schema, name, primary_key, columns, rows, limit, timestamp]
@@ -3047,7 +3530,16 @@ components:
               position: { type: integer }
               primary_key: { type: boolean }
               pk_position: { type: integer, nullable: true }
-              unique: { type: boolean }
+              unique: { type: boolean, description: "Column is the primary key or the only column of a unique index" }
+              size: { type: integer, nullable: true, description: "Character length or numeric precision (jdbc-admin COLUMN_SIZE)" }
+              scale: { type: integer, nullable: true, description: "Numeric scale (jdbc-admin DECIMAL_DIGITS)" }
+              default_value: { type: string, nullable: true, description: "Source default expression, verbatim" }
+              auto_increment: { type: boolean, description: "Identity / serial / AUTO_INCREMENT column (omitted when false)" }
+        indexes:
+          type: array
+          description: Indexes and unique constraints, the primary-key index included. Absent when the inspector does not report them (older cdc-jdbc-admin).
+          items:
+            $ref: "#/components/schemas/TableIndex"
         rows:
           type: array
           items:
@@ -3323,7 +3815,7 @@ components:
           items:
             type: object
             properties:
-              id: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy] }
+              id: { type: string, enum: [pgcopy, pgloader, redisshake, mongocopy, pgdump, rsync] }
               title: { type: string }
               enabled: { type: boolean }
               contract_path: { type: string }

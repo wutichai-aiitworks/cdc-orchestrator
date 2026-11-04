@@ -1,0 +1,69 @@
+# ksqlDB + Kafbat UI (optional overlay — not required for CDC replica pipelines).
+#
+# Usage (from docker/):
+#   docker compose -f docker-compose.yaml -f docker-compose.ops.yaml up -d
+#
+# install.sh includes this overlay by default; use install.sh --core to omit.
+
+services:
+  cdc-ksqldb:
+    image: ${CDC_KSQL_IMAGE:-confluentinc/ksqldb-server:0.29.0}
+    platform: ${CDC_KSQL_PLATFORM:-linux/amd64}
+    container_name: cdc-ksqldb
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    ports:
+      - "${CDC_KSQL_HOST_PORT:-28088}:8088"
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: cdc-message:9092
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_KSQL_SERVICE_ID: cdc_
+      KSQL_KSQL_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_INTERNAL_TOPIC_REPLICAS: "1"
+      KSQL_KSQL_SINK_REPLICAS: "1"
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_STREAMS_CACHE_MAX_BYTES_BUFFERING: "0"
+      KSQL_KSQL_STREAMS_AUTO_OFFSET_RESET: earliest
+      KSQL_KSQL_STREAMS_PROCESSING_GUARANTEE: at_least_once
+      KSQL_KSQL_PERSISTENCE_DEFAULT_FORMAT_VALUE: AVRO
+      KSQL_KSQL_PERSISTENCE_DEFAULT_FORMAT_KEY: KAFKA
+      KSQL_KSQL_HIDDEN_TOPICS: "^_.*"
+      KSQL_HEAP_OPTS: "-Xms256m -Xmx768m"
+    networks:
+      server_zone:
+        aliases: [ksqldb]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'echo > /dev/tcp/127.0.0.1/8088' || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  cdc-admin:
+    image: ${CDC_ADMIN_IMAGE:-ghcr.io/kafbat/kafka-ui:latest}
+    container_name: cdc-admin
+    depends_on:
+      cdc-connect:
+        condition: service_healthy
+    ports:
+      - "${CDC_ADMIN_HOST_PORT:-4321}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: cdc-message:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://cdc-connect:8083
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://cdc-message:8081
+      KAFKA_CLUSTERS_0_KSQLDBSERVER: http://cdc-ksqldb:8088
+      DYNAMIC_CONFIG_ENABLED: "true"
+      AUTH_TYPE: disabled
+    networks: [server_zone]
+    restart: unless-stopped

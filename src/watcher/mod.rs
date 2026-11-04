@@ -1,5 +1,6 @@
 //! Watcher — poll Connect state, match rules, notify.
 
+mod auto_recover;
 mod diff;
 mod dispatch;
 mod poll_audit;
@@ -204,6 +205,8 @@ async fn tick(state: &AppState) -> Result<(), AppError> {
     .await?;
     let next = parse_connector_list(&v);
     let prev = state.connector_snapshots.read().await.clone();
+    // Restart tasks that died because something was briefly unreachable.
+    auto_recover::recover(state, &next).await;
 
     if prev.is_empty() && !next.is_empty() {
         *state.connector_snapshots.write().await = next;

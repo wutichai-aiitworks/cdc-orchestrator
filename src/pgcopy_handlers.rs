@@ -12,6 +12,7 @@ use crate::models::{
     ValidationResponse,
 };
 use crate::pgcopy::{self, profile_run_payload, require_postgres_pair};
+use crate::saved_secret::keep_password;
 use crate::AppState;
 
 fn actor_from_headers(headers: &HeaderMap) -> String {
@@ -147,12 +148,9 @@ pub async fn update_pgcopy_profile(
 
     let mut source = req.source;
     let mut target = req.target;
-    if source.password == "********" {
-        source.password = existing.source.password;
-    }
-    if target.password == "********" {
-        target.password = existing.target.password;
-    }
+    // Stored passwords stay with their login; an edited host must be given the password again.
+    keep_password("source", &mut source, Some(&existing.source))?;
+    keep_password("target", &mut target, Some(&existing.target))?;
 
     let profile = PgCopyProfile {
         id,
@@ -245,4 +243,27 @@ pub async fn validate_pgcopy_connection(
         message: "Connection fields look valid; run clone to verify replication privileges.".into(),
         timestamp: Utc::now(),
     }))
+}
+
+/// Connect from the pgcopy sidecar (where the tool runs) and describe the server. A failed
+/// connection is a normal answer (`ok: false`, `error`, `hint`).
+pub async fn test_pgcopy_connection(
+    State(state): State<AppState>,
+    Json(req): Json<crate::tool_sidecar::TestConnectionRequest>,
+) -> Result<Json<Value>, AppError> {
+    let stored = match req.profile_id {
+        Some(id) => Some(
+            state
+                .pgcopy_profiles
+                .get(id)
+                .await?
+                .map(|p| (p.source, p.target))
+                .ok_or_else(|| AppError::NotFound(format!("pgcopy profile {id} not found")))?,
+        ),
+        None => None,
+    };
+    let body = crate::tool_sidecar::test_body(req, stored)?;
+    Ok(Json(
+        pgcopy::test_connection(&state.config, &state.http, body).await?,
+    ))
 }

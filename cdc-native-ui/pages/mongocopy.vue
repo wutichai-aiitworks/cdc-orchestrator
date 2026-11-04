@@ -1,321 +1,159 @@
 <script setup lang="ts">
-import { Database, Play, RefreshCw, Save, Square, Trash2 } from "@lucide/vue"
-import {
-  defaultMongoCopyOptions,
-  type MongoCopyConn,
-  type MongoCopyJob,
-  type MongoCopyProfile,
-  useMongoCopy,
-} from "~/composables/useMongoCopy"
+import { transferTester } from "~/composables/useTransferTest"
+// Mongo copy (mongodump → mongorestore) on the shared Copy & Sync workspace.
+import { Database } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
-import { formatApiError } from "~/utils/apiError"
+import { defaultMongoCopyOptions, type MongoCopyConn, type MongoCopyJob, type MongoCopyProfile, useMongoCopy } from "~/composables/useMongoCopy"
+import * as rules from "~/utils/transferTools/mongocopy"
+import type { TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
 
-const toast = useToast()
-const {
-  fetchContract,
-  fetchCapability,
-  fetchProfiles,
-  createProfile,
-  updateProfile,
-  deleteProfile,
-  runProfile,
-  fetchJobs,
-  fetchJobLogs,
-  stopJob,
-  validateConnection,
-} = useMongoCopy()
+const api = useMongoCopy()
+const contract = ref<Record<string, unknown> | null>(null)
+onMounted(() => api.fetchContract().then((c) => (contract.value = c)).catch(() => {}))
 
-const emptyConn = (): MongoCopyConn => ({
-  type: "mongo",
-  host: "",
-  port: "27017",
-  database: "",
-  username: "",
-  password: "",
-  schema: "",
+const emptyConn = (): MongoCopyConn => ({ type: "mongodb", host: "", port: "27017", database: "", username: "", password: "" })
+const toPayload = (d: any) => ({
+  name: d.name.trim(),
+  source: { ...d.source, type: "mongodb" },
+  target: { ...d.target, type: "mongodb" },
+  include_collections: [...d.include_collections],
+  options: { ...d.options, auth_source: d.options.auth_source?.trim() || "" },
+})
+const test = transferTester("mongocopy")
+const end = (role: string, c: MongoCopyConn, overwrite?: string) => ({
+  engine: "mongodb",
+  role,
+  title: c.host,
+  detail: `${c.database || "all databases"}, port ${c.port || "27017"}`,
+  overwrite,
 })
 
-const profiles = ref<MongoCopyProfile[]>([])
-const jobs = ref<MongoCopyJob[]>([])
-const selectedId = ref("")
-const loading = ref(false)
-const saving = ref(false)
-const running = ref(false)
-const sidecarNote = ref("")
-const includeText = ref("")
-const logText = ref("")
-const logJobId = ref("")
-const error = ref("")
-const contractDefaults = ref<Record<string, unknown> | null>(null)
+/** ", PostgreSQL 17" once a connection test has run (the route then names the server). */
+const ver = (check: any, name: string) => (check?.ok && check.raw?.server_version ? `, ${name} ${String(check.raw.server_version).split(" ")[0]}` : "")
 
-const form = reactive({
-  name: "",
-  source: emptyConn(),
-  target: emptyConn(),
-  options: defaultMongoCopyOptions(),
-})
-
-const loadAll = async () => {
-  loading.value = true
-  error.value = ""
-  try {
-    const [cap, profs, jobList] = await Promise.all([
-      fetchCapability().catch(() => ({})),
-      fetchProfiles(),
-      fetchJobs(),
-    ])
-    sidecarNote.value = String((cap as any)?.service || "")
-    profiles.value = profs
-    jobs.value = jobList
-    if (!selectedId.value && profs.length) selectProfile(profs[0].id)
-  } catch (e: any) {
-    error.value = formatApiError(e, "Failed to load mongocopy")
-  } finally {
-    loading.value = false
-  }
+const tool: TransferTool<MongoCopyProfile, any, MongoCopyJob> = {
+  key: "mongocopy",
+  title: "Mongo copy",
+  icon: Database,
+  intro: "Copy MongoDB databases or collections from one server to another with mongodump and mongorestore.",
+  emptyText: "A transfer dumps a MongoDB database (or chosen collections) and restores it on another server, optionally under a new database name.",
+  namePlaceholder: "App data to staging",
+  api: {
+    fetchProfiles: api.fetchProfiles,
+    createProfile: api.createProfile,
+    updateProfile: api.updateProfile,
+    deleteProfile: api.deleteProfile,
+    runProfile: api.runProfile,
+    fetchJobs: api.fetchJobs,
+    fetchJobLogs: api.fetchJobLogs,
+    stopJob: api.stopJob,
+    fetchCapability: api.fetchCapability,
+  },
+  newDraft: () => ({
+    name: "",
+    source: emptyConn(),
+    target: emptyConn(),
+    include_collections: [],
+    options: applyContractOptionDefaults(defaultMongoCopyOptions(), contract.value ?? undefined),
+  }),
+  toDraft: (p) => ({
+    name: p.name,
+    source: { ...emptyConn(), ...p.source },
+    target: { ...emptyConn(), ...p.target },
+    include_collections: [...(p.include_collections || [])],
+    options: { ...defaultMongoCopyOptions(), ...p.options },
+  }),
+  toPayload,
+  changeLabels: rules.changeLabels,
+  verb: rules.verb,
+  startedToast: rules.startedToast,
+  modeLabel: (p) => (rules.renames(p) ? `Copy and rename to ${p.target.database}` : "MongoDB to MongoDB"),
+  runResult: rules.runResult,
+  steps: (p, job, log) => rules.steps(p, job, log),
+  summary: rules.summary,
+  effects: rules.effects,
+  problems: rules.problems,
+  // Runs before per-run job ids used the profile id as the job id.
+  jobsOf: (jobs, id) => jobs.filter((j) => (j.profile_id || j.id) === id),
+  routeSource: (p, checks) => end(`Source${ver(checks.source, "MongoDB")}`, p.source),
+  routeDestinations: (p, checks) => [end(`Target${ver(checks.target, "MongoDB")}`, p.target, p.options.drop ? "Replaces copied collections" : undefined)],
+  railRoute: (p) => `${p.source.host}/${p.source.database || "*"} → ${p.target.host}/${p.target.database || "*"}`,
+  railEngines: () => ["mongodb", "mongodb"],
+  sections: () => [
+    { id: "mc-source", label: "Source server" },
+    { id: "mc-target", label: "Target server" },
+    { id: "mc-scope", label: "What to copy" },
+    { id: "mc-behaviour", label: "Target behaviour" },
+  ],
+  capabilityLine: (c) => [c.mongodump_version, c.mongorestore_version].filter(Boolean).map((v) => String(v).split("\n")[0]).join(" · "),
 }
-
-const selectProfile = (id: string) => {
-  selectedId.value = id
-  const p = profiles.value.find((item) => item.id === id)
-  if (!p) return
-  form.name = p.name
-  form.source = { ...emptyConn(), ...p.source }
-  form.target = { ...emptyConn(), ...p.target }
-  form.options = { ...defaultMongoCopyOptions(), ...p.options }
-  includeText.value = (p.include_collections || []).join("\n")
-}
-
-const payloadFromForm = () => ({
-  name: form.name.trim(),
-  source: form.source,
-  target: form.target,
-  include_collections: includeText.value.split("\n").map((line) => line.trim()).filter(Boolean),
-  options: form.options,
-})
-
-const saveProfile = async () => {
-  if (!form.name.trim()) {
-    toast.error("Profile name is required")
-    return
-  }
-  saving.value = true
-  try {
-    const body = payloadFromForm()
-    if (selectedId.value) {
-      const updated = await updateProfile(selectedId.value, body)
-      const idx = profiles.value.findIndex((p) => p.id === updated.id)
-      if (idx >= 0) profiles.value[idx] = updated
-      toast.success("Profile saved")
-    } else {
-      const created = await createProfile(body as any)
-      profiles.value.push(created)
-      selectProfile(created.id)
-      toast.success("Profile created")
-    }
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    saving.value = false
-  }
-}
-
-const newProfile = () => {
-  selectedId.value = ""
-  form.name = ""
-  form.source = emptyConn()
-  form.target = emptyConn()
-  form.options = applyContractOptionDefaults(defaultMongoCopyOptions(), contractDefaults.value ?? undefined)
-  includeText.value = ""
-}
-
-const removeProfile = async () => {
-  if (!selectedId.value || !confirm("Delete this Mongo copy profile?")) return
-  try {
-    await deleteProfile(selectedId.value)
-    profiles.value = profiles.value.filter((p) => p.id !== selectedId.value)
-    newProfile()
-    toast.success("Profile deleted")
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const runSelected = async () => {
-  if (!selectedId.value) {
-    toast.error("Save a profile before running")
-    return
-  }
-  running.value = true
-  try {
-    await saveProfile()
-    const job = await runProfile(selectedId.value)
-    toast.success(`Copy job started (${job.id})`)
-    await loadAll()
-    if (job.id) await showLogs(job.id)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    running.value = false
-  }
-}
-
-const showLogs = async (jobId: string) => {
-  logJobId.value = jobId
-  try {
-    logText.value = (await fetchJobLogs(jobId)).log || ""
-  } catch (e: any) {
-    logText.value = formatApiError(e, "Failed to load logs")
-  }
-}
-
-const stopRunningJob = async (jobId: string) => {
-  try {
-    await stopJob(jobId)
-    toast.success("Stop requested")
-    await loadAll()
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const testConn = async (which: "source" | "target") => {
-  try {
-    const res = await validateConnection(which === "source" ? form.source : form.target)
-    toast[res.valid ? "success" : "error"](res.message)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-let pollTimer: ReturnType<typeof setInterval> | null = null
-onMounted(() => {
-  fetchContract().then((c) => { contractDefaults.value = c }).catch(() => {})
-  loadAll()
-  pollTimer = setInterval(() => {
-    fetchJobs().then((j) => (jobs.value = j)).catch(() => {})
-    if (logJobId.value) showLogs(logJobId.value)
-  }, 8000)
-})
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
-})
+const CHECK_NOTE = "Tested from the mongocopy container, the same way a run connects."
 </script>
 
 <template>
-  <div class="space-y-6 animate-fade-in">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-xl font-semibold text-foreground flex items-center gap-2">
-          <Database class="h-5 w-5 text-primary" />
-          Mongo copy
-        </h1>
-        <div class="mt-1 flex items-center gap-1.5">
-          <span class="text-sm font-medium text-foreground">mongodump → mongorestore</span>
-          <AppInfoHint
-            :text="`MongoDB to MongoDB clone. Users never run mongodump or mongorestore.${sidecarNote ? ` ${sidecarNote}.` : ''}`"
-          />
-        </div>
-      </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap inline-flex items-center gap-2" @click="loadAll">
-          <RefreshCw class="h-4 w-4" :class="loading ? 'animate-spin' : ''" />
-          Refresh
-        </button>
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap" @click="newProfile">New profile</button>
-      </div>
-    </div>
+  <TransferWorkspace :tool="tool">
+    <template #config="{ draft, checks, savedLogin, selectedId, isNew }">
+      <TransferSection id="mc-source" title="Source server" why="The MongoDB server to copy from. Leave the database empty to copy every database. A user with the backup role is enough.">
+        <TransferConnection
+          :key="`src-${selectedId}`"
+          v-model="draft.source"
+          v-model:result="checks.source"
+          engine="mongodb"
+          default-port="27017"
+          host-placeholder="mongo.example.internal"
+          :database="{ label: 'Database', placeholder: 'All databases' }"
+          username-optional
+          username-placeholder="backup"
+          :check="test('source', () => ({ auth_source: draft.options.auth_source }), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :watch-key="draft.options.auth_source"
+          :saved-login="savedLogin('source', '27017')"
+          :start-editing="isNew || !draft.source.host"
+        />
+      </TransferSection>
 
-    <p v-if="error" class="alert-error text-sm">{{ error }}</p>
+      <TransferSection id="mc-target" title="Target server" why="Where the copy is restored. A different database name renames everything into it.">
+        <TransferConnection
+          :key="`tgt-${selectedId}`"
+          v-model="draft.target"
+          v-model:result="checks.target"
+          engine="mongodb"
+          default-port="27017"
+          host-placeholder="mongo-staging.example.internal"
+          :database="{ label: 'Database', placeholder: 'Same as source' }"
+          username-optional
+          username-placeholder="restore"
+          :check="test('target', () => ({ auth_source: draft.options.auth_source }), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :watch-key="draft.options.auth_source"
+          :saved-login="savedLogin('target', '27017')"
+          :start-editing="isNew || !draft.target.host"
+        />
+        <label class="block max-w-xs">
+          <span class="auth-label !mb-1.5">Authentication database</span>
+          <input v-model="draft.options.auth_source" class="auth-input" placeholder="admin" spellcheck="false" />
+          <span class="mt-1 block text-xs text-muted-foreground">Where the users are defined, on both servers. Usually admin.</span>
+        </label>
+      </TransferSection>
 
-    <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
-      <aside class="xl:col-span-3 card p-4 space-y-2">
-        <h2 class="text-sm font-medium text-muted-foreground">Saved profiles</h2>
-        <button
-          v-for="p in profiles"
-          :key="p.id"
-          type="button"
-          class="w-full text-left rounded-xl px-3 py-2 text-sm border transition-colors"
-          :class="selectedId === p.id ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/40'"
-          @click="selectProfile(p.id)"
-        >
-          <div class="font-medium truncate">{{ p.name }}</div>
-          <div class="text-xs text-muted-foreground truncate">{{ p.source.host }} → {{ p.target.host }}</div>
-        </button>
-        <p v-if="!profiles.length" class="text-sm text-muted-foreground italic">No profiles yet.</p>
-      </aside>
+      <TransferSection id="mc-scope" title="What to copy" why="Leave empty to copy every collection. Picking collections turns off renaming into a different database.">
+        <TransferTokens v-model="draft.include_collections" label="Only these collections" help="collection, or database.collection" placeholder="All collections" />
+        <p v-if="rules.renames(draft)" class="text-xs text-muted-foreground">
+          Everything in {{ draft.source.database }} is restored into {{ draft.target.database }}.
+        </p>
+        <TransferSwitch v-model="draft.options.gzip" label="Compress the archive" help="Smaller and usually faster over the network. Both tools handle it automatically." />
+      </TransferSection>
 
-      <section class="xl:col-span-9 space-y-4">
-        <div class="card p-5 space-y-4">
-          <input v-model="form.name" type="text" placeholder="Profile name" class="auth-input w-full" />
-          <div class="grid md:grid-cols-2 gap-4">
-            <div v-for="side in (['source', 'target'] as const)" :key="side" class="space-y-2 rounded-xl border border-border p-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold capitalize">{{ side }}</h3>
-                <button type="button" class="text-xs text-primary underline" @click="testConn(side)">Validate</button>
-              </div>
-              <input v-model="form[side].host" class="auth-input w-full" placeholder="Host" />
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model="form[side].port" class="auth-input" placeholder="Port" />
-                <input v-model="form[side].database" class="auth-input" placeholder="Database" />
-              </div>
-              <input v-model="form[side].username" class="auth-input w-full" placeholder="Username" />
-              <input v-model="form[side].password" type="password" class="auth-input w-full" placeholder="Password" />
-            </div>
-          </div>
-          <div>
-            <label class="auth-label">Include collections (optional, one per line: db.collection or collection)</label>
-            <textarea v-model="includeText" rows="3" class="auth-input w-full font-mono text-xs" />
-          </div>
-          <div class="grid sm:grid-cols-3 gap-3">
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.gzip" type="checkbox" class="rounded border-border" /> gzip archive</label>
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.drop" type="checkbox" class="rounded border-border" /> Drop collections on restore</label>
-            <label class="text-xs text-muted-foreground">Auth source
-              <input v-model="form.options.auth_source" class="auth-input w-full mt-1" placeholder="admin" />
-            </label>
-          </div>
-          <div class="flex flex-wrap gap-2 pt-2">
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="saving" @click="saveProfile">
-              <Save class="h-4 w-4" /> Save
-            </button>
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="running || !selectedId" @click="runSelected">
-              <Play class="h-4 w-4" /> Run copy
-            </button>
-            <button v-if="selectedId" type="button" class="btn-secondary inline-flex items-center gap-2" @click="removeProfile">
-              <Trash2 class="h-4 w-4" /> Delete
-            </button>
-          </div>
-        </div>
-        <div class="card p-5 space-y-3">
-          <h2 class="text-sm font-semibold">Jobs</h2>
-          <table class="data-table w-full text-sm">
-            <thead>
-              <tr class="text-left text-muted-foreground">
-                <th class="p-2">ID</th>
-                <th class="p-2">Status</th>
-                <th class="p-2">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="job in jobs" :key="job.id" class="border-t border-border">
-                <td class="p-2 font-mono text-xs">{{ job.id.slice(0, 8) }}…</td>
-                <td class="p-2">
-                  <span class="badge-neutral" :class="{ 'badge-success': job.status === 'succeeded', 'badge-error': job.status === 'failed', 'badge-warning': job.status === 'running' }">{{ job.status }}</span>
-                </td>
-                <td class="p-2 flex gap-2">
-                  <button type="button" class="text-xs text-primary underline" @click="showLogs(job.id)">Logs</button>
-                  <button v-if="job.status === 'running'" type="button" class="text-xs text-red-400 inline-flex items-center gap-1" @click="stopRunningJob(job.id)">
-                    <Square class="h-3 w-3" /> Stop
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <pre v-if="logText" class="code-block text-xs max-h-80 overflow-auto whitespace-pre-wrap">{{ logText }}</pre>
-        </div>
-      </section>
-    </div>
-  </div>
+      <TransferSection id="mc-behaviour" title="Target behaviour" why="What happens to collections that already exist on the target.">
+        <TransferSwitch
+          v-model="draft.options.drop"
+          label="Replace copied collections"
+          help="Each copied collection is dropped on the target before it is restored. Off: documents are added; ones whose _id already exists are skipped and reported."
+          danger
+        />
+      </TransferSection>
+    </template>
+  </TransferWorkspace>
 </template>

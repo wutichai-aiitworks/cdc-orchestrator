@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""HTTP sidecar to run pgloader jobs (MySQL/SQL Server/SQLite/CSV → Postgres)."""
+"""HTTP sidecar for Load to Postgres (pgloader). Contract: sidecar_common/http_api.py.
+
+One job per run (history per transfer). The load file carries the connection URIs, so it is a
+0600 file deleted as soon as the run ends; pgloader's own log prints connections without passwords.
+"""
 
 from __future__ import annotations
 
-import json
+import csv
 import os
-import signal
+import sqlite3
 import subprocess
-import threading
-import uuid
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sidecar_common"))  # local tests
+
+from http_api import Tool, serve  # noqa: E402
+from jobstore import JobStore, fmt_bytes, plural, probe, utc_now, write_secret  # noqa: E402
+from probes import BadRequest, describe, hint_for, norm_conn, pg_test  # noqa: E402
 
 WORK_ROOT = Path(os.environ.get("PGLOADER_WORK_ROOT", "/var/lib/pgloader"))
 JOBS_DIR = WORK_ROOT / "jobs"
 API_TOKEN = os.environ.get("PGLOADER_API_TOKEN", "").strip()
 HOST = os.environ.get("PGLOADER_API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PGLOADER_API_PORT", "8087"))
+PGLOADER = os.environ.get("PGLOADER_BIN", "pgloader")
+RETAIN = int(os.environ.get("PGLOADER_RETAIN_RUNS", "10"))
+
+STORE = JobStore(JOBS_DIR, "pgloader.log", retain_per_profile=RETAIN)
 
 SOURCE_ALIASES = {
     "mysql": "mysql",
@@ -29,32 +41,6 @@ SOURCE_ALIASES = {
     "sqlite": "sqlite",
     "csv": "csv",
 }
-
-_lock = threading.Lock()
-_procs: dict[str, subprocess.Popen[Any]] = {}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def job_dir(job_id: str) -> Path:
-    return JOBS_DIR / job_id
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-    tmp.replace(path)
 
 
 def conn_type(conn: dict[str, Any]) -> str:
@@ -152,254 +138,131 @@ def write_load_file(work: Path, body: dict[str, Any]) -> Path:
             lines.append(f"     INCLUDING ONLY TABLE NAMES MATCHING {matched}")
         lines.append(";")
 
-    path = work / "load.load"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return path
+    # The load file holds the connection URIs (with passwords): 0600, deleted when the run ends.
+    return write_secret(work / "load.load", "\n".join(lines) + "\n")
 
 
-def job_status(job_id: str) -> dict[str, Any]:
-    meta_path = job_dir(job_id) / "job.json"
-    meta = read_json(meta_path)
-    if not meta:
-        return {"id": job_id, "status": "unknown"}
 
-    with _lock:
-        proc = _procs.get(job_id)
-
-    if proc is not None:
-        code = proc.poll()
-        if code is None:
-            meta["status"] = "running"
-        else:
-            meta["status"] = "succeeded" if code == 0 else "failed"
-            meta["exit_code"] = code
-            meta["finished_at"] = utc_now()
-            write_json(meta_path, meta)
-            _procs.pop(job_id, None)
-    elif meta.get("status") == "running":
-        meta["status"] = "failed"
-        meta["error"] = meta.get("error") or "process not found"
-        meta["finished_at"] = utc_now()
-        write_json(meta_path, meta)
-
-    meta["id"] = job_id
-    return meta
-
-
-def tail_log(path: Path, max_bytes: int = 256_000) -> str:
-    if not path.is_file():
-        return ""
-    data = path.read_bytes()
-    if len(data) > max_bytes:
-        data = data[-max_bytes:]
-    return data.decode("utf-8", errors="replace")
+def cleanup_secrets(work: Path) -> None:
+    (work / "load.load").unlink(missing_ok=True)
 
 
 def start_job(body: dict[str, Any]) -> dict[str, Any]:
-    job_id = str(body.get("id") or uuid.uuid4())
-    work = job_dir(job_id)
-    work.mkdir(parents=True, exist_ok=True)
-    load_path = write_load_file(work, body)
-    argv = ["pgloader", str(load_path)]
-    log_path = work / "load.log"
-    meta = {
-        "id": job_id,
-        "name": body.get("name") or job_id,
-        "status": "starting",
-        "created_at": utc_now(),
-        "started_at": utc_now(),
-        "argv": ["pgloader", "load.load"],
-        "log_path": str(log_path),
-    }
-    write_json(work / "job.json", meta)
-
-    with log_path.open("ab") as log_fh:
-        log_fh.write(f"\n--- pgloader job {job_id} at {utc_now()} ---\n".encode())
-        proc = subprocess.Popen(
-            argv,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=str(work),
-            start_new_session=True,
-        )
-
-    with _lock:
-        _procs[job_id] = proc
-    meta["status"] = "running"
-    meta["pid"] = proc.pid
-    write_json(work / "job.json", meta)
-    return meta
-
-
-def stop_job(job_id: str) -> dict[str, Any]:
-    with _lock:
-        proc = _procs.get(job_id)
-    if proc is None or proc.poll() is not None:
-        meta = job_status(job_id)
-        if meta.get("status") == "running":
-            meta["status"] = "stopped"
-            meta["finished_at"] = utc_now()
-            write_json(job_dir(job_id) / "job.json", meta)
-        return meta
+    if not conn_type(body.get("source") or {}):
+        raise BadRequest("source.type is required")
+    job_id, work, meta = STORE.new_job(body)
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    meta = job_status(job_id)
-    meta["status"] = "stopped"
-    meta["finished_at"] = utc_now()
-    write_json(job_dir(job_id) / "job.json", meta)
-    with _lock:
-        _procs.pop(job_id, None)
-    return meta
+        load_file = write_load_file(work, body)
+    except ValueError as exc:
+        STORE.fail_start(job_id, str(exc))
+        raise BadRequest(str(exc)) from None
+    argv = [PGLOADER, str(load_file)]
+    STORE.update(job_id, argv=[PGLOADER, "load.load"], source_type=conn_type(body.get("source") or {}))
+    header = f"\n--- pgloader job {job_id} at {utc_now()} ---\n"
+    try:
+        return STORE.spawn(job_id, argv, header=header, on_exit=lambda jid, code: cleanup_secrets(work))
+    except Exception as exc:
+        cleanup_secrets(work)
+        STORE.fail_start(job_id, f"{type(exc).__name__}: {exc}")
+        raise
 
 
-def list_jobs() -> list[dict[str, Any]]:
-    if not JOBS_DIR.is_dir():
-        return []
-    return [job_status(child.name) for child in sorted(JOBS_DIR.iterdir(), key=lambda p: p.name, reverse=True) if child.is_dir()]
+# ── connection tests ────────────────────────────────────────────────────────
 
 
-CAPABILITY = {
-    "service": "cdc-pgloader",
-    "command": "pgloader",
-    "source_types": ["mysql", "mariadb", "mssql", "sqlserver", "sqlite", "csv"],
-    "target_types": ["postgres", "postgresql"],
-    "options": {
-        "booleans": ["drop_if_exists", "create_tables", "create_indexes", "reset_sequences", "truncate"],
-        "integers": ["workers", "concurrency", "csv_skip_header"],
-        "strings": ["target_table", "csv_delimiter"],
-    },
-    "connection_fields": ["type", "host", "port", "database", "username", "password"],
-    "include_tables": "Optional table names; empty means all tables. CSV uses options.target_table.",
-}
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def _auth_ok(self) -> bool:
-        if not API_TOKEN:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == API_TOKEN:
-            return True
-        return self.headers.get("X-API-Token", "").strip() == API_TOKEN
-
-    def _json(self, code: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length else b"{}"
+def test_file(conn: dict[str, Any], kind: str, options: dict[str, Any]) -> dict[str, Any]:
+    path = Path(file_path(conn))
+    if not str(path):
+        raise BadRequest("a file path is required")
+    target = str(path)
+    if not path.is_file():
+        return {"ok": False, "target": target, "error": f"{path} does not exist inside the pgloader container",
+                "hint": "Put the file on a volume mounted into cdc-pgloader and use its path inside the container."}
+    if not os.access(path, os.R_OK):
+        return {"ok": False, "target": target, "error": f"{path} is not readable", "hint": "Make the file readable by the sidecar's user."}
+    size = fmt_bytes(path.stat().st_size)
+    if kind == "sqlite":
         try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            return {}
-
-    def do_GET(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/") or "/"
-        if path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if path == "/v1/discover":
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
             try:
-                ver = subprocess.check_output(["pgloader", "--version"], text=True).strip().splitlines()[0]
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                ver = "unknown"
-            self._json(
-                200,
-                {
-                    "contract_version": "1",
-                    "tool_id": "pgloader",
-                    "service": CAPABILITY["service"],
-                    "sidecar_ready": True,
-                    "orchestrator_contract": "/cdc/pgloader/contract",
-                    "pgloader_version": ver,
-                    "options": CAPABILITY["options"],
-                },
-            )
-            return
-        if path == "/v1/capability":
-            out = dict(CAPABILITY)
-            try:
-                out["pgloader_version"] = subprocess.check_output(
-                    ["pgloader", "--version"], text=True
-                ).strip().splitlines()[0]
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                out["pgloader_version"] = "unknown"
-            self._json(200, out)
-            return
-        if path == "/v1/jobs":
-            self._json(200, {"jobs": list_jobs()})
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/logs"):
-            job_id = path.split("/")[3]
-            self._json(200, {"id": job_id, "log": tail_log(job_dir(job_id) / "load.log")})
-            return
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            meta = job_status(job_id)
-            if meta.get("status") == "unknown":
-                self._json(404, {"error": "job not found"})
-                return
-            self._json(200, meta)
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path == "/v1/jobs":
-            body = self._read_body()
-            if not body.get("source") or not body.get("target"):
-                self._json(400, {"error": "source and target are required"})
-                return
-            try:
-                meta = start_job(body)
-            except ValueError as exc:
-                self._json(400, {"error": str(exc)})
-                return
-            except OSError as exc:
-                self._json(500, {"error": str(exc)})
-                return
-            self._json(202, meta)
-            return
-        if path.startswith("/v1/jobs/") and path.endswith("/stop"):
-            self._json(200, stop_job(path.split("/")[3]))
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_DELETE(self) -> None:
-        if not self._auth_ok():
-            self._json(401, {"error": "unauthorized"})
-            return
-        path = urlparse(self.path).path.rstrip("/")
-        if path.startswith("/v1/jobs/"):
-            job_id = path.split("/")[-1]
-            stop_job(job_id)
-            self._json(200, {"id": job_id, "status": "stopped"})
-            return
-        self._json(404, {"error": "not found"})
+                tables = db.execute("select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%'").fetchone()[0]
+            finally:
+                db.close()
+        except sqlite3.DatabaseError as exc:
+            return {"ok": False, "target": target, "error": str(exc), "hint": "The file is not a SQLite database."}
+        return {"ok": True, "target": target, "facts": [f"SQLite file, {size}", plural(tables, "table")]}
+    delimiter = str(options.get("csv_delimiter") or ",")[:1]
+    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
+        rows = []
+        for row in csv.reader(fh, delimiter=delimiter):
+            rows.append(row)
+            if len(rows) >= 2:
+                break
+    if not rows:
+        return {"ok": False, "target": target, "error": "the file is empty", "hint": None}
+    cols = len(rows[0])
+    out: dict[str, Any] = {"ok": True, "target": target, "facts": [f"CSV file, {size}", plural(cols, "column")]}
+    if cols == 1 and delimiter not in rows[0][0] and any(d in rows[0][0] for d in ",;\t|"):
+        out["warning"] = f"Only one column is found with the separator “{delimiter}”. The file may use a different separator."
+    elif rows:
+        out["facts"].append("first line: " + ", ".join(rows[0][:6]) + (" …" if cols > 6 else ""))
+    return out
 
 
-def main() -> None:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"cdc-pgloader listening on {HOST}:{PORT}", flush=True)
-    server.serve_forever()
+def test_database_source(conn: dict[str, Any], kind: str) -> dict[str, Any]:
+    """pgloader --dry-run opens each connection with the same driver a load uses; the target is
+    a dummy, and the source's own Success/Failed line is the answer."""
+    default_port = "3306" if kind == "mysql" else "1433"
+    c = norm_conn(conn, default_port=default_port)
+    scheme = "mysql" if kind == "mysql" else "mssql"
+    with tempfile.TemporaryDirectory(dir=WORK_ROOT) as tmp:
+        load = write_secret(Path(tmp) / "probe.load",
+                            f"LOAD DATABASE FROM {sql_uri(scheme, c, default_port)} INTO postgresql://probe@127.0.0.1:1/probe;\n")
+        res = probe([PGLOADER, "--dry-run", str(load)], timeout=40, cwd=tmp)
+    text = (res.get("stdout") or "") + "\n" + (res.get("error") or "")
+    marker = "#<MYSQL-CONNECTION" if kind == "mysql" else "#<MSSQL-CONNECTION"
+    for line in text.splitlines():
+        if marker in line and "Success, opened" in line:
+            return {"ok": True, "target": describe(c), "latency_ms": res.get("latency_ms"),
+                    "facts": [("MySQL" if kind == "mysql" else "SQL Server") + " login accepted", f"{res.get('latency_ms')} ms"]}
+        if marker in line and "Failed to connect" in line:
+            reason = line.split(">: ", 1)[-1].strip()
+            return {"ok": False, "target": describe(c), "error": reason[:600], "hint": hint_for(reason)}
+    return {"ok": False, "target": describe(c), "error": (res.get("error") or text).strip()[-600:] or "no answer from pgloader", "hint": hint_for(text)}
 
+
+def test_connection(body: dict[str, Any]) -> dict[str, Any]:
+    side = body.get("side") or "source"
+    conn = body.get("connection") or {}
+    options = body.get("options") or {}
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    if side == "target":
+        return pg_test(conn, tmp_root=WORK_ROOT, dump_client=None)
+    kind = conn_type(conn)
+    if kind in ("csv", "sqlite"):
+        return test_file(conn, kind, options)
+    if kind in ("mysql", "mssql"):
+        return test_database_source(conn, kind)
+    raise BadRequest(f"unsupported source type: {kind or '(empty)'}")
+
+
+def capability() -> dict[str, Any]:
+    try:
+        ver = subprocess.check_output([PGLOADER, "--version"], text=True, timeout=10).strip()
+    except (OSError, subprocess.SubprocessError):
+        ver = "unknown"
+    return {
+        "source_types": sorted(set(SOURCE_ALIASES.values())),
+        "connection_fields": ["type", "host", "port", "database", "username", "password"],
+        "include_tables": "Optional table name patterns (INCLUDING ONLY TABLE NAMES MATCHING)",
+        "retain_runs_per_profile": RETAIN,
+        "pgloader_version": ver,
+    }
+
+
+TOOL = Tool(tool_id="pgloader", service="cdc-pgloader", store=STORE, capability=capability, start=start_job,
+            test=test_connection, api_token=API_TOKEN)
 
 if __name__ == "__main__":
-    main()
+    STORE.recover_on_start(cleanup_secrets)
+    serve(TOOL, HOST, PORT)

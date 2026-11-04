@@ -5,8 +5,8 @@
 #   RUN_SMOKE=1 ./testops.sh
 #   RUN_SMOKE=1 SMOKE_BASE_URL=http://127.0.0.1:9788 ./testops.sh
 #
-# Mirrors .woodpecker/test.yml. rdkafka's cmake-build feature needs cmake
-# and a C toolchain, same as that workflow. Smoke needs a running orchestrator.
+# Mirrors the rust steps in .woodpecker/main-ci.yml. rdkafka's cmake-build
+# feature needs cmake and a C toolchain, same as CI. Smoke needs a running orchestrator.
 set -euo pipefail
 cd "$(dirname "$0")"
 

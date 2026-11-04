@@ -1329,7 +1329,10 @@ mod tests {
 
     #[test]
     fn list_arg_accepts_arrays_and_csv() {
-        assert_eq!(list_arg(&json!({"t": ["a", " b ", ""]}), "t"), vec!["a", "b"]);
+        assert_eq!(
+            list_arg(&json!({"t": ["a", " b ", ""]}), "t"),
+            vec!["a", "b"]
+        );
         assert_eq!(list_arg(&json!({"t": "a, b,,c"}), "t"), vec!["a", "b", "c"]);
         assert!(list_arg(&json!({}), "t").is_empty());
         assert!(list_arg(&json!({"t": 5}), "t").is_empty());
@@ -1374,7 +1377,13 @@ mod tests {
         assert_eq!(stream["stream_platform"], "redpanda");
 
         let mut lake = json!({});
-        attach_pipeline_destination(&mut lake, &json!({"lake_zone": "silver"}), "source_to_lake", "orders").unwrap();
+        attach_pipeline_destination(
+            &mut lake,
+            &json!({"lake_zone": "silver"}),
+            "source_to_lake",
+            "orders",
+        )
+        .unwrap();
         assert!(lake["target"].is_null());
         assert_eq!(lake["lake"]["name"], "orders-lake");
         assert_eq!(lake["lake"]["change_mode"], "upsert");
@@ -1384,16 +1393,26 @@ mod tests {
     fn lake_change_mode_defaults_by_zone() {
         assert_eq!(lake_change_mode(&json!({}), "bronze"), "changelog");
         assert_eq!(lake_change_mode(&json!({}), "silver"), "upsert");
-        assert_eq!(lake_change_mode(&json!({"lake_change_mode": "append"}), "silver"), "append");
+        assert_eq!(
+            lake_change_mode(&json!({"lake_change_mode": "append"}), "silver"),
+            "append"
+        );
     }
 
     #[test]
     fn every_prompt_has_description_and_messages() {
         for p in prompts().as_array().unwrap() {
             let name = p["name"].as_str().unwrap();
-            assert_ne!(prompt_description(name), "CDC prompt", "{name} lacks a description");
+            assert_ne!(
+                prompt_description(name),
+                "CDC prompt",
+                "{name} lacks a description"
+            );
             let args = json!({"table_or_topic": "orders", "name": "p1"});
-            assert!(prompt_messages(name, &args).is_ok(), "{name} prompt_messages failed");
+            assert!(
+                prompt_messages(name, &args).is_ok(),
+                "{name} prompt_messages failed"
+            );
         }
     }
 }

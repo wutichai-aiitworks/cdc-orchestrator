@@ -5,10 +5,12 @@ mod config;
 mod connector_catalog;
 mod connector_meta;
 mod connector_parse;
+mod diagnose;
 mod engine;
 mod error;
 mod handlers;
 mod incremental_cdc;
+mod initial_load;
 mod kafka_admin;
 mod kafka_topics;
 mod lake;
@@ -20,6 +22,8 @@ mod mongocopy_handlers;
 mod ops;
 mod pgcopy;
 mod pgcopy_handlers;
+mod pgdump;
+mod pgdump_handlers;
 mod pgloader;
 mod pgloader_handlers;
 mod postgres_trigger_cdc;
@@ -28,7 +32,12 @@ mod profile_table_status;
 mod reconcile;
 mod redisshake;
 mod redisshake_handlers;
+mod rsync;
+mod rsync_handlers;
+mod saved_secret;
+mod split;
 mod store;
+mod tool_sidecar;
 mod trigger_cdc;
 mod watcher;
 
@@ -36,8 +45,8 @@ use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::models::AlertHistory;
 use crate::store::{
-    CompareProfileStore, MongoCopyProfileStore, PgCopyProfileStore, PgLoaderProfileStore,
-    ProfileStore, RedisShakeProfileStore,
+    CompareProfileStore, MongoCopyProfileStore, PgCopyProfileStore, PgDumpProfileStore,
+    PgLoaderProfileStore, ProfileStore, RedisShakeProfileStore, RsyncProfileStore,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -75,6 +84,8 @@ pub struct AppState {
     pub redisshake_profiles: RedisShakeProfileStore,
     pub pgloader_profiles: PgLoaderProfileStore,
     pub mongocopy_profiles: MongoCopyProfileStore,
+    pub pgdump_profiles: PgDumpProfileStore,
+    pub rsync_profiles: RsyncProfileStore,
     pub rqlite: Option<RqliteClient>,
     pub history: Arc<RwLock<AlertHistory>>,
     pub alerts_tx: broadcast::Sender<String>,
@@ -85,6 +96,8 @@ pub struct AppState {
     pub audit_redis: Option<ConnectionManager>,
     pub poll_audit_clock: PollAuditClock,
     pub poll_audit_offsets: PollAuditOffsets,
+    /// Background initial loads, keyed by profile id (in memory, this instance only).
+    pub initial_loads: initial_load::InitialLoadRegistry,
 }
 
 async fn open_rqlite(config: &AppConfig) -> Option<RqliteClient> {
@@ -132,7 +145,9 @@ async fn rqlite_after_connect(
             }
             Err(e) => {
                 if config.require_persistence {
-                    eprintln!("FATAL: rqlite schema init failed under ORCH_REQUIRE_PERSISTENCE: {e}");
+                    eprintln!(
+                        "FATAL: rqlite schema init failed under ORCH_REQUIRE_PERSISTENCE: {e}"
+                    );
                     std::process::exit(1);
                 }
                 warn!(error = %e, "rqlite schema init failed; memory-only configuration");
@@ -187,6 +202,8 @@ async fn main() {
         redisshake_profiles: RedisShakeProfileStore::new(rqlite.clone()),
         pgloader_profiles: PgLoaderProfileStore::new(rqlite.clone()),
         mongocopy_profiles: MongoCopyProfileStore::new(rqlite.clone()),
+        pgdump_profiles: PgDumpProfileStore::new(rqlite.clone()),
+        rsync_profiles: RsyncProfileStore::new(rqlite.clone()),
         rqlite: rqlite.clone(),
         history: Arc::new(RwLock::new(AlertHistory::new(config.history_capacity))),
         alerts_tx,
@@ -197,6 +214,7 @@ async fn main() {
         audit_redis,
         poll_audit_clock: Arc::new(RwLock::new(HashMap::new())),
         poll_audit_offsets: Arc::new(RwLock::new(HashMap::new())),
+        initial_loads: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let legacy = Router::new()
@@ -293,6 +311,10 @@ async fn main() {
             "/profiles/catalog/target/table",
             post(handlers::inspect_target_table),
         )
+        .route(
+            "/profiles/catalog/target/ddl",
+            post(handlers::create_target_tables),
+        )
         .route("/profiles/validate/target", post(handlers::validate_target))
         .route("/profiles/validate/lake", post(handlers::validate_lake))
         .route("/profiles/:id", get(handlers::get_profile))
@@ -310,6 +332,13 @@ async fn main() {
             "/profiles/:id/actions/:action",
             post(handlers::profile_action),
         )
+        .route(
+            "/profiles/:id/initial-load",
+            post(handlers::start_initial_load)
+                .get(handlers::get_initial_load)
+                .delete(handlers::cancel_initial_load),
+        )
+        .route("/profiles/:id/split", post(handlers::split_profile))
         .route(
             "/processing-pipelines",
             get(processing_api::list_pipelines).post(processing_api::create_pipeline),
@@ -478,6 +507,10 @@ async fn main() {
             "/profiles/catalog/target/table",
             post(handlers::inspect_target_table),
         )
+        .route(
+            "/profiles/catalog/target/ddl",
+            post(handlers::create_target_tables),
+        )
         .route("/profiles/validate/target", post(handlers::validate_target))
         .route("/profiles/validate/lake", post(handlers::validate_lake))
         .route("/profiles/:id", get(handlers::get_profile))
@@ -495,6 +528,13 @@ async fn main() {
             "/profiles/:id/actions/:action",
             post(handlers::profile_action),
         )
+        .route(
+            "/profiles/:id/initial-load",
+            post(handlers::start_initial_load)
+                .get(handlers::get_initial_load)
+                .delete(handlers::cancel_initial_load),
+        )
+        .route("/profiles/:id/split", post(handlers::split_profile))
         .route(
             "/processing-pipelines",
             get(processing_api::list_pipelines).post(processing_api::create_pipeline),
@@ -608,6 +648,10 @@ async fn main() {
             post(pgcopy_handlers::validate_pgcopy_connection),
         )
         .route(
+            "/pgcopy/test-connection",
+            post(pgcopy_handlers::test_pgcopy_connection),
+        )
+        .route(
             "/redisshake/discover",
             get(migration_tools_handlers::redisshake_discover),
         )
@@ -655,6 +699,10 @@ async fn main() {
             post(redisshake_handlers::validate_redisshake_connection),
         )
         .route(
+            "/redisshake/test-connection",
+            post(redisshake_handlers::test_redisshake_connection),
+        )
+        .route(
             "/pgloader/discover",
             get(migration_tools_handlers::pgloader_discover),
         )
@@ -700,6 +748,10 @@ async fn main() {
         .route(
             "/pgloader/validate",
             post(pgloader_handlers::validate_pgloader_connection),
+        )
+        .route(
+            "/pgloader/test-connection",
+            post(pgloader_handlers::test_pgloader_connection),
         )
         .route(
             "/mongocopy/discover",
@@ -750,6 +802,115 @@ async fn main() {
         .route(
             "/mongocopy/validate",
             post(mongocopy_handlers::validate_mongocopy_connection),
+        )
+        .route(
+            "/mongocopy/test-connection",
+            post(mongocopy_handlers::test_mongocopy_connection),
+        )
+        .route(
+            "/pgdump/discover",
+            get(migration_tools_handlers::pgdump_discover),
+        )
+        .route(
+            "/pgdump/contract",
+            get(migration_tools_handlers::pgdump_contract),
+        )
+        .route(
+            "/pgdump/capability",
+            get(pgdump_handlers::pgdump_capability),
+        )
+        .route(
+            "/pgdump/test-connection",
+            post(pgdump_handlers::test_pgdump_connection),
+        )
+        .route("/pgdump/jobs", get(pgdump_handlers::list_pgdump_jobs))
+        .route(
+            "/pgdump/jobs/:job_id",
+            get(pgdump_handlers::get_pgdump_job).delete(pgdump_handlers::delete_pgdump_job),
+        )
+        .route(
+            "/pgdump/jobs/:job_id/logs",
+            get(pgdump_handlers::pgdump_job_logs),
+        )
+        .route(
+            "/pgdump/jobs/:job_id/stop",
+            post(pgdump_handlers::stop_pgdump_job),
+        )
+        .route(
+            "/pgdump/jobs/:job_id/file",
+            get(pgdump_handlers::download_pgdump_file),
+        )
+        .route(
+            "/pgdump/jobs/:job_id/send",
+            post(pgdump_handlers::send_pgdump_file),
+        )
+        .route(
+            "/pgdump/profiles",
+            get(pgdump_handlers::list_pgdump_profiles).post(pgdump_handlers::create_pgdump_profile),
+        )
+        .route(
+            "/pgdump/profiles/:id",
+            get(pgdump_handlers::get_pgdump_profile)
+                .put(pgdump_handlers::update_pgdump_profile)
+                .delete(pgdump_handlers::delete_pgdump_profile),
+        )
+        .route(
+            "/pgdump/profiles/:id/run",
+            post(pgdump_handlers::run_pgdump_profile),
+        )
+        .route(
+            "/pgdump/validate",
+            post(pgdump_handlers::validate_pgdump_connection),
+        )
+        .route(
+            "/rsync/discover",
+            get(migration_tools_handlers::rsync_discover),
+        )
+        .route(
+            "/rsync/contract",
+            get(migration_tools_handlers::rsync_contract),
+        )
+        .route("/rsync/capability", get(rsync_handlers::rsync_capability))
+        .route(
+            "/rsync/test-connection",
+            post(rsync_handlers::test_rsync_connection),
+        )
+        .route("/rsync/test-route", post(rsync_handlers::test_rsync_route))
+        .route(
+            "/rsync/validate",
+            post(rsync_handlers::validate_rsync_profile),
+        )
+        .route("/rsync/jobs", get(rsync_handlers::list_rsync_jobs))
+        .route(
+            "/rsync/jobs/:job_id",
+            get(rsync_handlers::get_rsync_job).delete(rsync_handlers::delete_rsync_job),
+        )
+        .route(
+            "/rsync/jobs/:job_id/logs",
+            get(rsync_handlers::rsync_job_logs),
+        )
+        .route(
+            "/rsync/jobs/:job_id/stop",
+            post(rsync_handlers::stop_rsync_job),
+        )
+        .route("/rsync/staging", get(rsync_handlers::list_rsync_staging))
+        .route(
+            "/rsync/staging/:id",
+            delete(rsync_handlers::delete_rsync_staging),
+        )
+        .route(
+            "/rsync/profiles",
+            get(rsync_handlers::list_rsync_profiles).post(rsync_handlers::create_rsync_profile),
+        )
+        .route(
+            "/rsync/profiles/:id",
+            get(rsync_handlers::get_rsync_profile)
+                .put(rsync_handlers::update_rsync_profile)
+                .delete(rsync_handlers::delete_rsync_profile),
+        )
+        .route(
+            "/rsync/profiles/:id/run",
+            post(rsync_handlers::run_rsync_profile),
         );
 
     let protected = Router::new()

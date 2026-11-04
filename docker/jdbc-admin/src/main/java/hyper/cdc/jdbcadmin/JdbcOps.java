@@ -135,6 +135,7 @@ final class JdbcOps {
         try (Connection conn = open(dbType, connection)) {
             DatabaseMetaData meta = conn.getMetaData();
             List<String> pk = primaryKeys(meta, schema, table);
+            List<IndexInfo> indexes = loadIndexes(meta, schema, table);
             List<ColumnInfo> columns = new ArrayList<>();
             int position = 1;
             for (ColumnRow col : loadColumns(meta, schema, table)) {
@@ -146,6 +147,9 @@ final class JdbcOps {
                         break;
                     }
                 }
+                boolean unique = (isPk && pk.size() == 1) || indexes.stream().anyMatch(ix ->
+                        ix.unique() && ix.filter() == null && ix.columns().size() == 1
+                                && ix.columns().get(0).equalsIgnoreCase(col.name));
                 columns.add(new ColumnInfo(
                         col.name,
                         col.type,
@@ -153,10 +157,14 @@ final class JdbcOps {
                         position++,
                         isPk,
                         pkPos > 0 ? pkPos : null,
-                        isPk
+                        unique,
+                        col.size,
+                        col.scale,
+                        col.defaultValue,
+                        col.autoIncrement
                 ));
             }
-            return new InspectResult(schema, table, pk, columns);
+            return new InspectResult(schema, table, pk, columns, indexes);
         }
     }
 
@@ -214,6 +222,108 @@ final class JdbcOps {
                 rows = new ArrayList<>(rows.subList(0, (int) size));
             }
             return new PreviewResult(columns, rows, page, size, hasMore);
+        }
+    }
+
+    /** Default rows per round trip for {@link #openStream}. */
+    static final int STREAM_FETCH_SIZE = 1000;
+
+    /**
+     * Open a single forward-only {@code SELECT *} over a table for streaming copies.
+     *
+     * <p>Unlike {@link #preview}, which re-runs the query and skips {@code page * size} rows
+     * for every page (quadratic on large tables), this issues one statement and reads it
+     * with a cursor, so the source sees exactly one read of each row. {@code maxRows <= 0}
+     * means no cap. The caller must close the returned stream.
+     */
+    static RowStream openStream(
+            String dbType,
+            Map<String, String> connection,
+            String schema,
+            String table,
+            long maxRows,
+            int fetchSize
+    ) throws SQLException {
+        String sql = "SELECT * FROM " + JdbcUrls.qualified(dbType, schema, table);
+        Connection conn = open(dbType, connection);
+        try {
+            // PostgreSQL only streams with a cursor when autocommit is off; harmless elsewhere.
+            conn.setAutoCommit(false);
+            Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+            stmt.setFetchSize(fetchSize > 0 ? fetchSize : STREAM_FETCH_SIZE);
+            if (maxRows > 0) {
+                stmt.setMaxRows((int) Math.min(maxRows, Integer.MAX_VALUE));
+            }
+            ResultSet rs = stmt.executeQuery(sql);
+            ResultSetMetaData md = rs.getMetaData();
+            List<String> columns = new ArrayList<>();
+            for (int i = 1; i <= md.getColumnCount(); i++) {
+                columns.add(md.getColumnLabel(i));
+            }
+            return new RowStream(conn, stmt, rs, columns);
+        } catch (SQLException | RuntimeException e) {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // already failing
+            }
+            throw e;
+        }
+    }
+
+    /** Forward-only row cursor returned by {@link #openStream}. */
+    static final class RowStream implements AutoCloseable {
+        private final Connection conn;
+        private final Statement stmt;
+        private final ResultSet rs;
+        private final List<String> columns;
+
+        private RowStream(Connection conn, Statement stmt, ResultSet rs, List<String> columns) {
+            this.conn = conn;
+            this.stmt = stmt;
+            this.rs = rs;
+            this.columns = columns;
+        }
+
+        List<String> columns() {
+            return columns;
+        }
+
+        /** Next row as JSON-safe values, or {@code null} when the result set is exhausted. */
+        List<Object> next() throws SQLException {
+            if (!rs.next()) {
+                return null;
+            }
+            List<Object> row = new ArrayList<>(columns.size());
+            for (int i = 1; i <= columns.size(); i++) {
+                row.add(jsonSafe(rs.getObject(i)));
+            }
+            return row;
+        }
+
+        @Override
+        public void close() {
+            try {
+                rs.close();
+            } catch (SQLException ignored) {
+                // closing
+            }
+            try {
+                stmt.close();
+            } catch (SQLException ignored) {
+                // closing
+            }
+            try {
+                // Read-only work: never commit anything on the source.
+                conn.rollback();
+            } catch (SQLException ignored) {
+                // closing
+            }
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // closing
+            }
         }
     }
 
@@ -369,16 +479,112 @@ final class JdbcOps {
         List<ColumnRow> columns = new ArrayList<>();
         try (rs) {
             while (rs.next()) {
+                // Read in ascending column order: Oracle returns COLUMN_DEF as a LONG,
+                // which must be consumed before any later column.
                 String name = rs.getString("COLUMN_NAME");
+                int dataType = rs.getInt("DATA_TYPE");
+                String typeName = rs.getString("TYPE_NAME");
+                Integer size = intOrNull(rs, "COLUMN_SIZE");
+                Integer scale = intOrNull(rs, "DECIMAL_DIGITS");
+                boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
+                String defaultValue = trimToNull(rs.getString("COLUMN_DEF"));
+                boolean autoIncrement = false;
+                try {
+                    autoIncrement = "YES".equalsIgnoreCase(rs.getString("IS_AUTOINCREMENT"));
+                } catch (SQLException ignored) {
+                    // Older drivers do not expose IS_AUTOINCREMENT.
+                }
                 if (name == null) {
                     continue;
                 }
-                String type = firstNonBlank(rs.getString("TYPE_NAME"), String.valueOf(rs.getInt("DATA_TYPE")));
-                boolean nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
-                columns.add(new ColumnRow(name, type == null ? "" : type, nullable));
+                String type = firstNonBlank(typeName, String.valueOf(dataType));
+                columns.add(new ColumnRow(
+                        name, type == null ? "" : type, nullable, size, scale, defaultValue, autoIncrement));
             }
         }
         return columns;
+    }
+
+    /**
+     * Index and unique-constraint metadata. {@code approximate=true} matters on Oracle:
+     * with {@code false} the driver may run ANALYZE TABLE against the source.
+     */
+    private static List<IndexInfo> loadIndexes(DatabaseMetaData meta, String schema, String table) {
+        List<IndexInfo> out = readIndexes(meta, null, emptyToNull(schema), table);
+        if (out.isEmpty() && schema != null && !schema.isBlank()) {
+            out = readIndexes(meta, schema, null, table);
+        }
+        return out;
+    }
+
+    private static List<IndexInfo> readIndexes(
+            DatabaseMetaData meta, String catalog, String schema, String table) {
+        Map<String, IndexBuilder> byName = new LinkedHashMap<>();
+        try (ResultSet rs = meta.getIndexInfo(catalog, schema, table, false, true)) {
+            while (rs.next()) {
+                boolean nonUnique = rs.getBoolean("NON_UNIQUE");
+                String name = rs.getString("INDEX_NAME");
+                short type = rs.getShort("TYPE");
+                int ordinal = rs.getInt("ORDINAL_POSITION");
+                String column = rs.getString("COLUMN_NAME");
+                String order = rs.getString("ASC_OR_DESC");
+                String filter = null;
+                try {
+                    filter = trimToNull(rs.getString("FILTER_CONDITION"));
+                } catch (SQLException ignored) {
+                    // Not all drivers expose FILTER_CONDITION.
+                }
+                if (name == null || type == DatabaseMetaData.tableIndexStatistic || column == null) {
+                    continue;
+                }
+                IndexBuilder b = byName.computeIfAbsent(name, n -> new IndexBuilder(n, !nonUnique));
+                b.columns.put(ordinal, column);
+                if ("D".equalsIgnoreCase(order)) {
+                    b.descending.add(column);
+                }
+                if (filter != null) {
+                    b.filter = filter;
+                }
+            }
+        } catch (SQLException e) {
+            // Index metadata is best effort; the table structure is still useful without it.
+            return List.of();
+        }
+        List<IndexInfo> out = new ArrayList<>();
+        for (IndexBuilder b : byName.values()) {
+            List<String> cols = new ArrayList<>();
+            b.columns.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(e -> cols.add(e.getValue()));
+            out.add(new IndexInfo(b.name, b.unique, cols, new ArrayList<>(b.descending), b.filter));
+        }
+        return out;
+    }
+
+    private static Integer intOrNull(ResultSet rs, String column) throws SQLException {
+        int v = rs.getInt(column);
+        return rs.wasNull() ? null : v;
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String t = value.trim();
+        return t.isEmpty() ? null : t;
+    }
+
+    private static final class IndexBuilder {
+        final String name;
+        final boolean unique;
+        final Map<Integer, String> columns = new LinkedHashMap<>();
+        final Set<String> descending = new LinkedHashSet<>();
+        String filter;
+
+        IndexBuilder(String name, boolean unique) {
+            this.name = name;
+            this.unique = unique;
+        }
     }
 
     private static String schemaName(ResultSet rs) throws SQLException {
@@ -438,14 +644,27 @@ final class JdbcOps {
             int position,
             boolean primaryKey,
             Integer pkPosition,
-            boolean unique
+            boolean unique,
+            Integer size,
+            Integer scale,
+            String defaultValue,
+            boolean autoIncrement
+    ) {}
+
+    record IndexInfo(
+            String name,
+            boolean unique,
+            List<String> columns,
+            List<String> descending,
+            String filter
     ) {}
 
     record InspectResult(
             String schema,
             String name,
             List<String> primaryKey,
-            List<ColumnInfo> columns
+            List<ColumnInfo> columns,
+            List<IndexInfo> indexes
     ) {}
 
     record PreviewResult(
@@ -458,5 +677,13 @@ final class JdbcOps {
 
     record QueryResult(List<String> columns, List<List<Object>> rows) {}
 
-    private record ColumnRow(String name, String type, boolean nullable) {}
+    private record ColumnRow(
+            String name,
+            String type,
+            boolean nullable,
+            Integer size,
+            Integer scale,
+            String defaultValue,
+            boolean autoIncrement
+    ) {}
 }

@@ -1,0 +1,60 @@
+# Two throwaway SSH hosts for testing File sync (cdc-rsync). Demo only — password login is on.
+#
+#   docker compose -f docker-compose.rsync-demo.yaml up -d --build
+#   docker compose -f docker-compose.rsync-demo.yaml down -v
+#
+# Login user "syncuser" (password ${RSYNC_DEMO_PASSWORD:-sync-demo}); private keys appear in
+# ./rsync/demo-host/keys/{source,target}_ed25519 on first start (gitignored).
+# From cdc-rsync use host cdc-rsync-source / cdc-rsync-target, port 22.
+# The source has sample data in /home/syncuser/data; the target starts empty.
+name: cdc-rsync-demo   # own project: `down -v` never touches cdc-stack
+
+networks:
+  server_zone:
+    external: true
+    name: server_zone
+
+volumes:
+  cdc-rsync-source-home:
+  cdc-rsync-target-home:
+
+x-demo-host: &demo-host
+  image: cdc-rsync-demo-host:local
+  build:
+    context: ./rsync/demo-host
+  volumes:
+    - ./rsync/demo-host/keys:/keys
+  networks: [server_zone]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "pgrep -x sshd >/dev/null"]
+    interval: 15s
+    timeout: 5s
+    retries: 5
+
+services:
+  cdc-rsync-source:
+    <<: *demo-host
+    container_name: cdc-rsync-source
+    hostname: cdc-rsync-source
+    environment:
+      ROLE: source
+      DEMO_PASSWORD: ${RSYNC_DEMO_PASSWORD:-sync-demo}
+    ports:
+      - "${RSYNC_DEMO_SOURCE_PORT:-2221}:22"
+    volumes:
+      - ./rsync/demo-host/keys:/keys
+      - cdc-rsync-source-home:/home/syncuser
+
+  cdc-rsync-target:
+    <<: *demo-host
+    container_name: cdc-rsync-target
+    hostname: cdc-rsync-target
+    environment:
+      ROLE: target
+      DEMO_PASSWORD: ${RSYNC_DEMO_PASSWORD:-sync-demo}
+    ports:
+      - "${RSYNC_DEMO_TARGET_PORT:-2222}:22"
+    volumes:
+      - ./rsync/demo-host/keys:/keys
+      - cdc-rsync-target-home:/home/syncuser

@@ -226,6 +226,37 @@ pub struct SourceTableColumn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pk_position: Option<i32>,
     pub unique: bool,
+    /// Character length or numeric precision (JDBC COLUMN_SIZE). Absent when the
+    /// type string already carries it (native Postgres inspect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i32>,
+    /// Numeric scale (JDBC DECIMAL_DIGITS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
+    /// Source default expression, verbatim (dialect-specific).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    /// Identity / serial / AUTO_INCREMENT column.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_increment: bool,
+}
+
+/// Index or unique constraint on an inspected table (the primary-key index included).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct TableIndex {
+    pub name: String,
+    pub unique: bool,
+    /// Key columns in index order. Expression indexes may carry expression text here.
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descending: Vec<String>,
+    /// Partial-index predicate, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// True when the index has expression (non-column) keys.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expression: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +267,9 @@ pub struct SourceTableInspectResponse {
     pub row_count: Option<i64>,
     pub primary_key: Vec<String>,
     pub columns: Vec<SourceTableColumn>,
+    /// None when the inspector did not report index metadata (older jdbc-admin).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexes: Option<Vec<TableIndex>>,
     pub rows: Vec<Value>,
     pub limit: u32,
     pub timestamp: DateTime<Utc>,
@@ -563,6 +597,39 @@ pub enum CaptureMode {
     Incremental,
 }
 
+/// How an incremental (`capture_mode=incremental`) pipeline polls one table.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TablePollStrategy {
+    /// JDBC watermark on `timestamp_column` / `incrementing_column` (table mode). Default.
+    #[default]
+    Watermark,
+    /// Re-read every row whose `window_column` falls in today or the previous
+    /// `window_days` days, on every poll. No offset is kept, so date-only or
+    /// non-unique timestamps cannot skip same-day changes; the sink upsert makes the
+    /// repeats harmless. Rows outside the window (e.g. legacy rows) need an initial load.
+    RollingWindow,
+    /// Re-read the whole table on every poll. For small tables only.
+    FullCopy,
+}
+
+/// Per-table override of the incremental poll strategy. Tables without a rule use
+/// [`TablePollStrategy::Watermark`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TablePollRule {
+    /// `SCHEMA.TABLE`, as listed in `source.tables`.
+    pub table: String,
+    #[serde(default)]
+    pub strategy: TablePollStrategy,
+    /// Rolling window only: date/timestamp column to filter on (e.g. `UPDATE_DATE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_column: Option<String>,
+    /// Rolling window only: previous days to include besides today (default 1 =
+    /// today + yesterday, which covers changes around midnight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+}
+
 impl SourceConfig {
     /// Host/port/database identity used to detect two capture engines on one source.
     pub fn capture_identity(&self) -> String {
@@ -631,6 +698,10 @@ pub struct SourceConfig {
     /// JDBC poll runs in timestamp-only mode and requires `timestamp_column`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upsert_key_columns: Vec<String>,
+    /// Incremental capture: per-table poll strategy overrides (rolling window, full
+    /// copy). Tables not listed use the watermark columns above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_poll: Vec<TablePollRule>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1221,6 +1292,7 @@ mod tests {
             timestamp_column: None,
             incrementing_column: None,
             upsert_key_columns: vec![],
+            table_poll: vec![],
         };
         assert_eq!(
             source.capture_identity(),
@@ -1629,6 +1701,31 @@ pub struct SchemaCompareProfileRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SchemaCompareProfilesResponse {
     pub profiles: Vec<SchemaCompareProfile>,
+}
+
+/// Create target tables from the pipeline wizard (mapping step).
+#[derive(Debug, Deserialize)]
+pub struct TargetDdlRequest {
+    pub target: TargetConfig,
+    /// Statements run one at a time, in order; the run stops at the first failure.
+    pub statements: Vec<String>,
+    #[serde(default)]
+    pub profile_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TargetDdlStatementResult {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TargetDdlResponse {
+    pub status: bool,
+    pub executed: usize,
+    pub results: Vec<TargetDdlStatementResult>,
 }
 
 /// Request body for executing a DDL statement against a compare target connection.
@@ -2107,4 +2204,319 @@ pub struct MongoCopyProfileRequest {
 #[derive(Debug, Serialize)]
 pub struct MongoCopyProfilesResponse {
     pub profiles: Vec<MongoCopyProfile>,
+}
+
+// ── pgdump (PostgreSQL remote dump / dump → restore via pg_dump + pg_restore) ──
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// pg_dump / pg_restore options. Only set values are sent to the sidecar, which rejects
+/// unknown keys and validates patterns and ranges.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct PgDumpOptions {
+    /// `custom` (default, pg_restore-able), `plain` (SQL), `tar`. dump_restore needs `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub schema_only: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub data_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_schemas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_tables: Vec<String>,
+    /// Keep the table definition, skip its rows (audit/log tables).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_table_data: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_owner: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_privileges: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_comments: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_publications: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_subscriptions: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clean: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub if_exists: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub serializable_deferrable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_wait_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sslmode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sslmode: Option<String>,
+    /// pg_restore --jobs (parallel restore; not with restore_single_transaction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_jobs: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_clean: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_if_exists: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_no_owner: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_no_privileges: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_single_transaction: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_exit_on_error: bool,
+    /// Keep the sidecar copy after every SFTP destination has a verified copy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keep_local: bool,
+}
+
+fn default_sftp_port() -> String {
+    "22".to_string()
+}
+
+/// SFTP server that receives the dump file (`<file>.part` → rename, plus `<file>.sha256`).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PgDumpDestination {
+    #[serde(default)]
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_sftp_port")]
+    pub port: String,
+    pub username: String,
+    /// `key` or `password`.
+    #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
+    pub password: String,
+    /// OpenSSH / PEM private key text.
+    #[serde(default)]
+    pub private_key: String,
+    #[serde(default)]
+    pub passphrase: String,
+    /// Directory on the SFTP server (relative paths are under the SFTP user's home).
+    pub remote_dir: String,
+    /// Optional pin, e.g. `SHA256:1ZCE…` from `ssh-keygen -lf`; mismatch aborts the upload.
+    #[serde(default)]
+    pub host_key_fingerprint: String,
+}
+
+impl PgDumpDestination {
+    pub fn redact_secrets(&mut self) {
+        for secret in [
+            &mut self.password,
+            &mut self.private_key,
+            &mut self.passphrase,
+        ] {
+            if !secret.is_empty() {
+                *secret = "********".to_string();
+            }
+        }
+    }
+}
+
+fn default_pgdump_mode() -> String {
+    "dump".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PgDumpProfile {
+    pub id: Uuid,
+    pub name: String,
+    /// `dump` (file to download) or `dump_restore` (pg_dump → pg_restore into `target`).
+    #[serde(default = "default_pgdump_mode")]
+    pub mode: String,
+    pub source: SchemaCompareConn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SchemaCompareConn>,
+    /// pg_dump --table patterns; empty = whole database.
+    #[serde(default)]
+    pub include_tables: Vec<String>,
+    #[serde(default)]
+    pub options: PgDumpOptions,
+    /// SFTP servers that receive the dump file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<PgDumpDestination>,
+    #[serde(default)]
+    pub last_job_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl PgDumpProfile {
+    pub fn redact_secrets(&mut self) {
+        if !self.source.password.is_empty() {
+            self.source.password = "********".to_string();
+        }
+        if let Some(target) = &mut self.target {
+            if !target.password.is_empty() {
+                target.password = "********".to_string();
+            }
+        }
+        for dest in &mut self.destinations {
+            dest.redact_secrets();
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PgDumpProfileRequest {
+    pub name: String,
+    #[serde(default = "default_pgdump_mode")]
+    pub mode: String,
+    pub source: SchemaCompareConn,
+    #[serde(default)]
+    pub target: Option<SchemaCompareConn>,
+    #[serde(default)]
+    pub include_tables: Vec<String>,
+    #[serde(default)]
+    pub options: PgDumpOptions,
+    #[serde(default)]
+    pub destinations: Vec<PgDumpDestination>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PgDumpProfilesResponse {
+    pub profiles: Vec<PgDumpProfile>,
+}
+
+// ── rsync (host-to-host file sync over SSH: direct via the source, or relay) ──
+
+fn default_ssh_port() -> String {
+    "22".to_string()
+}
+
+/// One SSH host (Linux or macOS) and the directory on it.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RsyncEndpoint {
+    #[serde(default)]
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: String,
+    pub username: String,
+    /// `key` or `password`. Direct mode needs `key` on the target (it is forwarded via ssh-agent).
+    #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
+    pub password: String,
+    /// OpenSSH / PEM private key text.
+    #[serde(default)]
+    pub private_key: String,
+    #[serde(default)]
+    pub passphrase: String,
+    /// Directory (or file on the source). Relative = under the login's home. Source trailing `/`
+    /// copies the contents; without it the directory itself is created inside the target path.
+    pub path: String,
+    /// Optional pin, e.g. `SHA256:1ZCE…` from `ssh-keygen -lf`; mismatch aborts the run.
+    #[serde(default)]
+    pub host_key_fingerprint: String,
+    /// Optional rsync binary on this host (e.g. `/opt/homebrew/bin/rsync`); auto-detected if empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rsync_path: String,
+    /// Target only: address the *source* uses to reach this host in direct mode (LAN/VPN address).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reach_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reach_port: String,
+}
+
+impl RsyncEndpoint {
+    pub fn redact_secrets(&mut self) {
+        for secret in [
+            &mut self.password,
+            &mut self.private_key,
+            &mut self.passphrase,
+        ] {
+            if !secret.is_empty() {
+                *secret = "********".to_string();
+            }
+        }
+    }
+}
+
+/// rsync options. Only set values are sent; the sidecar rejects unknown keys.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct RsyncOptions {
+    /// `auto` (default: direct when the source reaches the target, else relay), `direct`, `relay`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Delete target files that are not on the source (mirror). Off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete: bool,
+    /// Abort deletions beyond this count (rsync --max-delete). Needs `delete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delete: Option<u64>,
+    /// Every run is a preview (--dry-run --itemize-changes).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub checksum: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compress: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_owner: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hard_links: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub acls: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub xattrs: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub numeric_ids: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub one_file_system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bwlimit_kbps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_timeout_seconds: Option<u64>,
+    /// Relay: remove the staging copy after the run (next relay run is then a full pull).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub discard_staging: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RsyncProfile {
+    pub id: Uuid,
+    pub name: String,
+    pub source: RsyncEndpoint,
+    pub target: RsyncEndpoint,
+    #[serde(default)]
+    pub options: RsyncOptions,
+    #[serde(default)]
+    pub last_job_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl RsyncProfile {
+    pub fn redact_secrets(&mut self) {
+        self.source.redact_secrets();
+        self.target.redact_secrets();
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RsyncProfileRequest {
+    pub name: String,
+    pub source: RsyncEndpoint,
+    pub target: RsyncEndpoint,
+    #[serde(default)]
+    pub options: RsyncOptions,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RsyncProfilesResponse {
+    pub profiles: Vec<RsyncProfile>,
 }

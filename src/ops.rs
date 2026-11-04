@@ -481,7 +481,16 @@ pub async fn profile_investigate(
 
     let pipeline_logs = if let Some(rqlite) = state.rqlite.as_ref() {
         rqlite
-            .list_pipeline_logs(100, None, Some(&id.to_string()), None, None, None, None, None)
+            .list_pipeline_logs(
+                100,
+                None,
+                Some(&id.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_or_default()
     } else {

@@ -1,382 +1,196 @@
 <script setup lang="ts">
-import { ArrowRightLeft, Play, RefreshCw, Save, Square, Trash2 } from "@lucide/vue"
-import {
-  defaultRedisShakeOptions,
-  type RedisShakeConn,
-  type RedisShakeJob,
-  type RedisShakeProfile,
-  useRedisShake,
-} from "~/composables/useRedisShake"
+import { transferTester } from "~/composables/useTransferTest"
+// Redis sync (RedisShake) on the shared Copy & Sync workspace. A sync runs until it is stopped.
+import { ArrowRightLeft, ChevronRight } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
-import { formatApiError } from "~/utils/apiError"
+import { defaultRedisShakeOptions, type RedisShakeConn, type RedisShakeJob, type RedisShakeProfile, useRedisShake } from "~/composables/useRedisShake"
+import * as rules from "~/utils/transferTools/redisshake"
+import type { TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
 
-const toast = useToast()
-const {
-  fetchContract,
-  fetchCapability,
-  fetchProfiles,
-  createProfile,
-  updateProfile,
-  deleteProfile,
-  runProfile,
-  fetchJobs,
-  fetchJobLogs,
-  stopJob,
-  validateConnection,
-} = useRedisShake()
+const api = useRedisShake()
+const contract = ref<Record<string, unknown> | null>(null)
+onMounted(() => api.fetchContract().then((c) => (contract.value = c)).catch(() => {}))
 
-const BOOL_OPTIONS: Array<{ key: keyof ReturnType<typeof defaultRedisShakeOptions>; label: string }> = [
-  { key: "source_cluster", label: "Source is cluster" },
-  { key: "target_cluster", label: "Target is cluster" },
-  { key: "source_tls", label: "Source TLS" },
-  { key: "target_tls", label: "Target TLS" },
-  { key: "sync_rdb", label: "Sync RDB (full)" },
-  { key: "sync_aof", label: "Sync AOF (incremental)" },
-  { key: "prefer_replica", label: "Prefer replica on source" },
-  { key: "try_diskless", label: "Try diskless sync" },
-  { key: "off_reply", label: "Disable writer replies" },
-]
-
-const emptyConn = (): RedisShakeConn => ({
-  type: "redis",
-  host: "",
-  port: "6379",
-  database: "",
-  username: "",
-  password: "",
+const emptyConn = (): RedisShakeConn => ({ type: "redis", host: "", port: "6379", database: "", username: "", password: "" })
+const toPayload = (d: any) => ({
+  name: d.name.trim(),
+  source: { ...d.source, type: "redis" },
+  target: { ...d.target, type: "redis" },
+  options: { ...d.options },
 })
+const test = transferTester("redisshake")
+const kind = (o: Record<string, any>, side: string) => [o[`${side}_cluster`] ? "Cluster" : "Single server", o[`${side}_tls`] && "TLS"].filter(Boolean).join(", ")
 
-const profiles = ref<RedisShakeProfile[]>([])
-const jobs = ref<RedisShakeJob[]>([])
-const selectedId = ref("")
-const loading = ref(false)
-const saving = ref(false)
-const running = ref(false)
-const sidecarNote = ref("")
-const logText = ref("")
-const logJobId = ref("")
-const error = ref("")
+/** ", PostgreSQL 17" once a connection test has run (the route then names the server). */
+const ver = (check: any, name: string) => (check?.ok && check.raw?.server_version ? `, ${name} ${String(check.raw.server_version).split(" ")[0]}` : "")
 
-const form = reactive({
-  name: "",
-  source: emptyConn(),
-  target: emptyConn(),
-  options: defaultRedisShakeOptions(),
-  duplicateBehavior: "panic",
-})
-
-const selectedProfile = computed(() => profiles.value.find((p) => p.id === selectedId.value) || null)
-
-const loadAll = async () => {
-  loading.value = true
-  error.value = ""
-  try {
-    const [cap, profs, jobList] = await Promise.all([
-      fetchCapability().catch(() => ({})),
-      fetchProfiles(),
-      fetchJobs(),
-    ])
-    sidecarNote.value = String((cap as any)?.redisshake_image || (cap as any)?.service || "")
-    profiles.value = profs
-    jobs.value = jobList
-    if (!selectedId.value && profs.length) selectProfile(profs[0].id)
-  } catch (e: any) {
-    error.value = formatApiError(e, "Failed to load RedisShake")
-  } finally {
-    loading.value = false
-  }
-}
-
-const selectProfile = (id: string) => {
-  selectedId.value = id
-  const p = profiles.value.find((item) => item.id === id)
-  if (!p) return
-  form.name = p.name
-  form.source = { ...emptyConn(), ...p.source, type: "redis" }
-  form.target = { ...emptyConn(), ...p.target, type: "redis" }
-  form.options = { ...defaultRedisShakeOptions(), ...p.options }
-  form.duplicateBehavior = p.options.rdb_restore_command_behavior || "panic"
-}
-
-const payloadFromForm = () => ({
-  name: form.name.trim(),
-  source: { ...form.source, type: "redis" },
-  target: { ...form.target, type: "redis" },
-  options: {
-    ...form.options,
-    rdb_restore_command_behavior: form.duplicateBehavior,
+const tool: TransferTool<RedisShakeProfile, any, RedisShakeJob> = {
+  key: "redisshake",
+  title: "Redis sync",
+  icon: ArrowRightLeft,
+  intro: "Copy every key from one Redis to another, then keep applying changes live until you stop the sync.",
+  emptyText: "A sync copies all keys from a source Redis to a target with RedisShake, then streams changes so the target stays current.",
+  namePlaceholder: "Cache to new cluster",
+  continuous: true,
+  stopVerb: rules.stopVerb,
+  api: {
+    fetchProfiles: api.fetchProfiles,
+    createProfile: api.createProfile,
+    updateProfile: api.updateProfile,
+    deleteProfile: api.deleteProfile,
+    runProfile: api.runProfile,
+    fetchJobs: api.fetchJobs,
+    fetchJobLogs: api.fetchJobLogs,
+    stopJob: api.stopJob,
+    fetchCapability: api.fetchCapability,
   },
-})
-
-const saveProfile = async () => {
-  if (!form.name.trim()) {
-    toast.error("Profile name is required")
-    return
-  }
-  saving.value = true
-  try {
-    const body = payloadFromForm()
-    if (selectedId.value) {
-      const updated = await updateProfile(selectedId.value, body)
-      const idx = profiles.value.findIndex((p) => p.id === updated.id)
-      if (idx >= 0) profiles.value[idx] = updated
-      toast.success("Profile saved")
-    } else {
-      const created = await createProfile(body as any)
-      profiles.value.push(created)
-      selectProfile(created.id)
-      toast.success("Profile created")
-    }
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    saving.value = false
-  }
+  newDraft: () => ({
+    name: "",
+    source: emptyConn(),
+    target: emptyConn(),
+    options: applyContractOptionDefaults(defaultRedisShakeOptions(), contract.value ?? undefined),
+  }),
+  toDraft: (p) => ({
+    name: p.name,
+    source: { ...emptyConn(), ...p.source },
+    target: { ...emptyConn(), ...p.target },
+    options: { ...defaultRedisShakeOptions(), ...p.options },
+  }),
+  toPayload,
+  changeLabels: rules.changeLabels,
+  verb: rules.verb,
+  startedToast: rules.startedToast,
+  modeLabel: (p) => (p.options.sync_aof !== false ? "Full copy, then live changes" : "Full copy only"),
+  runResult: rules.runResult,
+  steps: (p, job, log) => rules.steps(p, job, log),
+  summary: rules.summary,
+  effects: rules.effects,
+  problems: rules.problems,
+  // Runs before per-run job ids used the profile id as the job id.
+  jobsOf: (jobs, id) => jobs.filter((j) => (j.profile_id || j.id) === id),
+  routeSource: (p, checks) => ({ engine: "redis", role: `Source${ver(checks.source, "Redis")}`, title: p.source.host, detail: `port ${p.source.port || "6379"}, ${kind(p.options, "source").toLowerCase()}` }),
+  routeDestinations: (p, checks) => [
+    {
+      engine: "redis",
+      role: `Target${ver(checks.target, "Redis")}`,
+      title: p.target.host,
+      detail: `port ${p.target.port || "6379"}, ${kind(p.options, "target").toLowerCase()}`,
+      overwrite: (p.options.rdb_restore_command_behavior || "panic") === "rewrite" ? "Overwrites existing keys" : undefined,
+    },
+  ],
+  railRoute: (p) => `${p.source.host}:${p.source.port || "6379"} → ${p.target.host}:${p.target.port || "6379"}`,
+  railEngines: () => ["redis", "redis"],
+  liveFacts: (_job, log) => {
+    const s = rules.liveStats(log)
+    return [
+      ...(s.written !== undefined ? [{ label: "Keys written", value: s.written.toLocaleString() }] : []),
+      ...(s.lag !== undefined ? [{ label: "Behind the source", value: s.lag === 0 ? "Up to date" : `${s.lag.toLocaleString()} bytes` }] : []),
+    ]
+  },
+  sections: () => [
+    { id: "rs-source", label: "Source Redis" },
+    { id: "rs-target", label: "Target Redis" },
+    { id: "rs-what", label: "What to sync" },
+    { id: "rs-existing", label: "Existing keys" },
+    { id: "rs-advanced", label: "Advanced" },
+  ],
 }
-
-const contractDefaults = ref<Record<string, unknown> | null>(null)
-
-const newProfile = () => {
-  selectedId.value = ""
-  form.name = ""
-  form.source = emptyConn()
-  form.target = emptyConn()
-  form.options = applyContractOptionDefaults(
-    defaultRedisShakeOptions(),
-    contractDefaults.value ?? undefined,
-  )
-  form.duplicateBehavior = "panic"
-}
-
-const removeProfile = async () => {
-  if (!selectedId.value) return
-  if (!confirm("Delete this RedisShake profile?")) return
-  try {
-    await deleteProfile(selectedId.value)
-    profiles.value = profiles.value.filter((p) => p.id !== selectedId.value)
-    newProfile()
-    toast.success("Profile deleted")
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const runSelected = async () => {
-  if (!selectedId.value) {
-    toast.error("Save a profile before running")
-    return
-  }
-  if (form.options.sync_aof !== false) {
-    const ok = confirm(
-      "Incremental sync (AOF) runs until you stop the job. For a one-time full copy only, disable “Sync AOF”, save, then run. Continue?",
-    )
-    if (!ok) return
-  }
-  const alreadyRunning = jobs.value.some((j) => j.status === "running")
-  if (alreadyRunning) {
-    toast.error("A sync job is already running. Stop it before starting another.")
-    return
-  }
-  running.value = true
-  try {
-    await saveProfile()
-    const job = await runProfile(selectedId.value)
-    toast.success(`Sync job started (${job.id})`)
-    await loadAll()
-    if (job.id) await showLogs(job.id)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    running.value = false
-  }
-}
-
-const showLogs = async (jobId: string) => {
-  logJobId.value = jobId
-  try {
-    const res = await fetchJobLogs(jobId)
-    logText.value = res.log || ""
-  } catch (e: any) {
-    logText.value = formatApiError(e, "Failed to load logs")
-  }
-}
-
-const stopRunningJob = async (jobId: string) => {
-  try {
-    await stopJob(jobId)
-    toast.success("Stop requested")
-    await loadAll()
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const testConn = async (which: "source" | "target") => {
-  const connection = which === "source" ? form.source : form.target
-  try {
-    const res = await validateConnection({ ...connection, type: "redis" })
-    toast[res.valid ? "success" : "error"](res.message)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-let pollTimer: ReturnType<typeof setInterval> | null = null
-
-onMounted(async () => {
-  fetchContract()
-    .then((c) => {
-      contractDefaults.value = c
-    })
-    .catch(() => {})
-  loadAll()
-  pollTimer = setInterval(() => {
-    fetchJobs().then((j) => (jobs.value = j)).catch(() => {})
-    if (logJobId.value) showLogs(logJobId.value)
-  }, 8000)
-})
-
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
-})
+const CHECK_NOTE = "Tested from the redisshake container, the same way a run connects."
+const choiceModel = (o: Record<string, any>) => o.rdb_restore_command_behavior || "panic"
 </script>
 
 <template>
-  <div class="space-y-6 animate-fade-in">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-xl font-semibold text-foreground flex items-center gap-2">
-          <ArrowRightLeft class="h-5 w-5 text-primary" />
-          Redis sync (RedisShake)
-        </h1>
-        <div class="mt-1 flex items-center gap-1.5">
-          <span class="text-sm font-medium text-foreground">sync_reader → redis_writer</span>
-          <AppInfoHint
-            :text="`PSync full (RDB) + optional incremental (AOF). One-time migration: enable RDB, disable AOF — job exits when full sync finishes. Live cutover: keep AOF on, then stop the job after traffic moves. Staging disk under each job is removed when the job ends; only one concurrent sync is allowed.`"
-          />
-        </div>
-      </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap inline-flex items-center gap-2" @click="loadAll">
-          <RefreshCw class="h-4 w-4" :class="loading ? 'animate-spin' : ''" />
-          Refresh
-        </button>
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap" @click="newProfile">New profile</button>
-      </div>
-    </div>
-
-    <p v-if="error" class="alert-error text-sm">{{ error }}</p>
-
-    <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
-      <aside class="xl:col-span-3 card p-4 space-y-2">
-        <h2 class="text-sm font-medium text-muted-foreground">Saved profiles</h2>
-        <button
-          v-for="p in profiles"
-          :key="p.id"
-          type="button"
-          class="w-full text-left rounded-xl px-3 py-2 text-sm border transition-colors"
-          :class="selectedId === p.id ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/40'"
-          @click="selectProfile(p.id)"
+  <TransferWorkspace :tool="tool">
+    <template #config="{ draft, checks, savedLogin, selectedId, isNew }">
+      <TransferSection id="rs-source" title="Source Redis" why="The Redis to copy from. RedisShake reads it as a replica would, so the user needs the SYNC/PSYNC permissions.">
+        <TransferConnection
+          :key="`src-${selectedId}`"
+          v-model="draft.source"
+          v-model:result="checks.source"
+          engine="redis"
+          default-port="6379"
+          host-placeholder="cache.example.internal"
+          :database="null"
+          username-optional
+          username-placeholder="ACL user"
+          :check="test('source', () => draft.options, () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :summary-extra="kind(draft.options, 'source')"
+          :watch-key="`${draft.options.source_cluster}|${draft.options.source_tls}`"
+          :saved-login="savedLogin('source', '6379')"
+          :start-editing="isNew || !draft.source.host"
         >
-          <div class="font-medium truncate">{{ p.name }}</div>
-          <div class="text-xs text-muted-foreground truncate">{{ p.source.host }} → {{ p.target.host }}</div>
-        </button>
-        <p v-if="!profiles.length" class="text-sm text-muted-foreground italic">No profiles yet.</p>
-      </aside>
-
-      <section class="xl:col-span-9 space-y-4">
-        <div class="card p-5 space-y-4">
-          <input v-model="form.name" type="text" placeholder="Profile name" class="auth-input w-full" />
-
-          <div class="grid md:grid-cols-2 gap-4">
-            <div v-for="side in (['source', 'target'] as const)" :key="side" class="space-y-2 rounded-xl border border-border p-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold capitalize">{{ side }}</h3>
-                <button type="button" class="text-xs text-primary underline" @click="testConn(side)">Validate</button>
-              </div>
-              <input v-model="form[side].host" class="auth-input w-full" placeholder="Host" />
-              <input v-model="form[side].port" class="auth-input w-full" placeholder="Port (6379)" />
-              <input v-model="form[side].username" class="auth-input w-full" placeholder="Username (ACL, optional)" />
-              <input v-model="form[side].password" type="password" class="auth-input w-full" placeholder="Password" />
+          <template #extra>
+            <div class="grid gap-4 sm:grid-cols-2">
+              <TransferSwitch v-model="draft.options.source_cluster" label="Cluster" help="The source is a Redis Cluster; any node's address works." />
+              <TransferSwitch v-model="draft.options.source_tls" label="TLS" help="Connect over TLS." />
             </div>
-          </div>
+          </template>
+        </TransferConnection>
+      </TransferSection>
 
-          <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
-            <label v-for="opt in BOOL_OPTIONS" :key="String(opt.key)" class="flex items-center gap-2 text-sm">
-              <input v-model="(form.options as any)[opt.key]" type="checkbox" class="rounded border-border" />
-              {{ opt.label }}
-            </label>
-          </div>
+      <TransferSection id="rs-target" title="Target Redis" why="The Redis that receives the keys. It should be empty, or you choose below what happens to keys that exist.">
+        <TransferConnection
+          :key="`tgt-${selectedId}`"
+          v-model="draft.target"
+          v-model:result="checks.target"
+          engine="redis"
+          default-port="6379"
+          host-placeholder="cache-new.example.internal"
+          :database="null"
+          username-optional
+          username-placeholder="ACL user"
+          :check="test('target', () => draft.options, () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :summary-extra="kind(draft.options, 'target')"
+          :watch-key="`${draft.options.target_cluster}|${draft.options.target_tls}`"
+          :saved-login="savedLogin('target', '6379')"
+          :start-editing="isNew || !draft.target.host"
+        >
+          <template #extra>
+            <div class="grid gap-4 sm:grid-cols-2">
+              <TransferSwitch v-model="draft.options.target_cluster" label="Cluster" help="The target is a Redis Cluster; keys go to the right shard." />
+              <TransferSwitch v-model="draft.options.target_tls" label="TLS" help="Connect over TLS." />
+            </div>
+          </template>
+        </TransferConnection>
+      </TransferSection>
 
-          <label class="text-xs text-muted-foreground block max-w-xs">
-            Duplicate key behavior (RDB phase)
-            <select v-model="form.duplicateBehavior" class="auth-input w-full mt-1">
-              <option value="panic">panic — stop on duplicate</option>
-              <option value="rewrite">rewrite — overwrite target</option>
-              <option value="skip">skip — leave existing keys</option>
-            </select>
-          </label>
+      <TransferSection id="rs-what" title="What to sync" why="A full copy sends every key once. Live changes keep the target current until you stop the sync.">
+        <TransferSwitch v-model="draft.options.sync_rdb" label="Full copy" help="Copy every key that exists when the sync starts." />
+        <TransferSwitch v-model="draft.options.sync_aof" label="Live changes" help="Then keep applying writes made on the source. Off: the sync ends after the full copy." />
+        <p v-if="draft.options.sync_rdb === false && draft.options.sync_aof === false" class="text-xs text-amber-600 dark:text-amber-400">
+          Both are off, so the sync would copy nothing.
+        </p>
+      </TransferSection>
 
-          <div class="flex flex-wrap gap-2 pt-2">
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="saving" @click="saveProfile">
-              <Save class="h-4 w-4" />
-              Save
-            </button>
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="running || !selectedId" @click="runSelected">
-              <Play class="h-4 w-4" />
-              Start sync
-            </button>
-            <button v-if="selectedId" type="button" class="btn-secondary inline-flex items-center gap-2" @click="removeProfile">
-              <Trash2 class="h-4 w-4" />
-              Delete
-            </button>
-          </div>
-        </div>
+      <TransferSection id="rs-existing" title="Existing keys" why="What happens when a key from the source already exists on the target during the full copy.">
+        <TransferSegmented
+          :model-value="choiceModel(draft.options)"
+          :options="rules.DUPLICATE_CHOICES.map((c) => ({ value: c.value, label: c.label, help: c.help }))"
+          label="When a key already exists"
+          @update:model-value="draft.options.rdb_restore_command_behavior = $event"
+        />
+        <p v-if="choiceModel(draft.options) === 'rewrite'" class="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600 dark:text-amber-400">
+          Replaces data on the target
+        </p>
+      </TransferSection>
 
-        <div class="card p-5 space-y-3">
-          <h2 class="text-sm font-semibold">Jobs</h2>
-          <div class="overflow-x-auto">
-            <table class="data-table w-full text-sm">
-              <thead>
-                <tr class="text-left text-muted-foreground">
-                  <th class="p-2">ID</th>
-                  <th class="p-2">Status</th>
-                  <th class="p-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="job in jobs" :key="job.id" class="border-t border-border">
-                  <td class="p-2 font-mono text-xs">{{ job.id.slice(0, 8) }}…</td>
-                  <td class="p-2">
-                    <span
-                      class="badge-neutral"
-                      :class="{
-                        'badge-success': job.status === 'succeeded',
-                        'badge-error': job.status === 'failed',
-                        'badge-warning': job.status === 'running',
-                      }"
-                    >{{ job.status }}</span>
-                  </td>
-                  <td class="p-2 flex gap-2">
-                    <button type="button" class="text-xs text-primary underline" @click="showLogs(job.id)">Logs</button>
-                    <button
-                      v-if="job.status === 'running'"
-                      type="button"
-                      class="text-xs text-red-400 inline-flex items-center gap-1"
-                      @click="stopRunningJob(job.id)"
-                    >
-                      <Square class="h-3 w-3" /> Stop
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+      <TransferSection id="rs-advanced" title="Advanced" why="Rarely changed.">
+        <details class="group rounded-lg border border-border">
+          <summary class="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm font-medium text-foreground">
+            <ChevronRight class="h-4 w-4 transition-transform group-open:rotate-90" :stroke-width="1.75" />
+            Source load and write speed
+          </summary>
+          <div class="space-y-4 border-t border-border p-3">
+            <TransferSwitch v-model="draft.options.prefer_replica" label="Read from a replica" help="In a cluster, sync from replicas to keep load off the primaries." />
+            <TransferSwitch v-model="draft.options.try_diskless" label="Diskless full copy" help="Ask the source to stream the snapshot without writing it to disk." />
+            <TransferSwitch v-model="draft.options.off_reply" label="Do not wait for write replies" help="Faster writes to the target, but write errors are not reported." danger="Hides write errors" />
           </div>
-          <pre v-if="logText" class="code-block text-xs max-h-80 overflow-auto whitespace-pre-wrap">{{ logText }}</pre>
-        </div>
-      </section>
-    </div>
-  </div>
+        </details>
+      </TransferSection>
+    </template>
+  </TransferWorkspace>
 </template>

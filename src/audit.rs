@@ -84,7 +84,7 @@ async fn persist_rqlite(
         .trim_audit_events(state.config.audit_rqlite_max_rows)
         .await?;
     let (level, phase, message) = pipeline_log_fields(&event.action, &event.outcome);
-    if let Err(e) = rqlite
+    rqlite
         .insert_pipeline_log(
             &event.audit_id,
             &event.timestamp,
@@ -97,10 +97,7 @@ async fn persist_rqlite(
             &message,
             &event.detail,
         )
-        .await
-    {
-        return Err(e);
-    }
+        .await?;
     rqlite
         .trim_pipeline_logs(state.config.audit_rqlite_max_rows)
         .await?;
@@ -117,12 +114,12 @@ fn pipeline_log_fields(action: &str, outcome: &str) -> (String, String, String) 
     } else {
         "ops".into()
     };
-    let level = if outcome == "failure" || action == "connector.failed" || action == "sync.dlq_growth"
-    {
-        "error".into()
-    } else {
-        "info".into()
-    };
+    let level =
+        if outcome == "failure" || action == "connector.failed" || action == "sync.dlq_growth" {
+            "error".into()
+        } else {
+            "info".into()
+        };
     let message = match action {
         "profile.start" => "Pipeline started".into(),
         "profile.stop" => "Pipeline stopped".into(),
@@ -131,6 +128,9 @@ fn pipeline_log_fields(action: &str, outcome: &str) -> (String, String, String) 
         "profile.restart" => "Pipeline restarted".into(),
         "profile.resync" => "Pipeline resync requested".into(),
         "profile.test_initial_sync" => "Test initial sync (row limit)".into(),
+        "profile.initial_load_start" => "Initial load started (streaming)".into(),
+        "profile.initial_load_cancel" => "Initial load cancel requested".into(),
+        "profile.initial_load" => "Initial load finished".into(),
         "profile.create" => "Pipeline created".into(),
         "profile.update" => "Pipeline configuration updated".into(),
         "profile.delete" => "Pipeline deleted".into(),
@@ -141,6 +141,8 @@ fn pipeline_log_fields(action: &str, outcome: &str) -> (String, String, String) 
         "connector.failed" => "Connector entered FAILED state".into(),
         "connector.paused" => "Connector paused".into(),
         "connector.running" => "Connector running".into(),
+        "profile.split" => "Pipeline split: tables moved to a new pipeline".into(),
+        "connector.auto_restart" => "Connector auto-restarted after a temporary failure".into(),
         "connector.state_changed" => "Connector state changed".into(),
         other => other.to_string(),
     };
@@ -214,11 +216,7 @@ async fn persist_redis(
     event: &AuditEvent,
 ) -> Result<(), redis::RedisError> {
     let payload = serde_json::to_string(event).map_err(|e| {
-        redis::RedisError::from((
-            redis::ErrorKind::TypeError,
-            "audit json",
-            e.to_string(),
-        ))
+        redis::RedisError::from((redis::ErrorKind::TypeError, "audit json", e.to_string()))
     })?;
     let mut conn = client.clone();
     let key = state.config.audit_redis_key.as_str();

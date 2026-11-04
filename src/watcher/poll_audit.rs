@@ -35,6 +35,57 @@ async fn run_loop(state: Arc<AppState>) {
     }
 }
 
+async fn emit_poll_audit_tick(
+    state: &AppState,
+    profile: &crate::models::CdcProfile,
+    interval_ms: u64,
+    connector: &str,
+    offsets: &str,
+    watermark_advanced: bool,
+) {
+    let interval_secs = profile
+        .flow
+        .schedule
+        .interval_seconds
+        .unwrap_or(if interval_ms >= 1000 {
+            (interval_ms / 1000) as u32
+        } else {
+            1
+        });
+    let tick_detail = detail_json(serde_json::json!({
+        "connector": connector,
+        "interval_ms": interval_ms,
+        "interval_seconds": interval_secs,
+        "delivery_mode": format!("{:?}", profile.flow.schedule.delivery_mode),
+        "capture_mode": format!("{:?}", profile.source.capture_mode),
+        "offsets": offsets,
+        "watermark_advanced": watermark_advanced,
+    }));
+    let event = new_event(
+        "system:poll_audit",
+        "sync.interval_tick",
+        "success",
+        &tick_detail,
+        Some(profile.id),
+        Some(profile.name.as_str()),
+    );
+    emit(state, event).await;
+    if watermark_advanced {
+        emit_system(
+            state,
+            "sync.watermark_advanced",
+            "success",
+            serde_json::json!({
+                "connector": connector,
+                "offsets": offsets,
+            }),
+            Some(profile.id),
+            Some(profile.name.as_str()),
+        )
+        .await;
+    }
+}
+
 async fn tick(state: &AppState) -> Result<(), AppError> {
     let profiles = state.profiles.list().await?;
     let now = Instant::now();
@@ -74,47 +125,15 @@ async fn tick(state: &AppState) -> Result<(), AppError> {
             let prev = offsets_map.insert(profile.id, offsets.clone());
             prev.is_some_and(|p| p != offsets)
         };
-        let interval_secs = profile
-            .flow
-            .schedule
-            .interval_seconds
-            .unwrap_or(if interval_ms >= 1000 {
-                (interval_ms / 1000) as u32
-            } else {
-                1
-            });
-        let tick_detail = detail_json(serde_json::json!({
-            "connector": connector,
-            "interval_ms": interval_ms,
-            "interval_seconds": interval_secs,
-            "delivery_mode": format!("{:?}", profile.flow.schedule.delivery_mode),
-            "capture_mode": format!("{:?}", profile.source.capture_mode),
-            "offsets": offsets,
-            "watermark_advanced": watermark_advanced,
-        }));
-        let event = new_event(
-            "system:poll_audit",
-            "sync.interval_tick",
-            "success",
-            &tick_detail,
-            Some(profile.id),
-            Some(profile.name.as_str()),
-        );
-        emit(state, event).await;
-        if watermark_advanced {
-            emit_system(
-                state,
-                "sync.watermark_advanced",
-                "success",
-                serde_json::json!({
-                    "connector": connector,
-                    "offsets": offsets,
-                }),
-                Some(profile.id),
-                Some(profile.name.as_str()),
-            )
-            .await;
-        }
+        emit_poll_audit_tick(
+            state,
+            &profile,
+            interval_ms,
+            &connector,
+            &offsets,
+            watermark_advanced,
+        )
+        .await;
     }
     Ok(())
 }

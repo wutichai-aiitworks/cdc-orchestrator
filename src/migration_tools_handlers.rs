@@ -54,6 +54,12 @@ pub async fn migration_tool_discover(
         "mongocopy" => migration_tools::mongocopy_discover(&state.config, &state.http)
             .await
             .map(Json),
+        "pgdump" => migration_tools::pgdump_discover(&state.config, &state.http)
+            .await
+            .map(Json),
+        "rsync" => migration_tools::rsync_discover(&state.config, &state.http)
+            .await
+            .map(Json),
         _ => Err(AppError::NotFound(format!(
             "unknown migration tool {tool_id}"
         ))),
@@ -78,4 +84,24 @@ pub async fn mongocopy_discover(State(state): State<AppState>) -> Result<Json<Va
 
 pub async fn mongocopy_contract(State(state): State<AppState>) -> Json<Value> {
     Json(migration_tools::mongocopy_contract(&state.config))
+}
+
+pub async fn pgdump_discover(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    migration_tools::pgdump_discover(&state.config, &state.http)
+        .await
+        .map(Json)
+}
+
+pub async fn pgdump_contract(State(state): State<AppState>) -> Json<Value> {
+    Json(migration_tools::pgdump_contract(&state.config))
+}
+
+pub async fn rsync_discover(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    migration_tools::rsync_discover(&state.config, &state.http)
+        .await
+        .map(Json)
+}
+
+pub async fn rsync_contract(State(state): State<AppState>) -> Json<Value> {
+    Json(migration_tools::rsync_contract(&state.config))
 }

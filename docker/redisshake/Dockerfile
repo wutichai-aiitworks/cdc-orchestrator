@@ -5,6 +5,7 @@ RUN apk add --no-cache python3 curl
 
 WORKDIR /app
 COPY serve.py /app/serve.py
+COPY --from=common jobstore.py probes.py http_api.py /app/
 
 RUN mkdir -p /var/lib/redisshake/jobs \
   && chmod +x /app/serve.py

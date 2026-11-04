@@ -1,377 +1,215 @@
 <script setup lang="ts">
-import { Database, Play, RefreshCw, Save, Square, Trash2 } from "@lucide/vue"
-import {
-  defaultPgLoaderOptions,
-  PGLOADER_SOURCE_TYPES,
-  type PgLoaderConn,
-  type PgLoaderJob,
-  type PgLoaderProfile,
-  usePgLoader,
-} from "~/composables/usePgLoader"
+import { transferTester } from "~/composables/useTransferTest"
+// Load to Postgres (pgloader) on the shared Copy & Sync workspace.
+import { Database } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
-import { formatApiError } from "~/utils/apiError"
+import { defaultPgLoaderOptions, type PgLoaderConn, type PgLoaderJob, type PgLoaderProfile, usePgLoader } from "~/composables/usePgLoader"
+import * as rules from "~/utils/transferTools/pgloader"
+import type { TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
 
-const toast = useToast()
-const {
-  fetchContract,
-  fetchCapability,
-  fetchProfiles,
-  createProfile,
-  updateProfile,
-  deleteProfile,
-  runProfile,
-  fetchJobs,
-  fetchJobLogs,
-  stopJob,
-  validateConnection,
-} = usePgLoader()
+const api = usePgLoader()
+const contract = ref<Record<string, unknown> | null>(null)
+onMounted(() => api.fetchContract().then((c) => (contract.value = c)).catch(() => {}))
 
-const emptySource = (): PgLoaderConn => ({
-  type: "mysql",
-  host: "",
-  port: "3306",
-  database: "",
-  username: "",
-  password: "",
-})
-
-const emptyTarget = (): PgLoaderConn => ({
-  type: "postgres",
-  host: "",
-  port: "5432",
-  database: "",
-  username: "",
-  password: "",
-})
-
-const profiles = ref<PgLoaderProfile[]>([])
-const jobs = ref<PgLoaderJob[]>([])
-const selectedId = ref("")
-const loading = ref(false)
-const saving = ref(false)
-const running = ref(false)
-const sidecarVersion = ref("")
-const includeTablesText = ref("")
-const logText = ref("")
-const logJobId = ref("")
-const error = ref("")
-const contractDefaults = ref<Record<string, unknown> | null>(null)
-
-const form = reactive({
-  name: "",
-  source: emptySource(),
-  target: emptyTarget(),
-  options: defaultPgLoaderOptions(),
-})
-
-const isFileSource = computed(() => ["sqlite", "csv"].includes(form.source.type))
-
-const onSourceType = () => {
-  const meta = PGLOADER_SOURCE_TYPES.find((item) => item.value === form.source.type)
-  form.source.port = meta?.port || ""
-}
-
-const loadAll = async () => {
-  loading.value = true
-  error.value = ""
-  try {
-    const [cap, profs, jobList] = await Promise.all([
-      fetchCapability().catch(() => ({})),
-      fetchProfiles(),
-      fetchJobs(),
-    ])
-    sidecarVersion.value = String((cap as any)?.pgloader_version || "")
-    profiles.value = profs
-    jobs.value = jobList
-    if (!selectedId.value && profs.length) selectProfile(profs[0].id)
-  } catch (e: any) {
-    error.value = formatApiError(e, "Failed to load pgloader")
-  } finally {
-    loading.value = false
+const emptySource = (): PgLoaderConn => ({ type: "mysql", host: "", port: "3306", database: "", username: "", password: "" })
+const emptyTarget = (): PgLoaderConn => ({ type: "postgres", host: "", port: "5432", database: "", username: "", password: "" })
+const num = (v: unknown) => (v === "" || v == null || Number.isNaN(Number(v)) ? undefined : Number(v))
+const toPayload = (d: any) => {
+  const file = rules.isFile(d)
+  return {
+    name: d.name.trim(),
+    // A file source is just a path (kept in `database`); no host or login is sent.
+    source: file ? { type: d.source.type, host: "", port: "", database: d.source.database.trim(), username: "", password: "" } : { ...d.source },
+    target: { ...d.target, type: "postgres" },
+    include_tables: rules.isCsv(d) ? [] : [...d.include_tables],
+    options: {
+      ...d.options,
+      workers: num(d.options.workers),
+      concurrency: num(d.options.concurrency),
+      csv_skip_header: num(d.options.csv_skip_header),
+      target_table: d.options.target_table?.trim() || undefined,
+    },
   }
 }
+const test = transferTester("pgloader")
 
-const selectProfile = (id: string) => {
-  selectedId.value = id
-  const p = profiles.value.find((item) => item.id === id)
-  if (!p) return
-  form.name = p.name
-  form.source = { ...emptySource(), ...p.source }
-  form.target = { ...emptyTarget(), ...p.target }
-  form.options = { ...defaultPgLoaderOptions(), ...p.options }
-  includeTablesText.value = (p.include_tables || []).join("\n")
+/** ", PostgreSQL 17" once a connection test has run (the route then names the server). */
+const ver = (check: any, name: string) => (check?.ok && check.raw?.server_version ? `, ${name} ${String(check.raw.server_version).split(" ")[0]}` : "")
+
+const tool: TransferTool<PgLoaderProfile, any, PgLoaderJob> = {
+  key: "pgloader",
+  title: "Load to Postgres",
+  icon: Database,
+  intro: "Load a MySQL, MariaDB, SQL Server or SQLite database, or a CSV file, into PostgreSQL. Types are converted for you.",
+  emptyText: "A transfer loads another database or a CSV file into PostgreSQL with pgloader, creating the tables and converting types.",
+  namePlaceholder: "Legacy shop to Postgres",
+  api: {
+    fetchProfiles: api.fetchProfiles,
+    createProfile: api.createProfile,
+    updateProfile: api.updateProfile,
+    deleteProfile: api.deleteProfile,
+    runProfile: api.runProfile,
+    fetchJobs: api.fetchJobs,
+    fetchJobLogs: api.fetchJobLogs,
+    stopJob: api.stopJob,
+    fetchCapability: api.fetchCapability,
+  },
+  newDraft: () => ({
+    name: "",
+    source: emptySource(),
+    target: emptyTarget(),
+    include_tables: [],
+    options: applyContractOptionDefaults(defaultPgLoaderOptions(), contract.value ?? undefined),
+  }),
+  toDraft: (p) => ({
+    name: p.name,
+    source: { ...emptySource(), ...p.source },
+    target: { ...emptyTarget(), ...p.target },
+    include_tables: [...(p.include_tables || [])],
+    options: { ...defaultPgLoaderOptions(), ...p.options },
+  }),
+  toPayload,
+  changeLabels: rules.changeLabels,
+  verb: rules.verb,
+  startedToast: rules.startedToast,
+  modeLabel: (p) => `${rules.engineOf(p.source.type).label} to PostgreSQL`,
+  runResult: rules.runResult,
+  steps: (p, job, log) => rules.steps(p, job, log),
+  summary: rules.summary,
+  effects: rules.effects,
+  problems: rules.problems,
+  // Runs before per-run job ids used the profile id as the job id.
+  jobsOf: (jobs, id) => jobs.filter((j) => (j.profile_id || j.id) === id),
+  routeSource: (p) =>
+    rules.isFile(p)
+      ? { engine: p.source.type, role: rules.engineOf(p.source.type).label, title: p.source.database.split("/").pop() || "", detail: p.source.database, mono: true }
+      : { engine: p.source.type, role: `Source, ${rules.engineOf(p.source.type).label}`, title: p.source.host, detail: p.source.database ? `${p.source.database}, port ${p.source.port || rules.engineOf(p.source.type).port}` : "" },
+  routeDestinations: (p, checks) => [
+    {
+      engine: "postgres",
+      role: `Target${ver(checks.target, "PostgreSQL") || ", PostgreSQL"}`,
+      title: p.target.host,
+      detail: rules.isCsv(p) ? `${p.target.database}, table ${p.options.target_table || "?"}` : p.target.database ? `${p.target.database}, port ${p.target.port || "5432"}` : "",
+      overwrite: !rules.isCsv(p) && p.options.drop_if_exists ? "Replaces existing tables" : !rules.isCsv(p) && p.options.truncate ? "Empties tables first" : undefined,
+    },
+  ],
+  railRoute: (p) => `${rules.isFile(p) ? p.source.database.split("/").pop() : `${p.source.host}/${p.source.database}`} → ${p.target.host}/${p.target.database}`,
+  railEngines: (p) => [p.source.type, "postgres"],
+  sections: (p) =>
+    [
+      { id: "pl-source", label: "Source" },
+      { id: "pl-target", label: "Target database" },
+      { id: "pl-scope", label: rules.isCsv(p) ? "CSV format" : "What to load" },
+      !rules.isCsv(p) && { id: "pl-behaviour", label: "Target behaviour" },
+      !rules.isCsv(p) && { id: "pl-speed", label: "Speed" },
+    ].filter(Boolean) as { id: string; label: string }[],
+  capabilityLine: (c) => {
+    const v = String(c.pgloader_version || "").match(/version "?([^"\s]+)"?/)
+    return v ? `pgloader ${v[1]}` : ""
+  },
 }
 
-const payloadFromForm = () => ({
-  name: form.name.trim(),
-  source: form.source,
-  target: form.target,
-  include_tables: includeTablesText.value.split("\n").map((line) => line.trim()).filter(Boolean),
-  options: form.options,
-})
-
-const saveProfile = async () => {
-  if (!form.name.trim()) {
-    toast.error("Profile name is required")
-    return
-  }
-  saving.value = true
-  try {
-    const body = payloadFromForm()
-    if (selectedId.value) {
-      const updated = await updateProfile(selectedId.value, body)
-      const idx = profiles.value.findIndex((p) => p.id === updated.id)
-      if (idx >= 0) profiles.value[idx] = updated
-      toast.success("Profile saved")
-    } else {
-      const created = await createProfile(body as any)
-      profiles.value.push(created)
-      selectProfile(created.id)
-      toast.success("Profile created")
-    }
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    saving.value = false
-  }
+const ENGINE_OPTIONS = rules.ENGINES.map((e) => ({ value: e.value, label: e.label }))
+const setEngine = (draft: any, value: string) => {
+  const meta = rules.engineOf(value)
+  const wasFile = rules.isFile(draft)
+  draft.source.type = value
+  draft.source.port = meta.port
+  if (meta.file !== wasFile) draft.source.database = ""
 }
-
-const newProfile = () => {
-  selectedId.value = ""
-  form.name = ""
-  form.source = emptySource()
-  form.target = emptyTarget()
-  form.options = applyContractOptionDefaults(defaultPgLoaderOptions(), contractDefaults.value ?? undefined)
-  includeTablesText.value = ""
-}
-
-const removeProfile = async () => {
-  if (!selectedId.value || !confirm("Delete this pgloader profile?")) return
-  try {
-    await deleteProfile(selectedId.value)
-    profiles.value = profiles.value.filter((p) => p.id !== selectedId.value)
-    newProfile()
-    toast.success("Profile deleted")
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const runSelected = async () => {
-  if (!selectedId.value) {
-    toast.error("Save a profile before running")
-    return
-  }
-  running.value = true
-  try {
-    await saveProfile()
-    const job = await runProfile(selectedId.value)
-    toast.success(`Load job started (${job.id})`)
-    await loadAll()
-    if (job.id) await showLogs(job.id)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  } finally {
-    running.value = false
-  }
-}
-
-const showLogs = async (jobId: string) => {
-  logJobId.value = jobId
-  try {
-    logText.value = (await fetchJobLogs(jobId)).log || ""
-  } catch (e: any) {
-    logText.value = formatApiError(e, "Failed to load logs")
-  }
-}
-
-const stopRunningJob = async (jobId: string) => {
-  try {
-    await stopJob(jobId)
-    toast.success("Stop requested")
-    await loadAll()
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-const testConn = async (which: "source" | "target") => {
-  try {
-    const res = await validateConnection(which === "source" ? form.source : form.target)
-    toast[res.valid ? "success" : "error"](res.message)
-  } catch (e: any) {
-    toast.error(formatApiError(e, "Request failed"))
-  }
-}
-
-let pollTimer: ReturnType<typeof setInterval> | null = null
-onMounted(() => {
-  fetchContract().then((c) => { contractDefaults.value = c }).catch(() => {})
-  loadAll()
-  pollTimer = setInterval(() => {
-    fetchJobs().then((j) => (jobs.value = j)).catch(() => {})
-    if (logJobId.value) showLogs(logJobId.value)
-  }, 8000)
-})
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
-})
+const CHECK_NOTE = "Tested from the pgloader container, the same way a run connects."
 </script>
 
 <template>
-  <div class="space-y-6 animate-fade-in">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-xl font-semibold text-foreground flex items-center gap-2">
-          <Database class="h-5 w-5 text-primary" />
-          Load to Postgres (pgloader)
-        </h1>
-        <div class="mt-1 flex items-center gap-1.5">
-          <span class="text-sm font-medium text-foreground">MySQL / SQL Server / SQLite / CSV → Postgres</span>
-          <AppInfoHint
-            :text="`Configure a load into PostgreSQL without running pgloader yourself.${sidecarVersion ? ` Sidecar ${sidecarVersion}.` : ''}`"
+  <TransferWorkspace :tool="tool">
+    <template #config="{ draft, checks, savedLogin, selectedId, isNew }">
+      <TransferSection id="pl-source" title="Source" :why="rules.isFile(draft) ? 'The file must be readable inside the pgloader container, for example on a mounted volume.' : 'The database to load from. A read-only login is enough.'">
+        <div>
+          <span class="auth-label !mb-1.5">Load from</span>
+          <TransferSegmented :model-value="draft.source.type" :options="ENGINE_OPTIONS" label="Source engine" @update:model-value="setEngine(draft, $event)" />
+        </div>
+        <TransferConnection
+          :key="`src-${selectedId}-${rules.isFile(draft)}`"
+          v-model="draft.source"
+          v-model:result="checks.source"
+          :engine="draft.source.type"
+          :default-port="rules.engineOf(draft.source.type).port"
+          :database="{ label: 'Database', placeholder: 'shop' }"
+          :file="rules.isFile(draft) ? { label: draft.source.type === 'csv' ? 'CSV file path' : 'SQLite file path', placeholder: draft.source.type === 'csv' ? '/data/orders.csv' : '/data/shop.sqlite' } : null"
+          :check="test('source', () => ({ csv_delimiter: draft.options.csv_delimiter }), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :saved-login="savedLogin('source', rules.engineOf(draft.source.type).port)"
+          :start-editing="isNew || (!draft.source.host && !draft.source.database)"
+        />
+      </TransferSection>
+
+      <TransferSection id="pl-target" title="Target database" why="The PostgreSQL database to load into. The role needs to create tables there.">
+        <TransferConnection
+          :key="`tgt-${selectedId}`"
+          v-model="draft.target"
+          v-model:result="checks.target"
+          engine="postgres"
+          default-port="5432"
+          username-placeholder="loader"
+          :database="{ label: 'Database', placeholder: 'shop' }"
+          :check="test('target', () => ({}), () => (isNew ? undefined : selectedId))"
+          :check-note="CHECK_NOTE"
+          :saved-login="savedLogin('target', '5432')"
+          :start-editing="isNew || !draft.target.host"
+        />
+      </TransferSection>
+
+      <TransferSection v-if="rules.isCsv(draft)" id="pl-scope" title="CSV format" why="How the file is read, and which table its rows go into. Rows are added to the table; existing rows stay.">
+        <div class="grid max-w-xl gap-3 sm:grid-cols-3">
+          <label class="sm:col-span-3">
+            <span class="auth-label !mb-1.5">Into table</span>
+            <input v-model="draft.options.target_table" class="auth-input font-mono !text-xs" placeholder="public.orders" spellcheck="false" />
+          </label>
+          <label>
+            <span class="auth-label !mb-1.5">Field separator</span>
+            <input v-model="draft.options.csv_delimiter" class="auth-input font-mono" maxlength="1" placeholder="," />
+          </label>
+          <label>
+            <span class="auth-label !mb-1.5">Header lines to skip</span>
+            <input v-model.number="draft.options.csv_skip_header" type="number" min="0" class="auth-input tabular-nums" placeholder="1" />
+          </label>
+        </div>
+      </TransferSection>
+
+      <template v-else>
+        <TransferSection id="pl-scope" title="What to load" why="Leave empty to load every table.">
+          <TransferTokens v-model="draft.include_tables" label="Only tables matching" help="Table names or patterns, as pgloader matches them." placeholder="All tables" />
+        </TransferSection>
+
+        <TransferSection id="pl-behaviour" title="Target behaviour" why="What pgloader does in the target database before and after loading the rows.">
+          <TransferSwitch v-model="draft.options.create_tables" label="Create the tables" help="Off: the tables must already exist with matching columns." />
+          <TransferSwitch
+            v-model="draft.options.drop_if_exists"
+            label="Drop existing tables first"
+            help="Tables being loaded that already exist are dropped and recreated."
+            :disabled="!draft.options.create_tables"
+            danger
           />
-        </div>
-      </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap inline-flex items-center gap-2" @click="loadAll">
-          <RefreshCw class="h-4 w-4" :class="loading ? 'animate-spin' : ''" />
-          Refresh
-        </button>
-        <button type="button" class="btn-secondary !w-auto whitespace-nowrap" @click="newProfile">New profile</button>
-      </div>
-    </div>
+          <TransferSwitch v-model="draft.options.truncate" label="Empty tables before loading" help="Existing rows are removed (TRUNCATE) before the new rows are loaded." danger />
+          <TransferSwitch v-model="draft.options.create_indexes" label="Build indexes" help="Off: faster load; create the indexes yourself afterwards." />
+          <TransferSwitch v-model="draft.options.reset_sequences" label="Reset sequences" help="Sequences continue after the highest loaded value, so new rows get fresh ids." />
+        </TransferSection>
 
-    <p v-if="error" class="alert-error text-sm">{{ error }}</p>
-
-    <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
-      <aside class="xl:col-span-3 card p-4 space-y-2">
-        <h2 class="text-sm font-medium text-muted-foreground">Saved profiles</h2>
-        <button
-          v-for="p in profiles"
-          :key="p.id"
-          type="button"
-          class="w-full text-left rounded-xl px-3 py-2 text-sm border transition-colors"
-          :class="selectedId === p.id ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/40'"
-          @click="selectProfile(p.id)"
-        >
-          <div class="font-medium truncate">{{ p.name }}</div>
-          <div class="text-xs text-muted-foreground truncate">{{ p.source.type }} → Postgres</div>
-        </button>
-        <p v-if="!profiles.length" class="text-sm text-muted-foreground italic">No profiles yet.</p>
-      </aside>
-
-      <section class="xl:col-span-9 space-y-4">
-        <div class="card p-5 space-y-4">
-          <input v-model="form.name" type="text" placeholder="Profile name" class="auth-input w-full" />
-
-          <div class="grid md:grid-cols-2 gap-4">
-            <div class="space-y-2 rounded-xl border border-border p-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold">Source</h3>
-                <button type="button" class="text-xs text-primary underline" @click="testConn('source')">Validate</button>
-              </div>
-              <select v-model="form.source.type" class="auth-input w-full" @change="onSourceType">
-                <option v-for="item in PGLOADER_SOURCE_TYPES" :key="item.value" :value="item.value">{{ item.label }}</option>
-              </select>
-              <input
-                v-if="isFileSource"
-                v-model="form.source.database"
-                class="auth-input w-full"
-                :placeholder="form.source.type === 'csv' ? 'CSV path on sidecar (/data/file.csv)' : 'SQLite path on sidecar'"
-              />
-              <template v-else>
-                <input v-model="form.source.host" class="auth-input w-full" placeholder="Host" />
-                <div class="grid grid-cols-2 gap-2">
-                  <input v-model="form.source.port" class="auth-input" placeholder="Port" />
-                  <input v-model="form.source.database" class="auth-input" placeholder="Database" />
-                </div>
-                <input v-model="form.source.username" class="auth-input w-full" placeholder="Username" />
-                <input v-model="form.source.password" type="password" class="auth-input w-full" placeholder="Password" />
-              </template>
-            </div>
-            <div class="space-y-2 rounded-xl border border-border p-4">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold">Target Postgres</h3>
-                <button type="button" class="text-xs text-primary underline" @click="testConn('target')">Validate</button>
-              </div>
-              <input v-model="form.target.host" class="auth-input w-full" placeholder="Host" />
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model="form.target.port" class="auth-input" placeholder="Port" />
-                <input v-model="form.target.database" class="auth-input" placeholder="Database" />
-              </div>
-              <input v-model="form.target.username" class="auth-input w-full" placeholder="Username" />
-              <input v-model="form.target.password" type="password" class="auth-input w-full" placeholder="Password" />
-            </div>
-          </div>
-
-          <div v-if="form.source.type !== 'csv'">
-            <label class="auth-label">Include tables (optional, one per line)</label>
-            <textarea v-model="includeTablesText" rows="3" class="auth-input w-full font-mono text-xs" />
-          </div>
-          <div v-else class="grid sm:grid-cols-3 gap-3">
-            <label class="text-xs text-muted-foreground">Target table
-              <input v-model="form.options.target_table" class="auth-input w-full mt-1" placeholder="public.imported" />
+        <TransferSection id="pl-speed" title="Speed" why="More workers load faster but use more memory and connections.">
+          <div class="grid max-w-xl gap-3 sm:grid-cols-2">
+            <label>
+              <span class="auth-label !mb-1.5">Workers</span>
+              <input v-model.number="draft.options.workers" type="number" min="1" max="64" class="auth-input tabular-nums" placeholder="Default" />
             </label>
-            <label class="text-xs text-muted-foreground">Delimiter
-              <input v-model="form.options.csv_delimiter" class="auth-input w-full mt-1" />
-            </label>
-            <label class="text-xs text-muted-foreground">Skip header rows
-              <input v-model.number="form.options.csv_skip_header" type="number" min="0" class="auth-input w-full mt-1" />
+            <label>
+              <span class="auth-label !mb-1.5">Concurrent loads</span>
+              <input v-model.number="draft.options.concurrency" type="number" min="1" max="64" class="auth-input tabular-nums" placeholder="Default" />
             </label>
           </div>
-
-          <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.drop_if_exists" type="checkbox" class="rounded border-border" /> Drop existing</label>
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.create_tables" type="checkbox" class="rounded border-border" /> Create tables</label>
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.create_indexes" type="checkbox" class="rounded border-border" /> Create indexes</label>
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.reset_sequences" type="checkbox" class="rounded border-border" /> Reset sequences</label>
-            <label class="flex items-center gap-2 text-sm"><input v-model="form.options.truncate" type="checkbox" class="rounded border-border" /> Truncate</label>
-          </div>
-
-          <div class="flex flex-wrap gap-2 pt-2">
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="saving" @click="saveProfile">
-              <Save class="h-4 w-4" /> Save
-            </button>
-            <button type="button" class="btn-primary inline-flex items-center gap-2" :disabled="running || !selectedId" @click="runSelected">
-              <Play class="h-4 w-4" /> Run load
-            </button>
-            <button v-if="selectedId" type="button" class="btn-secondary inline-flex items-center gap-2" @click="removeProfile">
-              <Trash2 class="h-4 w-4" /> Delete
-            </button>
-          </div>
-        </div>
-
-        <div class="card p-5 space-y-3">
-          <h2 class="text-sm font-semibold">Jobs</h2>
-          <table class="data-table w-full text-sm">
-            <thead>
-              <tr class="text-left text-muted-foreground">
-                <th class="p-2">ID</th>
-                <th class="p-2">Status</th>
-                <th class="p-2">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="job in jobs" :key="job.id" class="border-t border-border">
-                <td class="p-2 font-mono text-xs">{{ job.id.slice(0, 8) }}…</td>
-                <td class="p-2">
-                  <span class="badge-neutral" :class="{ 'badge-success': job.status === 'succeeded', 'badge-error': job.status === 'failed', 'badge-warning': job.status === 'running' }">{{ job.status }}</span>
-                </td>
-                <td class="p-2 flex gap-2">
-                  <button type="button" class="text-xs text-primary underline" @click="showLogs(job.id)">Logs</button>
-                  <button v-if="job.status === 'running'" type="button" class="text-xs text-red-400 inline-flex items-center gap-1" @click="stopRunningJob(job.id)">
-                    <Square class="h-3 w-3" /> Stop
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <pre v-if="logText" class="code-block text-xs max-h-80 overflow-auto whitespace-pre-wrap">{{ logText }}</pre>
-        </div>
-      </section>
-    </div>
-  </div>
+        </TransferSection>
+      </template>
+    </template>
+  </TransferWorkspace>
 </template>

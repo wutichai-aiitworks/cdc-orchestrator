@@ -66,9 +66,39 @@ export type TableSyncStatusRow = {
   kafka_messages?: number | null
   processing_rows?: number | null
   source_offset?: unknown
+  /** Incremental rolling-window / full-copy rule; absent = JDBC watermark. */
+  poll_rule?: import("~/composables/useProfilesM3").TablePollRule | null
   source_count_error?: string | null
   target_count_error?: string | null
   kafka_error?: string | null
+  source_count_diagnosis?: ErrorDiagnosis | null
+  target_count_diagnosis?: ErrorDiagnosis | null
+  kafka_diagnosis?: ErrorDiagnosis | null
+}
+
+/** Orchestrator's answer to "where is the problem and how do I fix it". */
+export type ErrorDiagnosis = {
+  area:
+    | "source_database"
+    | "target_database"
+    | "network"
+    | "kafka_connect"
+    | "kafka"
+    | "schema_registry"
+    | "pipeline_config"
+    | "orchestrator"
+  area_label: string
+  /** Which end of the pipeline the failure belongs to, when it belongs to one. */
+  side?: "source" | "target" | null
+  title: string
+  fix: string
+}
+
+export type ConnectorIssue = {
+  connector: string
+  role: "source" | "sink"
+  message: string
+  diagnosis: ErrorDiagnosis
 }
 
 export type ProfileTableSyncStatusResponse = {
@@ -79,6 +109,9 @@ export type ProfileTableSyncStatusResponse = {
   capture_mode: string
   tables: TableSyncStatusRow[]
   counts_skipped: boolean
+  /** Profile says Running but a connector/task FAILED or is PAUSED in Kafka Connect. */
+  connector_issue?: string | null
+  connector_issues?: ConnectorIssue[]
 }
 
 export type AlertRule = {
@@ -159,7 +192,7 @@ export const useOperationsM3 = () => {
 
   const fetchProfileTableSyncStatus = (
     profileId: string,
-    query?: { skip_counts?: boolean },
+    query?: { skip_counts?: boolean; skip_source_counts?: boolean; tables?: string },
   ) =>
     $fetch<ProfileTableSyncStatusResponse>(
       `/api/cdc/profiles/${encodeURIComponent(profileId)}/tables/sync-status`,

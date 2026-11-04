@@ -517,7 +517,9 @@ pub(crate) fn urlencoding_simple(s: &str) -> String {
     // Percent-encode UTF-8 bytes, not chars: `c as u8` truncated non-ASCII names (e.g. Thai).
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -542,7 +544,10 @@ mod tests {
         });
         AppState {
             cfg: cfg.clone(),
-            http: Client::builder().timeout(Duration::from_millis(500)).build().unwrap(),
+            http: Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap(),
             sessions: Arc::new(RwLock::new(HashSet::new())),
             rate_limit: Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit_rpm))),
         }
@@ -566,21 +571,40 @@ mod tests {
         let defs = tools::definitions();
         let mut seen = HashSet::new();
         for d in &defs {
-            assert!(d.name.starts_with("cdc_"), "{} must start with cdc_", d.name);
+            assert!(
+                d.name.starts_with("cdc_"),
+                "{} must start with cdc_",
+                d.name
+            );
             assert!(seen.insert(d.name.clone()), "duplicate tool {}", d.name);
             assert!(d.description.len() >= 10, "{} needs a description", d.name);
             assert_eq!(d.input_schema["type"], "object", "{} input schema", d.name);
-            assert!(d.annotations["readOnlyHint"].is_boolean(), "{} readOnlyHint", d.name);
+            assert!(
+                d.annotations["readOnlyHint"].is_boolean(),
+                "{} readOnlyHint",
+                d.name
+            );
         }
     }
 
     #[test]
     fn required_args_exist_in_properties() {
         for d in tools::definitions() {
-            let props = d.input_schema["properties"].as_object().cloned().unwrap_or_default();
-            for req in d.input_schema["required"].as_array().cloned().unwrap_or_default() {
+            let props = d.input_schema["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for req in d.input_schema["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
                 let key = req.as_str().unwrap();
-                assert!(props.contains_key(key), "{}: required `{key}` missing from properties", d.name);
+                assert!(
+                    props.contains_key(key),
+                    "{}: required `{key}` missing from properties",
+                    d.name
+                );
             }
         }
     }
@@ -605,13 +629,20 @@ mod tests {
             if d.annotations["readOnlyHint"] == json!(true) {
                 continue;
             }
-            let call = ToolCall { name: d.name.clone(), arguments: generous_args() };
+            let call = ToolCall {
+                name: d.name.clone(),
+                arguments: generous_args(),
+            };
             match tools::call(&st, call).await {
                 Err(ApiError::Message(m)) if m.contains("write tools disabled") => {}
                 other => unguarded.push(format!("{} → {:?}", d.name, other.map(|_| "ok"))),
             }
         }
-        assert!(unguarded.is_empty(), "write tools without guard_write:\n{}", unguarded.join("\n"));
+        assert!(
+            unguarded.is_empty(),
+            "write tools without guard_write:\n{}",
+            unguarded.join("\n")
+        );
     }
 
     #[test]
@@ -633,7 +664,10 @@ mod tests {
     fn bearer_check_is_exact() {
         let mut h = HeaderMap::new();
         assert!(!bearer_ok(&h, "secret-token"));
-        h.insert(header::AUTHORIZATION, "Bearer secret-token".parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
         assert!(bearer_ok(&h, "secret-token"));
         assert!(!bearer_ok(&h, "secret-token-2"));
         h.insert(header::AUTHORIZATION, "Basic secret-token".parse().unwrap());

@@ -3,8 +3,7 @@ import type { Component } from "vue"
 import {
   Activity,
   AlertCircle,
-  CircleCheck,
-  CircleX,
+  AlertTriangle,
   FlaskConical,
   MoreHorizontal,
   Pause,
@@ -12,17 +11,20 @@ import {
   Play,
   Power,
   RefreshCcwDot,
+  DatabaseZap,
   RotateCw,
   ScrollText,
   Settings2,
   Square,
   Table2,
+  Split,
   Trash2,
+  Unplug,
 } from "@lucide/vue"
 import type { ActionMenuItem } from "~/components/AppActionMenu.vue"
-import type { AuditEventItem } from "~/composables/useOperationsM3"
 import type { CdcProfile, ProfileDlqStatus } from "~/composables/useProfilesM3"
 import { formatApiError } from "~/utils/apiError"
+import { eventLabel } from "~/utils/pipelineEvents"
 
 /**
  * Selected-pipeline view: status with its reason, the one next action, and tabs
@@ -41,6 +43,8 @@ export type PipelineDetailAction =
   | "delete"
   | "test-sync"
   | "resync"
+  | "initial-load"
+  | "split"
 
 type FlowProps = {
   sourceLabel: string
@@ -85,24 +89,6 @@ const tab = ref<TabKey>(isReplica.value ? "tables" : "activity")
 const status = computed(() => String(props.profile.status || "unknown").toLowerCase())
 const history = computed(() => [...(props.profile.history ?? [])].reverse())
 
-const EVENT_LABELS: Record<string, string> = {
-  profile_created: "Created",
-  profile_updated: "Configuration updated",
-  profile_started: "Started",
-  profile_autostarted: "Started after orchestrator restart",
-  profile_stopped: "Stopped",
-  profile_paused: "Paused",
-  profile_resumed: "Resumed",
-  profile_restarted: "Restarted",
-  profile_resynced: "Resynced",
-  profile_enable_changed: "Enabled state changed",
-  profile_test_initial_sync: "Test initial sync passed",
-  profile_test_initial_sync_failed: "Test initial sync failed",
-}
-
-const eventLabel = (event: string) =>
-  EVENT_LABELS[event] ?? event.replace(/^profile[._]/, "").replace(/[._]/g, " ").replace(/^\w/, (c) => c.toUpperCase())
-
 const relativeTime = (iso?: string | null) => {
   if (!iso) return ""
   const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000)
@@ -142,6 +128,44 @@ const primary = computed<Primary>(() => {
   return { key: "start", label: "Start", icon: Play, disabled: !props.canStart, title: props.startBlockedReason }
 })
 
+/** Streaming initial load copies into PostgreSQL replicas only. */
+/** Source / target connection state reported by the Tables panel (null = not checked). */
+const endpointHealth = ref<import("~/components/ProfileTableSyncPanel.vue").PipelineHealth | null>(null)
+watch(
+  () => props.profile.id,
+  () => {
+    endpointHealth.value = null
+  },
+)
+
+const endpointProblems = computed(() => {
+  const h = endpointHealth.value
+  if (!h) return []
+  const out: { key: string; label: string; offline: boolean }[] = []
+  for (const side of ["source", "target"] as const) {
+    const name = side === "source" ? "Source" : "Target"
+    if (h[side] === "offline") out.push({ key: side, label: `${name} offline`, offline: true })
+    else if (h[side] === "attention") out.push({ key: side, label: `${name} needs attention`, offline: false })
+  }
+  if (h.engine && !out.length) out.push({ key: "engine", label: "Sync engine issue", offline: false })
+  return out
+})
+
+/** Explicit table list with ≥ 2 tables, not trigger capture (triggers belong to one pipeline). */
+const supportsSplit = computed(
+  () =>
+    props.profile.pattern !== "source_to_olake" &&
+    props.profile.source?.capture_mode !== "trigger" &&
+    props.profile.source?.table_mode === "specific_tables" &&
+    (props.profile.source?.tables ?? []).filter((t) => t.trim()).length >= 2,
+)
+
+const supportsInitialLoad = computed(
+  () =>
+    isReplica.value &&
+    ["postgres", "postgresql"].includes(String(props.profile.target?.target_type || "").toLowerCase()),
+)
+
 const moreItems = computed<ActionMenuItem[]>(() => {
   const blocked = !props.canStart
   const items: ActionMenuItem[] = [
@@ -155,6 +179,12 @@ const moreItems = computed<ActionMenuItem[]>(() => {
     items.push({ key: "test-sync", label: "Test initial sync…", icon: FlaskConical, disabled: blocked, separatorBefore: true })
   }
   items.push({ key: "resync", label: "Resync…", icon: RefreshCcwDot, disabled: blocked, separatorBefore: !props.supportsTestSync })
+  if (supportsInitialLoad.value) {
+    items.push({ key: "initial-load", label: "Initial load (streaming)…", icon: DatabaseZap, disabled: !props.profile.enabled })
+  }
+  if (supportsSplit.value) {
+    items.push({ key: "split", label: "Split tables into new pipeline…", icon: Split, separatorBefore: true })
+  }
   if (primary.value.key !== "toggle-enabled") {
     items.push({ key: "toggle-enabled", label: props.profile.enabled ? "Disable" : "Enable", icon: Power, separatorBefore: true })
   }
@@ -162,66 +192,41 @@ const moreItems = computed<ActionMenuItem[]>(() => {
   return items
 })
 
-// ── Activity: profile history + audit trail ──────────────────────────────────
+// ── Activity ────────────────────────────────────────────────────────────────
+// The timeline itself lives in PipelineActivityTimeline. Here only the tab's red dot:
+// a failure in the last 24 h (pipeline history or audit trail), not "ever failed".
 
 const { fetchAuditEvents } = useOperationsM3()
-const audit = ref<AuditEventItem[]>([])
-const auditLoading = ref(false)
-const auditError = ref("")
+const RECENT_MS = 24 * 3_600_000
+const recentAuditFailure = ref(false)
 
-const loadAudit = async () => {
-  auditLoading.value = true
-  auditError.value = ""
-  try {
-    audit.value = (await fetchAuditEvents({ profile_id: props.profile.id, limit: 50 })).items ?? []
-  } catch (e: any) {
-    auditError.value = formatApiError(e, "Audit trail unavailable")
-  } finally {
-    auditLoading.value = false
-  }
-}
+const recentFailure = computed(
+  () =>
+    recentAuditFailure.value ||
+    history.value.some(
+      (h) =>
+        (h.level === "error" || h.event.endsWith("_failed")) &&
+        Date.now() - new Date(h.timestamp).getTime() < RECENT_MS,
+    ),
+)
 
 watch(
-  () => [tab.value, props.profile.updated_at] as const,
-  ([current]) => {
-    if (current === "activity") void loadAudit()
+  () => [props.profile.id, props.profile.updated_at] as const,
+  async () => {
+    try {
+      const res = await fetchAuditEvents({
+        profile_id: props.profile.id,
+        outcome: "failure",
+        since: new Date(Date.now() - RECENT_MS).toISOString(),
+        limit: 1,
+      })
+      recentAuditFailure.value = (res.items?.length ?? 0) > 0
+    } catch {
+      recentAuditFailure.value = false
+    }
   },
   { immediate: true },
 )
-
-type ActivityRow = { key: string; at: string; title: string; detail: string; failed: boolean; source: "pipeline" | "audit" }
-
-const activity = computed<ActivityRow[]>(() => {
-  const rows: ActivityRow[] = history.value.map((h, i) => ({
-    key: `h-${i}-${h.timestamp}`,
-    at: h.timestamp,
-    title: eventLabel(h.event),
-    detail: h.detail,
-    failed: h.level === "error" || h.event.endsWith("_failed"),
-    source: "pipeline",
-  }))
-  for (const e of audit.value) {
-    if (e.outcome === "success") continue // successes already appear in the pipeline history
-    rows.push({
-      key: `a-${e.audit_id}`,
-      at: e.timestamp,
-      title: `${e.action} failed`,
-      detail: auditErrorText(e.detail),
-      failed: true,
-      source: "audit",
-    })
-  }
-  return rows.sort((a, b) => b.at.localeCompare(a.at))
-})
-
-const auditErrorText = (detail: string) => {
-  try {
-    const parsed = JSON.parse(detail)
-    return String(parsed?.error ?? detail)
-  } catch {
-    return detail
-  }
-}
 
 // ── Configuration in plain language ──────────────────────────────────────────
 
@@ -299,6 +304,21 @@ const configRows = computed(() => [
           <div class="flex flex-wrap items-center gap-2">
             <h2 class="truncate text-lg font-semibold text-foreground">{{ profile.name }}</h2>
             <AppStatusBadge :status="profile.enabled ? profile.status : 'disabled'" />
+            <!-- Which end is broken, in plain words (from the Tables panel's checks). -->
+            <template v-if="profile.status === 'running' && endpointHealth">
+              <span
+                v-for="side in endpointProblems"
+                :key="side.key"
+                class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium"
+                :class="side.offline
+                  ? 'border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300'"
+              >
+                <Unplug v-if="side.offline" class="h-3 w-3" :stroke-width="2" />
+                <AlertTriangle v-else class="h-3 w-3" :stroke-width="2" />
+                {{ side.label }}
+              </span>
+            </template>
             <button
               v-if="autoNamed"
               type="button"
@@ -349,7 +369,9 @@ const configRows = computed(() => [
 
     <!-- Tabs -->
     <div class="stat-card p-0">
-      <div class="flex gap-1 overflow-x-auto border-b border-border px-2" role="tablist">
+      <!-- No scroll container: overflow-x-auto also makes overflow-y auto, and the tabs'
+           -mb-px underline overlap then showed a vertical scrollbar. Wrap instead. -->
+      <div class="flex flex-wrap gap-x-1 border-b border-border px-2" role="tablist">
         <button
           v-for="t in tabs"
           :key="t.key"
@@ -363,38 +385,33 @@ const configRows = computed(() => [
           <component :is="t.icon" class="h-4 w-4" :stroke-width="1.75" />
           {{ t.label }}
           <span
-            v-if="t.key === 'activity' && activity.some((r) => r.failed)"
+            v-if="t.key === 'activity' && recentFailure"
             class="h-1.5 w-1.5 rounded-full bg-destructive"
-            aria-label="has failures"
+            title="Failures in the last 24 hours"
+            aria-label="has failures in the last 24 hours"
           />
         </button>
       </div>
 
       <div class="p-4">
-        <ProfileTableSyncPanel v-if="tab === 'tables'" :key="`${profile.id}-sync`" :profile-id="profile.id" compact />
+        <ProfileTableSyncPanel
+          v-if="tab === 'tables'"
+          :key="`${profile.id}-sync`"
+          :profile-id="profile.id"
+          :refresh-token="profile.updated_at"
+          compact
+          :endpoints="{
+            source: { image: flow.sourceImage, label: flow.sourceLabel, caption: flow.sourceCaption },
+            target: { image: flow.targetImage, label: flow.targetLabel, caption: flow.targetCaption },
+          }"
+          @health="endpointHealth = $event"
+        />
 
-        <div v-else-if="tab === 'activity'" class="space-y-3">
-          <AppStateBlock v-if="auditError" kind="error" :message="auditError" />
-          <p v-if="!activity.length && !auditLoading" class="text-sm text-muted-foreground">No activity yet.</p>
-          <ol class="space-y-2">
-            <li
-              v-for="row in activity"
-              :key="row.key"
-              class="flex gap-3 rounded-xl border border-border px-3 py-2"
-              :class="{ 'row-error': row.failed }"
-            >
-              <CircleX v-if="row.failed" class="mt-0.5 h-4 w-4 shrink-0 text-destructive" :stroke-width="1.75" />
-              <CircleCheck v-else class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" :stroke-width="1.75" />
-              <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap items-baseline justify-between gap-2">
-                  <p class="text-sm font-medium text-foreground">{{ row.title }}</p>
-                  <time class="text-xs text-muted-foreground" :datetime="row.at" :title="row.at">{{ relativeTime(row.at) }}</time>
-                </div>
-                <p v-if="row.detail" class="mt-0.5 break-words text-xs text-muted-foreground">{{ row.detail }}</p>
-              </div>
-            </li>
-          </ol>
-        </div>
+        <PipelineActivityTimeline
+          v-else-if="tab === 'activity'"
+          :key="`${profile.id}-activity`"
+          :profile="profile"
+        />
 
         <PipelineProcessingLog
           v-else-if="tab === 'logs'"

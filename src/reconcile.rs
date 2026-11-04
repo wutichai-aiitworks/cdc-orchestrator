@@ -46,7 +46,7 @@ pub fn leftover_connector_names(profile: &CdcProfile) -> Vec<String> {
     ]
 }
 
-fn slug(value: &str) -> String {
+pub(crate) fn slug(value: &str) -> String {
     value
         .chars()
         .map(|c| {
@@ -673,10 +673,83 @@ async fn resume_connector(state: &AppState, name: &str) -> Result<(), AppError> 
     Ok(())
 }
 
+/// Start must leave a connector RUNNING. A config PUT does not change Connect's target
+/// state, so a connector paused by Stop stayed PAUSED after Start, and a FAILED task is
+/// only retried when its config changes. Resume (no-op when running), then restart just
+/// the failed tasks. Best effort: a rebalance can answer 409 right after a config PUT;
+/// the table status then reports the connector instead of a silent "syncing".
+async fn ensure_running(state: &AppState, name: &str) {
+    if let Err(e) = resume_connector(state, name).await {
+        tracing::warn!(connector = %name, error = %e, "resume after start failed");
+    }
+    let path = format!(
+        "/connectors/{}/restart?includeTasks=true&onlyFailed=true",
+        urlencoding::encode(name)
+    );
+    if let Err(e) = connect_request(state, Method::POST, &path, None).await {
+        tracing::warn!(connector = %name, error = %e, "restart of failed tasks after start failed");
+    }
+}
+
+/// Why the offsets stored for an existing source connector cannot carry over to `new`.
+async fn existing_offsets_incompatible(
+    state: &AppState,
+    name: &str,
+    new: &HashMap<String, String>,
+) -> Option<String> {
+    let path = format!("/connectors/{}/config", urlencoding::encode(name));
+    let old: HashMap<String, String> = match connect_request(state, Method::GET, &path, None).await
+    {
+        Ok(v) => serde_json::from_value(v).ok()?,
+        Err(_) => return None, // not created yet: nothing stored
+    };
+    offsets_incompatible_reason(&old, new)
+}
+
+/// Pure rule behind [`existing_offsets_incompatible`].
+fn offsets_incompatible_reason(
+    old: &HashMap<String, String>,
+    new: &HashMap<String, String>,
+) -> Option<String> {
+    fn get<'a>(m: &'a HashMap<String, String>, k: &str) -> &'a str {
+        m.get(k).map(String::as_str).unwrap_or("")
+    }
+    if get(old, "connector.class") != get(new, "connector.class") {
+        return Some("capture connector type changed".into());
+    }
+    // A snapshot-only run stores "snapshot done" without ever streaming; a streaming
+    // mode would resume after it and silently miss every change made since.
+    if get(old, "snapshot.mode") == "initial_only" && get(new, "snapshot.mode") != "initial_only" {
+        return Some("switched from Sync once to ongoing capture".into());
+    }
+    None
+}
+
 async fn cleanup_leftover_connectors(state: &AppState, profile: &CdcProfile) {
     for leftover in leftover_connector_names(profile) {
         if let Err(err) = stop_connector(state, &leftover, true).await {
             tracing::warn!(connector = %leftover, error = %err, "failed to delete leftover connector");
+        }
+    }
+}
+
+/// Extra per-table source connectors (`{primary}-poll-*`) that currently exist in Connect.
+///
+/// Read from Connect rather than derived from the profile, so connectors left behind by a
+/// table whose strategy changed are still paused, stopped and removed with the pipeline.
+async fn existing_poll_connectors(state: &AppState, profile: &CdcProfile) -> Vec<String> {
+    let prefix = crate::incremental_cdc::poll_connector_prefix(&connector_name_for(profile));
+    match connect_request(state, Method::GET, "/connectors", None).await {
+        Ok(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|name| name.starts_with(&prefix))
+            .map(str::to_string)
+            .collect(),
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list per-table poll connectors");
+            Vec::new()
         }
     }
 }
@@ -722,18 +795,51 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
     }
     let registry = schema_registry_url(state);
     let name = connector_name_for(profile);
-    let config = match profile.source.capture_mode {
-        crate::models::CaptureMode::Trigger => {
-            crate::postgres_trigger_cdc::build_jdbc_source_config(profile, &registry)?
-        }
+    // Incremental pipelines may need one source connector per rolling-window / full-copy
+    // table on top of the table-mode watermark connector; the first one keeps `name`.
+    let sources: Vec<(String, HashMap<String, String>)> = match profile.source.capture_mode {
+        crate::models::CaptureMode::Trigger => vec![(
+            name.clone(),
+            crate::postgres_trigger_cdc::build_jdbc_source_config(profile, &registry)?,
+        )],
         crate::models::CaptureMode::Incremental => {
             let columns = incremental_source_columns(profile).await?;
-            crate::incremental_cdc::build_jdbc_source_config(profile, &registry, &columns)?
+            crate::incremental_cdc::source_connector_plan(profile, &name, &registry, &columns)?
+                .into_iter()
+                .map(|spec| (spec.name, spec.config))
+                .collect()
         }
-        _ => build_debezium_config(profile, &registry)?,
+        _ => vec![(name.clone(), build_debezium_config(profile, &registry)?)],
     };
     cleanup_leftover_connectors(state, profile).await;
-    upsert_connector(state, &name, &config).await?;
+    for stale in existing_poll_connectors(state, profile).await {
+        if !sources.iter().any(|(n, _)| *n == stale) {
+            if let Err(err) = stop_connector(state, &stale, true).await {
+                tracing::warn!(connector = %stale, error = %err, "failed to delete stale poll connector");
+            }
+        }
+    }
+    for (source_name, config) in &sources {
+        if let Some(reason) = existing_offsets_incompatible(state, source_name, config).await {
+            // Stored offsets would make the new connector skip rows (e.g. Sync once →
+            // Change capture: Debezium sees a finished snapshot and streams only from
+            // now, losing everything written in between). Reset so it snapshots again;
+            // the sink upserts by key, so re-sent rows do not duplicate.
+            halt_connector(state, source_name).await?;
+            wait_for_stopped(state, source_name).await?;
+            reset_connector_offsets(state, source_name).await?;
+            profile.push_history(HistoryItem {
+                timestamp: Utc::now(),
+                level: "warn".to_string(),
+                event: "source_offsets_reset".to_string(),
+                detail: format!(
+                    "{reason}: cleared stored offsets of {source_name}; a full snapshot runs before streaming"
+                ),
+            });
+        }
+        upsert_connector(state, source_name, config).await?;
+        ensure_running(state, source_name).await;
+    }
     profile.connector_name = Some(name.clone());
 
     // Trigger capture lands in hyper_cdc.inbox on the Postgres target; install the
@@ -748,6 +854,7 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
         let sink_name = sink_connector_name_for(profile);
         let sink_config = build_managed_sink_config(profile, &registry)?;
         upsert_connector(state, &sink_name, &sink_config).await?;
+        ensure_running(state, &sink_name).await;
         profile.sink_connector_name = Some(sink_name);
     }
 
@@ -766,6 +873,9 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
 pub async fn reconcile_pause(state: &AppState, profile: &mut CdcProfile) -> Result<(), AppError> {
     let name = connector_name_for(profile);
     pause_connector(state, &name).await?;
+    for extra in existing_poll_connectors(state, profile).await {
+        let _ = pause_connector(state, &extra).await;
+    }
     profile.connector_name = Some(name);
     if profile.has_managed_sink() {
         let sink_name = sink_connector_name_for(profile);
@@ -786,6 +896,9 @@ pub async fn reconcile_pause(state: &AppState, profile: &mut CdcProfile) -> Resu
 pub async fn reconcile_resume(state: &AppState, profile: &mut CdcProfile) -> Result<(), AppError> {
     let name = connector_name_for(profile);
     resume_connector(state, &name).await?;
+    for extra in existing_poll_connectors(state, profile).await {
+        let _ = resume_connector(state, &extra).await;
+    }
     profile.connector_name = Some(name);
     if profile.has_managed_sink() {
         let sink_name = sink_connector_name_for(profile);
@@ -822,6 +935,11 @@ pub async fn reconcile_stop(state: &AppState, profile: &mut CdcProfile) -> Resul
     let delete = state.config.stop_deletes_connector;
     cleanup_leftover_connectors(state, profile).await;
     stop_connector(state, &name, delete).await?;
+    for extra in existing_poll_connectors(state, profile).await {
+        if let Err(err) = stop_connector(state, &extra, delete).await {
+            tracing::warn!(connector = %extra, error = %err, "failed to stop poll connector");
+        }
+    }
     profile.connector_name = Some(name);
     if profile.has_managed_sink() {
         let sink_name = sink_connector_name_for(profile);
@@ -854,27 +972,58 @@ async fn halt_connector(state: &AppState, name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// `GET /connectors/{name}/status` → the connector state (`RUNNING`, `STOPPED`, …).
+///
+/// `Ok(None)` when Connect answers 404: a connector that was just created (or just
+/// re-targeted) has its config committed before any worker writes a status record, so
+/// "No status found" is a normal, short-lived state rather than an error.
+async fn connector_state(state: &AppState, name: &str) -> Result<Option<String>, AppError> {
+    let url = format!(
+        "{}/connectors/{}/status",
+        state.config.connect_base_url.trim_end_matches('/'),
+        urlencoding::encode(name)
+    );
+    let res = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::Upstream(format!("connect request failed: {e}")))?;
+    let status = res.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| AppError::Upstream(format!("connect response read failed: {e}")))?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "connect returned {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Upstream(format!("invalid connect json: {e}")))?;
+    Ok(body
+        .get("connector")
+        .and_then(|c| c.get("state"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string))
+}
+
 async fn wait_for_stopped(state: &AppState, name: &str) -> Result<(), AppError> {
+    let mut last_state: Option<String> = None;
     for _ in 0..40 {
-        let status = connect_request(
-            state,
-            Method::GET,
-            &format!("/connectors/{}/status", urlencoding::encode(name)),
-            None,
-        )
-        .await?;
-        let state_str = status
-            .get("connector")
-            .and_then(|c| c.get("state"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        if state_str == "STOPPED" {
+        last_state = connector_state(state, name).await?;
+        if last_state.as_deref() == Some("STOPPED") {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    let seen = last_state.unwrap_or_else(|| "no status reported by Connect".to_string());
     Err(AppError::Upstream(format!(
-        "connector '{name}' did not reach STOPPED in time; resync aborted before touching offsets"
+        "connector '{name}' did not reach STOPPED within 20s (last state: {seen}); aborted before touching offsets"
     )))
 }
 
@@ -926,7 +1075,13 @@ async fn truncate_target_tables(profile: &CdcProfile) -> Result<Vec<String>, App
     client
         .batch_execute(&format!("TRUNCATE TABLE {}", quoted.join(", ")))
         .await
-        .map_err(|e| AppError::BadRequest(format!("failed to clear target tables: {e}")))?;
+        .map_err(|e| {
+            AppError::BadRequest(format!(
+                "failed to clear target tables ({}): {}",
+                names.join(", "),
+                crate::connector_catalog::postgres_ddl_detail(&e)
+            ))
+        })?;
     Ok(names)
 }
 
@@ -981,6 +1136,30 @@ type SnapshotOutcome = (Vec<String>, Vec<(String, i64)>);
 /// Halt connectors, optionally truncate targets, copy live source rows, then resume them
 /// when `resume_after` (resync). The test initial sync leaves them STOPPED for teardown.
 /// Does not reset Kafka Connect offsets (safe after Start or for resync).
+async fn resume_snapshot_connectors(
+    state: &AppState,
+    source_name: &str,
+    sink_name: Option<&str>,
+    extras: &[String],
+    snapshot_result: &Result<SnapshotOutcome, AppError>,
+) -> Result<(), AppError> {
+    if let Err(e) = resume_halted_connectors(state, source_name, sink_name).await {
+        if snapshot_result.is_ok() {
+            return Err(e);
+        }
+        tracing::warn!(error = %e, "failed to resume connectors after failed table snapshot");
+    }
+    for extra in extras {
+        if let Err(e) = resume_connector(state, extra).await {
+            if snapshot_result.is_ok() {
+                return Err(e);
+            }
+            tracing::warn!(connector = %extra, error = %e, "failed to resume poll connector");
+        }
+    }
+    Ok(())
+}
+
 async fn run_trigger_table_snapshot(
     state: &AppState,
     profile: &CdcProfile,
@@ -998,6 +1177,10 @@ async fn run_trigger_table_snapshot(
         halt_connector(state, sink).await?;
     }
     halt_connector(state, &source_name).await?;
+    let extras = existing_poll_connectors(state, profile).await;
+    for extra in &extras {
+        halt_connector(state, extra).await?;
+    }
     wait_for_stopped(state, &source_name).await?;
 
     let snapshot_result: Result<SnapshotOutcome, AppError> = async {
@@ -1006,12 +1189,9 @@ async fn run_trigger_table_snapshot(
         } else {
             Vec::new()
         };
-        let copied = crate::postgres_trigger_cdc::snapshot_source_tables(
-            profile,
-            !clear_target,
-            row_limit,
-        )
-        .await?;
+        let copied =
+            crate::postgres_trigger_cdc::snapshot_source_tables(profile, !clear_target, row_limit)
+                .await?;
         Ok((cleared, copied))
     }
     .await;
@@ -1019,12 +1199,14 @@ async fn run_trigger_table_snapshot(
     if !resume_after {
         return snapshot_result;
     }
-    if let Err(e) = resume_halted_connectors(state, &source_name, sink_name.as_deref()).await {
-        if snapshot_result.is_ok() {
-            return Err(e);
-        }
-        tracing::warn!(error = %e, "failed to resume connectors after failed table snapshot");
-    }
+    resume_snapshot_connectors(
+        state,
+        &source_name,
+        sink_name.as_deref(),
+        &extras,
+        &snapshot_result,
+    )
+    .await?;
     snapshot_result
 }
 
@@ -1136,6 +1318,12 @@ async fn teardown_test_connectors(state: &AppState, profile: &CdcProfile) -> Res
             first_error.get_or_insert(e);
         }
     }
+    // Rolling-window / full-copy connectors run in bulk mode and keep no offsets: delete.
+    for extra in existing_poll_connectors(state, profile).await {
+        if let Err(e) = stop_connector(state, &extra, true).await {
+            first_error.get_or_insert(e);
+        }
+    }
     first_error.map_or(Ok(()), Err)
 }
 
@@ -1178,7 +1366,7 @@ pub async fn reconcile_autostart_profiles(state: &AppState) {
             continue;
         }
         let name = profile.name.clone();
-        match reconcile_start(&state, &mut profile).await {
+        match reconcile_start(state, &mut profile).await {
             Ok(()) => {
                 profile.push_history(HistoryItem {
                     timestamp: Utc::now(),
@@ -1202,6 +1390,27 @@ pub async fn reconcile_autostart_profiles(state: &AppState) {
     }
 }
 
+/// Refuse to empty the target of a pipeline that polls any table with a rolling window.
+///
+/// A rolling window only ever re-reads recent rows, so after `TRUNCATE` every older row
+/// (for example legacy rows with no `UPDATE_DATE`) would stay missing until someone runs
+/// an initial load. Fail loudly instead of silently shrinking the replica — this also
+/// covers the scheduled full refresh, which always clears the target.
+fn guard_clear_target_for_rolling_window(
+    profile: &CdcProfile,
+    clear_target: bool,
+) -> Result<(), AppError> {
+    if clear_target && crate::incremental_cdc::has_rolling_window_tables(profile) {
+        return Err(AppError::BadRequest(
+            "clear_target is not allowed on a pipeline with rolling-window tables: the window \
+             re-reads only recent rows, so older rows would stay missing. Resync without \
+             clearing, or use Initial load (streaming) to rebuild the target."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn reconcile_resync(
     state: &AppState,
     profile: &mut CdcProfile,
@@ -1215,6 +1424,7 @@ pub async fn reconcile_resync(
         )));
     }
     require_row_limit_for_profile(profile, row_limit)?;
+    guard_clear_target_for_rolling_window(profile, clear_target)?;
     if table_snapshot_resync_path(profile, row_limit) {
         let (cleared, copied) =
             run_trigger_table_snapshot(state, profile, clear_target, row_limit, true).await?;
@@ -1234,10 +1444,17 @@ pub async fn reconcile_resync(
         return Ok(());
     }
 
-    if let Some(sink) = profile.has_managed_sink().then(|| sink_connector_name_for(profile)) {
+    if let Some(sink) = profile
+        .has_managed_sink()
+        .then(|| sink_connector_name_for(profile))
+    {
         halt_connector(state, &sink).await?;
     }
     halt_connector(state, &source_name).await?;
+    let extras = existing_poll_connectors(state, profile).await;
+    for extra in &extras {
+        halt_connector(state, extra).await?;
+    }
     wait_for_stopped(state, &source_name).await?;
     let cleared = if clear_target {
         truncate_target_tables(profile).await?
@@ -1246,6 +1463,10 @@ pub async fn reconcile_resync(
     };
     reset_connector_offsets(state, &source_name).await?;
     resume_connector(state, &source_name).await?;
+    // Bulk-mode poll connectors keep no offsets; resuming makes them re-read their window.
+    for extra in &extras {
+        resume_connector(state, extra).await?;
+    }
     if profile.has_managed_sink() {
         let sink = sink_connector_name_for(profile);
         let _ = resume_connector(state, &sink).await;
@@ -1264,7 +1485,28 @@ pub async fn reconcile_resync(
     Ok(())
 }
 
+/// How often a `topics.regex` sink re-reads topic metadata (ms).
+///
+/// The sink starts in the same Start call as the source, before the source has created
+/// any capture topic. A regex consumer only notices new matching topics on a metadata
+/// refresh — `metadata.max.age.ms`, 5 min by default — so a finished snapshot could sit in
+/// Kafka for up to five minutes with the target still empty. Connect ≥ 3.0 allows this
+/// per-connector override by default (`connector.client.config.override.policy=All`).
+const SINK_METADATA_MAX_AGE_MS: &str = "10000";
+
 fn build_managed_sink_config(
+    profile: &CdcProfile,
+    schema_registry_url: &str,
+) -> Result<HashMap<String, String>, AppError> {
+    let mut cfg = build_managed_sink_config_inner(profile, schema_registry_url)?;
+    if cfg.contains_key("topics.regex") {
+        cfg.entry("consumer.override.metadata.max.age.ms".into())
+            .or_insert_with(|| SINK_METADATA_MAX_AGE_MS.into());
+    }
+    Ok(cfg)
+}
+
+fn build_managed_sink_config_inner(
     profile: &CdcProfile,
     schema_registry_url: &str,
 ) -> Result<HashMap<String, String>, AppError> {
@@ -1327,6 +1569,29 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn sync_once_to_streaming_resets_offsets() {
+        let dbz = "io.debezium.connector.postgresql.PostgresConnector";
+        let once = cfg(&[("connector.class", dbz), ("snapshot.mode", "initial_only")]);
+        let cdc = cfg(&[("connector.class", dbz), ("snapshot.mode", "initial")]);
+        assert!(offsets_incompatible_reason(&once, &cdc).is_some());
+        // Same mode again, or streaming → streaming: keep offsets (no re-snapshot).
+        assert!(offsets_incompatible_reason(&cdc, &cdc).is_none());
+        assert!(offsets_incompatible_reason(&once, &once).is_none());
+        let jdbc = cfg(&[(
+            "connector.class",
+            "io.confluent.connect.jdbc.JdbcSourceConnector",
+        )]);
+        assert!(offsets_incompatible_reason(&jdbc, &cdc).is_some());
+    }
+
     #[test]
     fn test_sync_history_detail_reports_counts_and_stop() {
         let copied = vec![("app.orders".to_string(), 5), ("app.items".to_string(), 3)];
@@ -1370,6 +1635,7 @@ mod tests {
                 timestamp_column: None,
                 incrementing_column: None,
                 upsert_key_columns: vec![],
+                table_poll: vec![],
             },
             target: Some(TargetConfig {
                 name: "warehouse".into(),
