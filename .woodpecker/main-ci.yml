@@ -91,10 +91,10 @@ steps:
         # Orchestrator and Connect both build from the repo root: docker/Dockerfile
         # copies Cargo sources; docker/connect/Dockerfile compiles kafka-connect-jdbc/.
         for SPEC in \
-          "hyper-cdc-orchestrator|docker/Dockerfile|." \
-          "hyper-cdc-connect|docker/connect/Dockerfile|." \
-          "hyper-cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui" \
-          "hyper-cdc-mcp|mcp/Dockerfile|mcp" ; do
+          "cdc-orchestrator|docker/Dockerfile|." \
+          "cdc-connect|docker/connect/Dockerfile|." \
+          "cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui" \
+          "cdc-mcp|mcp/Dockerfile|mcp" ; do
 
           NAME="$${SPEC%%|*}"
           REST="$${SPEC#*|}"
@@ -150,14 +150,14 @@ steps:
         {
           "embeds": [
             {
-              "title": "🚀 hyper-cdc-orchestrator images pushed",
+              "title": "🚀 cdc-orchestrator images pushed",
               "description": "Docker multi-arch publish completed.",
               "color": 5763719,
               "fields": [
                 { "name": "Project", "value": "$${CI_REPO_NAME}", "inline": true },
                 { "name": "Branch", "value": "$${REF}", "inline": true },
                 { "name": "Triggered by", "value": "$${CI_COMMIT_AUTHOR}", "inline": true },
-                { "name": "Images", "value": "\`$${NS}/hyper-cdc-orchestrator\`\n\`$${NS}/hyper-cdc-connect\`\n\`$${NS}/hyper-cdc-webui\`\n\`$${NS}/hyper-cdc-mcp\`", "inline": false },
+                { "name": "Images", "value": "\`$${NS}/cdc-orchestrator\`\n\`$${NS}/cdc-connect\`\n\`$${NS}/cdc-webui\`\n\`$${NS}/cdc-mcp\`", "inline": false },
                 { "name": "Tags", "value": "\`latest\`, \`$${VERSION}\`", "inline": true },
                 { "name": "Platforms", "value": "\`linux/amd64\`, \`linux/arm64\`", "inline": true },
                 { "name": "Commit", "value": "[\`$${SHORT_SHA}\`]($${COMMIT_URL})", "inline": true },

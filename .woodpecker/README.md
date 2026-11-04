@@ -26,10 +26,10 @@ Runs on push / manual (not `main`) and on `v*` tags.
 
 | Image | Dockerfile | Build context |
 |-------|-----------|---------------|
-| `$REGISTRY_NAMESPACE/hyper-cdc-orchestrator` | `docker/Dockerfile` | repo root |
-| `$REGISTRY_NAMESPACE/hyper-cdc-connect` | `docker/connect/Dockerfile` | repo root |
-| `$REGISTRY_NAMESPACE/hyper-cdc-webui` | `cdc-native-ui/Dockerfile` | `cdc-native-ui` |
-| `$REGISTRY_NAMESPACE/hyper-cdc-mcp` | `mcp/Dockerfile` | `mcp` |
+| `$REGISTRY_NAMESPACE/cdc-orchestrator` | `docker/Dockerfile` | repo root |
+| `$REGISTRY_NAMESPACE/cdc-connect` | `docker/connect/Dockerfile` | repo root |
+| `$REGISTRY_NAMESPACE/cdc-webui` | `cdc-native-ui/Dockerfile` | `cdc-native-ui` |
+| `$REGISTRY_NAMESPACE/cdc-mcp` | `mcp/Dockerfile` | `mcp` |
 
 The orchestrator image needs the repo root as its context because `docker/Dockerfile`
 copies `Cargo.toml`, `Cargo.lock`, `build.rs`, `proto/`, and `src/`. The Connect image
