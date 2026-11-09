@@ -20,7 +20,13 @@ const autoRefresh = ref(true)
 const lastUpdated = ref("")
 let timer: ReturnType<typeof setInterval> | null = null
 
+const stateOf = (value: any) => String(value?.status?.connector?.state || "UNKNOWN").toUpperCase()
 const connectorList = computed(() => Object.entries(connectors.value))
+/** Health table: failed first, then other non-running, then running; by name within each. */
+const connectorsByUrgency = computed(() => {
+  const rank = (v: any) => (stateOf(v) === "FAILED" ? 0 : stateOf(v) === "RUNNING" ? 2 : 1)
+  return [...connectorList.value].sort(([an, av], [bn, bv]) => rank(av) - rank(bv) || an.localeCompare(bn))
+})
 const failedConnectors = computed(
   () => connectorList.value.filter(([, value]) => String(value?.status?.connector?.state || "").toUpperCase() === "FAILED").length
 )
@@ -113,7 +119,7 @@ onUnmounted(() => {
       <AppMetricCard label="Kafka Topics" :value="topicCount" helper="Available event streams" tone="info">
         <List class="h-5 w-5" :stroke-width="1.75" />
       </AppMetricCard>
-      <AppMetricCard label="Consumer Groups" :value="groupCount" helper="Tracked reader groups" tone="warning">
+      <AppMetricCard label="Consumer Groups" :value="groupCount" helper="Tracked reader groups">
         <Users class="h-5 w-5" :stroke-width="1.75" />
       </AppMetricCard>
     </section>
@@ -136,7 +142,7 @@ onUnmounted(() => {
         <AppTable v-else>
           <thead><tr><th>Connector</th><th>State</th><th>Tasks</th></tr></thead>
           <tbody>
-            <tr v-for="[name, value] in connectorList.slice(0, 10)" :key="name">
+            <tr v-for="[name, value] in connectorsByUrgency" :key="name" :class="stateOf(value) === 'FAILED' ? 'row-error' : ''">
               <td class="font-mono">{{ name }}</td>
               <td><AppStatusBadge :status="value?.status?.connector?.state" /></td>
               <td>{{ value?.status?.tasks?.length || 0 }}</td>
@@ -163,7 +169,7 @@ onUnmounted(() => {
           <div
             v-for="(alert, index) in alerts.slice(0, 8)"
             :key="`${alert.ts}-${alert.connector}-${index}`"
-            class="flex items-start justify-between gap-3 rounded-xl border border-border bg-muted/40 px-3 py-2"
+            class="flex items-start justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2"
           >
             <div class="min-w-0">
               <p class="truncate text-sm font-medium">{{ alert.connector || "Unknown Connector" }}</p>

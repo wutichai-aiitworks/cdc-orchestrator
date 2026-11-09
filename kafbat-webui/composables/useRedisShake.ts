@@ -19,6 +19,12 @@ export type RedisShakeSyncOptions = {
   try_diskless?: boolean
   off_reply?: boolean
   rdb_restore_command_behavior?: string
+  /** Delete the target's keys right before a full copy (synced databases only, or all). */
+  empty_target?: boolean
+  /** Source database numbers to sync; empty = every database. */
+  source_dbs?: number[]
+  /** Write into this target database instead of the same number (needs exactly one source database). */
+  target_db?: number | null
 }
 
 export type RedisShakeProfile = {
@@ -34,6 +40,12 @@ export type RedisShakeProfile = {
 
 export type RedisShakeJob = {
   id: string
+  /** How the run was started: "once" = full copy then exit, "cdc" = follow source changes. */
+  mode?: "once" | "cdc"
+  /** CDC runs: whether it began with a full copy. */
+  snapshot?: boolean
+  /** Set when the target was emptied before the full copy. */
+  emptied?: { scope: "all" | number[]; keys_removed: number | null; by?: string }
   /** The transfer this run belongs to (older runs: same as id). */
   profile_id?: string | null
   name?: string
@@ -69,9 +81,17 @@ export const useRedisShake = () => {
     })
   const deleteProfile = (id: string) =>
     $fetch(`/api/cdc/redisshake/profiles/${encodeURIComponent(id)}`, { method: "DELETE" })
-  const runProfile = (id: string) =>
+  /** Start a run; `mode` overrides the profile default for this run only. */
+  const runProfile = (id: string, mode?: "once" | "cdc", snapshot?: boolean, emptyTarget?: boolean) =>
     $fetch<RedisShakeJob>(`/api/cdc/redisshake/profiles/${encodeURIComponent(id)}/run`, {
       method: "POST",
+      query: mode
+        ? {
+            mode,
+            ...(mode === "cdc" && snapshot !== undefined ? { snapshot: String(snapshot) } : {}),
+            ...(emptyTarget !== undefined ? { empty_target: String(emptyTarget) } : {}),
+          }
+        : undefined,
     })
   const fetchJobs = () =>
     $fetch<{ jobs: RedisShakeJob[] }>("/api/cdc/redisshake/jobs").then((r) => r.jobs)

@@ -96,12 +96,12 @@ useEventListener(document, "keydown", (event: KeyboardEvent) => {
   >
     <button
       type="button"
-      class="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+      class="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground opacity-60 transition hover:opacity-100 hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
       :aria-label="accessibleLabel"
       :aria-expanded="open"
       @click.stop="toggle"
     >
-      <Info class="h-3.5 w-3.5" :stroke-width="1.75" />
+      <Info class="h-3 w-3" :stroke-width="2" />
     </button>
     <Teleport to="body">
       <div

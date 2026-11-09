@@ -85,10 +85,16 @@ test("mongo: renames only when databases differ and nothing is filtered", () => 
 
 test("redis: a running sync is the normal state; existing-key choice is spelled out", () => {
   assert.deepEqual(redis.runResult({ id: "j", status: "running" }), { tone: "ok", text: "Syncing" })
+  // The phase comes from the log: a finished full copy is not "still syncing".
+  assert.equal(redis.runResult({ id: "j", status: "running" }, "INF start syncing...\nINF receiving rdb").text, "Full copy in progress")
+  assert.equal(redis.runResult({ id: "j", status: "running" }, "INF write_count=[94], syncing aof, diff=[0]").text, "Up to date · following live changes")
+  assert.equal(redis.runResult({ id: "j", status: "running" }, "INF write_count=[94], syncing aof, diff=[5120]").text, "Catching up with the source")
+  assert.equal(redis.runResult({ id: "j", status: "stopped" }, "syncing aof, diff=[0]").text, redis.runResult({ id: "j", status: "stopped" }).text)
   assert.equal(railLine({ id: "j", status: "running" }, redis.runResult).text, "Syncing")
   const p = { name: "r", source: conn("redis", "cache-a", "", "6379"), target: conn("redis", "cache-b", "", ""), options: { rdb_restore_command_behavior: "rewrite" } }
   assert.deepEqual(redis.steps(p, undefined).map((s) => s.label), ["Full copy", "Live changes"])
-  assert.equal(redis.summary(p)[2].value, "When a key already exists on the target: overwrite the target key")
+  assert.equal(redis.summary(p).find((r) => r.label === "Existing keys")?.value, "When a key already exists on the target: overwrite the target key")
+  assert.equal(redis.summary(p).find((r) => r.label === "Databases")?.value, "Every database")
   assert.deepEqual(redis.effects(p), [
     "Write keys from cache-a:6379 into cache-b:6379, and keep writing changes until you stop the sync.",
     "Overwrite keys that already exist on cache-b:6379.",
@@ -101,4 +107,67 @@ test("redis: a running sync is the normal state; existing-key choice is spelled 
   assert.deepEqual(redis.liveStats("nothing yet"), {})
   const busy = redis.problems({ id: "j", status: "failed", exit_code: 1 }, "ERR [writer] redisStandaloneWriter received BUSYKEY reply. cmd=[RESTORE user:3 0 …]")
   assert.match(busy[0].fix!, /Existing keys, choose “Overwrite the target key” or “Keep the target key”/)
+})
+
+test("redis: source databases filter the sync; one database can land in another number", () => {
+  assert.deepEqual(redis.parseDbs(["5", "db0", " 2 ", "5", "x", "-1", "1.5"]), [0, 2, 5])
+  assert.equal(redis.targetDb({ source_dbs: [2], target_db: 0 }), 0)
+  assert.equal(redis.targetDb({ source_dbs: [2], target_db: 2 }), undefined) // same number: no remap
+  assert.equal(redis.targetDb({ source_dbs: [0, 2], target_db: 1 }), undefined) // two sources never merge
+  assert.equal(redis.targetDb({ source_dbs: [2], target_db: "" }), undefined) // emptied number input
+  assert.equal(redis.dbLabel({ source_dbs: [0, 5] }), "db 0 and db 5")
+  assert.equal(redis.dbLabel({ source_dbs: [2], target_db: 0 }), "db 2 into db 0 on the target")
+  assert.equal(redis.dbProblem({ source_cluster: true, source_dbs: [1] }), "A Redis Cluster source has only database 0.")
+  assert.equal(redis.dbProblem({ target_cluster: true, source_dbs: [2], target_db: 1 }), "A Redis Cluster target has only database 0.")
+  assert.equal(redis.dbProblem({ source_cluster: true, source_dbs: [0] }), null)
+  const p = { name: "r", source: conn("redis", "a", "", "6379"), target: conn("redis", "b", "", "6379"), options: { source_dbs: [2], target_db: 0, sync_aof: false } }
+  assert.deepEqual(redis.effects(p), ["Copy every key from a:6379 (db 2 into db 0 on the target) into b:6379 once."])
+  const labels = redis.changeLabels.filter(([, get]) => JSON.stringify(get(p)) !== JSON.stringify(get({ ...p, options: { ...p.options, target_db: 1 } }))).map(([l]) => l)
+  assert.deepEqual(labels, ["databases"])
+})
+
+test("redis: start modes in CDC terms — one-time sync, CDC with snapshot, CDC from now", () => {
+  assert.equal(redis.defaultMode({}), "cdc")
+  assert.equal(redis.defaultMode({ sync_aof: false }), "once")
+  assert.equal(redis.defaultMode({ sync_rdb: false }), "cdc-live")
+  const p = { name: "r", source: conn("redis", "a", "", "6379"), target: conn("redis", "b", "", "6379"), options: { rdb_restore_command_behavior: "rewrite" } }
+  assert.equal(redis.verb(p), "Start CDC")
+  // The job record says how a run was started, whatever the profile default is.
+  assert.deepEqual(redis.steps(p, { id: "j", status: "running", mode: "once" } as any).map((s) => s.label), ["Full copy"])
+  assert.deepEqual(redis.steps(p, { id: "j", status: "running", mode: "cdc", snapshot: false } as any).map((s) => s.label), ["Live changes"])
+  assert.deepEqual(redis.steps(p, undefined).map((s) => s.label), ["Full copy", "Live changes"])
+  // Stopping is the normal end of CDC; a stopped one-time sync was interrupted.
+  const liveLog = "INF write_count=[3], syncing aof, diff=[0]"
+  assert.deepEqual(states(redis.steps(p, { id: "j", status: "stopped", mode: "cdc" } as any, liveLog)), ["done", "done"])
+  assert.deepEqual(states(redis.steps(p, { id: "j", status: "stopped", mode: "once" } as any, "")), ["failed"])
+  // A one-time sync ends by itself: finite wording, not "Live"/"Finished".
+  assert.equal(redis.runResult({ id: "j", status: "running", mode: "once" } as any).text, "Full copy in progress")
+  assert.equal(redis.runResult({ id: "j", status: "succeeded", mode: "once" } as any).text, "Succeeded")
+  // Effects per mode; existing-key overwrite only matters when there is a full copy.
+  assert.deepEqual(redis.effects(p, "once"), ["Copy every key from a:6379 into b:6379 once.", "Overwrite keys that already exist on b:6379."])
+  assert.deepEqual(redis.effects(p, "cdc-live"), ["Write changes made on a:6379 from now on into b:6379, until you stop the sync."])
+  assert.match(redis.summary(p).find((r) => r.label === "Default start")!.value, /^Start CDC: copy every key, then keep applying/)
+})
+
+test("redis: empty the target first — scoped to the synced databases, only before a full copy", () => {
+  const p = (options: Record<string, any>) => ({ name: "r", source: conn("redis", "a", "", "6379"), target: conn("redis", "b", "", "26379"), options })
+  assert.equal(redis.emptyScopeText(p({})), "every key in every database on b:26379")
+  assert.equal(redis.emptyScopeText(p({ source_dbs: [0] })), "every key in db 0 on b:26379")
+  assert.equal(redis.emptyScopeText(p({ source_dbs: [2], target_db: 0 })), "every key in db 0 on b:26379")
+  assert.equal(redis.emptyScopeText(p({ target_cluster: true })), "every key on the cluster b:26379")
+  // One-off "start clean" run, profile unchanged; overwrite note is moot once emptied.
+  assert.deepEqual(redis.effects(p({ source_dbs: [0], rdb_restore_command_behavior: "rewrite" }), "once", true), [
+    "Delete every key in db 0 on b:26379 first (cannot be undone).",
+    "Copy every key from a:6379 (db 0) into b:26379 once.",
+  ])
+  // CDC from now never empties, even when the profile says so.
+  assert.equal(redis.emptiesFirst({ empty_target: true }, "cdc-live"), false)
+  assert.equal(redis.effects(p({ empty_target: true }), "cdc-live").some((e) => e.startsWith("Delete")), false)
+  // The route shows the emptying as its own step, with what was removed.
+  const job = { id: "j", status: "succeeded", mode: "once", emptied: { scope: [0], keys_removed: 89 } } as any
+  assert.deepEqual(redis.steps(p({}), job, "Emptied the target before the full copy: db 0, 89 key(s) removed.").map((s) => [s.label, s.detail]), [
+    ["Empty target", "89 keys removed"],
+    ["Full copy", "every key, once"],
+  ])
+  assert.match(redis.summary(p({ empty_target: true, source_dbs: [0] })).find((r) => r.label === "Existing keys")!.value, /^Deleted before each full copy/)
 })

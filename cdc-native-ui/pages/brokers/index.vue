@@ -63,7 +63,7 @@ onMounted(load)
     <section class="grid grid-cols-1 gap-4 sm:grid-cols-3">
       <AppMetricCard label="Broker count" :value="String(result?.broker_count || 0)" />
       <AppMetricCard label="Active controller" :value="result?.controller_id == null ? '—' : String(result.controller_id)" />
-      <AppMetricCard label="Version" :value="result?.version || '—'" helper="rpk / broker version" />
+      <AppMetricCard label="Version" :value="String(result?.version || '—').replace(/^version:\s*/i, '')" helper="rpk / broker version" />
     </section>
 
     <AppStateBlock v-if="error" kind="error" :message="error" />

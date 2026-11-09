@@ -21,10 +21,28 @@ const logViewport = ref<HTMLElement | null>(null)
 let eventSource: EventSource | null = null
 
 const serviceNames = computed(() => Object.keys(services.value).sort())
-const filteredLines = computed(() => {
+type Level = "error" | "warn" | "debug" | "info"
+const levelOf = (line: string): Level =>
+  /\b(error|fatal|exception|failed)\b/i.test(line) ? "error" : /\b(warn|warning)\b/i.test(line) ? "warn" : /\b(debug|trace)\b/i.test(line) ? "debug" : "info"
+/** Which lines to show: all, warnings and errors, or errors only. */
+const levelFilter = ref<"all" | "warn" | "error">("all")
+const wrapLines = ref(false)
+// Line numbers refer to the retained buffer, so a filtered view still points at the same line.
+const numbered = computed(() => lines.value.map((text, i) => ({ n: i + 1, text, level: levelOf(text) })))
+const levelCounts = computed(() => ({
+  all: numbered.value.length,
+  warn: numbered.value.filter((l) => l.level === "warn" || l.level === "error").length,
+  error: numbered.value.filter((l) => l.level === "error").length,
+}))
+const filteredRows = computed(() => {
   const query = search.value.trim().toLowerCase()
-  return query ? lines.value.filter((line) => line.toLowerCase().includes(query)) : lines.value
+  return numbered.value.filter(
+    (l) =>
+      (levelFilter.value === "all" || (levelFilter.value === "error" ? l.level === "error" : l.level !== "info" && l.level !== "debug")) &&
+      (!query || l.text.toLowerCase().includes(query)),
+  )
 })
+const filteredLines = computed(() => filteredRows.value.map((l) => l.text))
 const loggerEntries = computed(() => {
   const source = (loggers.value as any)?.loggers || loggers.value || {}
   return Object.entries(source)
@@ -35,11 +53,11 @@ const loggerEntries = computed(() => {
     .sort((a, b) => a.name.localeCompare(b.name))
 })
 
-const lineClass = (line: string) => {
-  if (/\b(error|fatal|exception|failed)\b/i.test(line)) return "text-red-300"
-  if (/\b(warn|warning)\b/i.test(line)) return "text-amber-300"
-  if (/\b(debug|trace)\b/i.test(line)) return "text-blue-300"
-  return "text-surface-200"
+const LEVEL_CLASS: Record<Level, string> = {
+  error: "bg-red-500/[0.07] text-red-700 dark:text-red-300",
+  warn: "text-amber-700 dark:text-amber-300",
+  debug: "text-muted-foreground",
+  info: "text-foreground",
 }
 
 const loadSnapshot = async () => {
@@ -245,6 +263,25 @@ onUnmounted(() => {
               <Search class="pointer-events-none absolute left-3 top-3 h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
               <AppInput v-model="search" input-class="w-56 pl-9" placeholder="Filter logs..." />
             </div>
+            <div class="flex rounded-lg border border-border p-0.5" role="radiogroup" aria-label="Show levels">
+              <button
+                v-for="opt in ([['all', 'All'], ['warn', 'Warnings'], ['error', 'Errors']] as const)"
+                :key="opt[0]"
+                type="button"
+                role="radio"
+                :aria-checked="levelFilter === opt[0]"
+                class="rounded-md px-2.5 py-1 text-xs font-medium transition-colors"
+                :class="levelFilter === opt[0] ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'"
+                @click="levelFilter = opt[0]"
+              >
+                {{ opt[1] }}
+                <span class="ml-0.5 tabular-nums" :class="opt[0] === 'error' && levelCounts.error ? 'text-red-600 dark:text-red-400' : 'text-muted-foreground'">{{ levelCounts[opt[0]] }}</span>
+              </button>
+            </div>
+            <label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+              <input v-model="wrapLines" type="checkbox" class="accent-[var(--primary)]" />
+              Wrap
+            </label>
             <AppSelect v-model="tail" select-class="w-28" aria-label="Log line count">
               <option :value="100">100 Lines</option>
               <option :value="200">200 Lines</option>
@@ -258,13 +295,14 @@ onUnmounted(() => {
         </div>
         <div
           ref="logViewport"
-          class="h-[60vh] overflow-auto rounded-xl border border-surface-700 bg-surface-950 p-4 font-mono text-sm leading-6"
+          class="h-[65vh] overflow-auto rounded-lg border border-border bg-background py-2 font-mono text-xs leading-5"
           aria-live="polite"
         >
-          <p v-if="loading" class="text-surface-400">Loading logs…</p>
-          <p v-else-if="!filteredLines.length" class="text-surface-400">No matching log lines.</p>
-          <div v-for="(line, index) in filteredLines" v-else :key="index" :class="lineClass(line)">
-            <span class="mr-4 select-none text-surface-600">{{ String(index + 1).padStart(4, "0") }}</span>{{ line }}
+          <p v-if="loading" class="px-4 text-muted-foreground">Loading logs…</p>
+          <p v-else-if="!filteredRows.length" class="px-4 text-muted-foreground">No matching log lines.</p>
+          <div v-for="row in filteredRows" v-else :key="row.n" class="flex min-w-max px-2" :class="[LEVEL_CLASS[row.level], wrapLines ? '!min-w-0' : '']">
+            <span class="sticky left-0 w-12 shrink-0 select-none bg-background pr-3 text-right tabular-nums text-muted-foreground opacity-60">{{ row.n }}</span>
+            <span :class="wrapLines ? 'min-w-0 whitespace-pre-wrap break-words' : 'whitespace-pre'">{{ row.text }}</span>
           </div>
         </div>
       </section>

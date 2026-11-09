@@ -409,25 +409,20 @@ const everyTableCustomPolled = () => {
 const incompleteRollingRules = () =>
   activeTablePoll().filter((r) => r.strategy === "rolling_window" && !filled(r.window_column ?? ""))
 
+/** Watermark columns are an incremental-only concept; other modes always post them empty. */
 const buildSourceWatermarkFields = () => {
-  const timestamp_column = textValue(form.timestampColumn) || null
-  const wm = incrementalWatermarkFields()
-  const hasWatermarks = Boolean(
-    timestamp_column || wm.incrementing_column || wm.upsert_key_columns.length,
-  )
-  if (!isIncrementalCapture() && !hasWatermarks) {
+  if (!isIncrementalCapture()) {
     return {
       timestamp_column: null as string | null,
       incrementing_column: null as string | null,
       upsert_key_columns: [] as string[],
-      incremental: false,
     }
   }
+  const wm = incrementalWatermarkFields()
   return {
-    timestamp_column,
+    timestamp_column: textValue(form.timestampColumn) || null,
     incrementing_column: wm.incrementing_column,
     upsert_key_columns: wm.upsert_key_columns,
-    incremental: true,
   }
 }
 
@@ -1069,8 +1064,12 @@ const optionalPositiveInt = (value: string): number | null => {
 }
 
 const buildPayload = (): ProfilePayload => {
+  // The picked capture mode is authoritative. Watermark columns linger in the form
+  // after switching away from Incremental (they are re-hydrated on every save), and
+  // used to flip the saved mode back to incremental — e.g. One-time sync came back
+  // as Incremental on the next edit.
+  const incrementalCapture = isIncrementalCapture()
   const watermarks = buildSourceWatermarkFields()
-  const incrementalCapture = isIncrementalCapture() || watermarks.incremental
   return {
   name: textValue(form.name),
   description: textValue(form.description),
@@ -1091,7 +1090,7 @@ const buildPayload = (): ProfilePayload => {
     schema_mode: form.schemaMode,
     table_mode:
       form.captureMode === "trigger" || incrementalCapture ? "specific_tables" : form.tableMode,
-    capture_mode: incrementalCapture ? "incremental" : form.captureMode,
+    capture_mode: form.captureMode,
     schemas: form.schemaMode === "specific_schemas" ? splitList(form.schemas) : [],
     tables:
       form.tableMode === "specific_tables" ||
@@ -1552,6 +1551,16 @@ const splitOpen = ref(false)
 /** Show the new (draft) pipeline after a split. */
 const openSplitResult = async (id: string) => {
   splitOpen.value = false
+  await load()
+  selectPipeline(id)
+}
+
+// ── Duplicate as a new pipeline ──────────────────────────────────────────────
+const duplicateOpen = ref(false)
+
+/** Show the new (draft) copy after a duplicate. */
+const openDuplicateResult = async (id: string) => {
+  duplicateOpen.value = false
   await load()
   selectPipeline(id)
 }
@@ -2152,6 +2161,9 @@ const onDetailAction = (action: PipelineDetailAction) => {
     case "split":
       splitOpen.value = true
       return
+    case "duplicate":
+      duplicateOpen.value = true
+      return
     default:
       void execute(action)
   }
@@ -2324,6 +2336,13 @@ onUnmounted(() => {
                 </div>
               </button>
             </div>
+            <SourceCdcReadiness
+              :source-type="form.sourceType"
+              :capture-mode="form.captureMode"
+              :username="form.username"
+              :database="form.database"
+              :tables="form.tableMode === 'specific_tables' ? form.tables : ''"
+            />
             <div v-if="form.captureMode === 'trigger'" class="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div class="md:col-span-2 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:items-end">
                 <label>
@@ -3569,6 +3588,14 @@ onUnmounted(() => {
       @done="load()"
       @open-created="openSplitResult"
       @restart-original="restartAfterSplit"
+    />
+
+    <DuplicatePipelineDialog
+      :open="duplicateOpen"
+      :profile="selected"
+      @update:open="(open) => (duplicateOpen = open)"
+      @done="load()"
+      @open-created="openDuplicateResult"
     />
 
     <InitialLoadDialog

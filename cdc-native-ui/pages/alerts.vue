@@ -195,7 +195,7 @@ onMounted(load)
               <AppStatusBadge :status="event.to" />
             </td>
             <td>{{ event.rule || "Watcher" }}</td>
-            <td><AppStatusBadge :status="event.resolved ? 'Resolved' : 'Open'" /></td>
+            <td><AppStatusBadge :status="event.resolved ? 'Resolved' : /^(running|healthy|stable)$/i.test(String(event.to || '')) ? 'Recovered' : 'Open'" /></td>
           </tr>
         </tbody>
       </AppTable>

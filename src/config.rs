@@ -2,25 +2,56 @@ use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EnvMode {
-    Dev,
-    Prod,
+/// APP_MODE — the one deployment-mode variable (replaces ORCH_ENV).
+/// Production: no ribbon, hardened by default. Maintenance / Enhanced: a corner ribbon in the web UI.
+/// Hardening defaults follow the mode (on only for Production); ORCH_REQUIRE_AUTH /
+/// ORCH_REQUIRE_PERSISTENCE / ORCH_STRICT_PERSISTENCE override it either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppMode {
+    /// Live system in normal service.
+    Production,
+    /// Stable release, fixes only.
+    Maintenance,
+    /// Release with new features in development.
+    Enhanced,
 }
 
-impl EnvMode {
-    fn from_env(value: &str) -> Self {
+impl AppMode {
+    /// Accepts common spellings ("prod", "Maintainance", "enhance", …). Unknown or empty → None.
+    pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "prod" | "production" => Self::Prod,
-            _ => Self::Dev,
+            "production" | "prod" => Some(Self::Production),
+            "maintenance" | "maintainance" | "maint" => Some(Self::Maintenance),
+            "enhanced" | "enhance" | "enhancement" | "enhancements" => Some(Self::Enhanced),
+            _ => None,
+        }
+    }
+
+    /// APP_MODE, else the retired ORCH_ENV (dev → Enhanced, prod → Production), else Production.
+    pub fn resolve(app_mode: Option<&str>, legacy_orch_env: Option<&str>) -> Self {
+        if let Some(m) = app_mode.and_then(Self::parse) {
+            return m;
+        }
+        match legacy_orch_env
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("dev" | "development") => Self::Enhanced,
+            _ => Self::Production,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Dev => "dev",
-            Self::Prod => "prod",
+            Self::Production => "production",
+            Self::Maintenance => "maintenance",
+            Self::Enhanced => "enhanced",
         }
+    }
+
+    /// Default for ORCH_REQUIRE_AUTH / _PERSISTENCE / ORCH_STRICT_PERSISTENCE when unset.
+    pub fn hardened_by_default(&self) -> bool {
+        *self == Self::Production
     }
 }
 
@@ -51,7 +82,9 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
-    pub env_mode: EnvMode,
+    pub app_mode: AppMode,
+    /// The retired ORCH_ENV, if still set; warned at startup.
+    pub legacy_orch_env: Option<String>,
     pub engine_provider: EngineProvider,
     pub container_project_name: String,
     pub managed_containers: Vec<String>,
@@ -59,6 +92,11 @@ pub struct AppConfig {
     pub redpanda_container: String,
     pub schema_registry_url: Option<String>,
     pub ksql_url: Option<String>,
+    /// ORCH_KSQL_ENABLED (default **false**). Off: the KSQL DB API and UI are turned off even if a URL is set.
+    pub ksql_enabled: bool,
+    /// cdc-wireguard gateway (ADR 0010): ORCH_WIREGUARD_URL / ORCH_WIREGUARD_TOKEN. Unset = no tunnels.
+    pub wireguard_url: Option<String>,
+    pub wireguard_token: Option<String>,
     pub command_timeout_secs: u64,
     pub api_token: Option<String>,
     pub jdbc_admin_url: Option<String>,
@@ -86,6 +124,12 @@ pub struct AppConfig {
     pub audit_redis_key: String,
     pub audit_redis_max_len: usize,
     pub audit_rqlite_max_rows: usize,
+    /// Copy & Sync timeline (ADR 0009): keep events this many days (ORCH_TOOL_EVENTS_RETENTION_DAYS).
+    pub tool_events_retention_days: u32,
+    /// …and at most this many rows (ORCH_TOOL_EVENTS_MAX_ROWS).
+    pub tool_events_max_rows: usize,
+    /// How often the run watcher reads the sidecars' job lists (ORCH_TOOL_EVENTS_POLL_SECS).
+    pub tool_events_poll_secs: u64,
     /// How often to check JDBC poll schedules for interval audit events (seconds).
     pub poll_audit_check_secs: u64,
     /// How often the changelog pruner runs (seconds). Per-profile retention window
@@ -104,7 +148,10 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
-        let env_mode = EnvMode::from_env(&env::var("ORCH_ENV").unwrap_or_else(|_| "dev".into()));
+        let non_empty = |k: &str| env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let legacy_orch_env = non_empty("ORCH_ENV");
+        let app_mode =
+            AppMode::resolve(non_empty("APP_MODE").as_deref(), legacy_orch_env.as_deref());
         let host = env::var("ORCH_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("ORCH_PORT")
             .ok()
@@ -143,6 +190,15 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .or_else(|| Some("http://cdc-message:8081".to_string()));
         let ksql_url = env::var("ORCH_KSQL_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let ksql_enabled = ksql_enabled_from(env::var("ORCH_KSQL_ENABLED").ok().as_deref());
+        let wireguard_url = env::var("ORCH_WIREGUARD_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        let wireguard_token = env::var("ORCH_WIREGUARD_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -285,6 +341,21 @@ impl AppConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(200_000)
             .max(1_000);
+        let tool_events_retention_days = env::var("ORCH_TOOL_EVENTS_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(365)
+            .max(1);
+        let tool_events_max_rows = env::var("ORCH_TOOL_EVENTS_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(200_000)
+            .max(1_000);
+        let tool_events_poll_secs = env::var("ORCH_TOOL_EVENTS_POLL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(15)
+            .max(5);
         let changelog_prune_interval_secs = env::var("ORCH_CHANGELOG_PRUNE_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -305,12 +376,11 @@ impl AppConfig {
             })
             .unwrap_or(false);
 
-        // Prod defaults: require auth + persistence. Dev defaults: optional.
-        let require_auth = env_truthy("ORCH_REQUIRE_AUTH").unwrap_or(env_mode == EnvMode::Prod);
-        let require_persistence =
-            env_truthy("ORCH_REQUIRE_PERSISTENCE").unwrap_or(env_mode == EnvMode::Prod);
-        let strict_persistence =
-            env_truthy("ORCH_STRICT_PERSISTENCE").unwrap_or(env_mode == EnvMode::Prod);
+        // Production defaults: require auth + persistence. Explicit flags override in any mode.
+        let hardened = app_mode.hardened_by_default();
+        let require_auth = env_truthy("ORCH_REQUIRE_AUTH").unwrap_or(hardened);
+        let require_persistence = env_truthy("ORCH_REQUIRE_PERSISTENCE").unwrap_or(hardened);
+        let strict_persistence = env_truthy("ORCH_STRICT_PERSISTENCE").unwrap_or(hardened);
 
         let cors_origins = env::var("ORCH_CORS_ORIGINS")
             .ok()
@@ -327,7 +397,8 @@ impl AppConfig {
             host,
             port,
             enabled,
-            env_mode,
+            app_mode,
+            legacy_orch_env,
             engine_provider,
             container_project_name,
             managed_containers,
@@ -335,6 +406,9 @@ impl AppConfig {
             redpanda_container,
             schema_registry_url,
             ksql_url,
+            ksql_enabled,
+            wireguard_url,
+            wireguard_token,
             command_timeout_secs,
             api_token,
             jdbc_admin_url,
@@ -361,6 +435,9 @@ impl AppConfig {
             audit_redis_key,
             audit_redis_max_len,
             audit_rqlite_max_rows,
+            tool_events_retention_days,
+            tool_events_max_rows,
+            tool_events_poll_secs,
             poll_audit_check_secs,
             changelog_prune_interval_secs,
             history_capacity,
@@ -382,7 +459,7 @@ impl AppConfig {
             match &self.api_token {
                 None => {
                     eprintln!(
-                        "FATAL: ORCH_REQUIRE_AUTH/ORCH_ENV=prod requires ORCH_API_TOKEN (min 24 chars)"
+                        "FATAL: ORCH_REQUIRE_AUTH=true requires ORCH_API_TOKEN (min 24 chars)"
                     );
                     std::process::exit(1);
                 }
@@ -407,7 +484,7 @@ impl AppConfig {
 
         if self.require_persistence {
             if self.rqlite_url.is_none() {
-                eprintln!("FATAL: ORCH_REQUIRE_PERSISTENCE/ORCH_ENV=prod requires ORCH_RQLITE_URL");
+                eprintln!("FATAL: ORCH_REQUIRE_PERSISTENCE=true requires ORCH_RQLITE_URL");
                 std::process::exit(1);
             }
         } else if !self.persistence_enabled() {
@@ -416,21 +493,42 @@ impl AppConfig {
             );
         }
 
-        if self.host == "0.0.0.0" && self.env_mode == EnvMode::Prod {
+        if let Some(v) = &self.legacy_orch_env {
             tracing::warn!(
-                "ORCH_HOST=0.0.0.0 in prod — prefer binding to a private interface or publish compose ports as 127.0.0.1 only"
+                orch_env = %v,
+                app_mode = self.app_mode.as_str(),
+                "ORCH_ENV is retired: use APP_MODE=Production|Maintenance|Enhanced only"
+            );
+        }
+
+        if self.host == "0.0.0.0" && self.require_auth {
+            tracing::warn!(
+                "ORCH_HOST=0.0.0.0 with auth required — prefer binding to a private interface or publish compose ports as 127.0.0.1 only"
             );
         }
     }
 }
 
+/// ORCH_KSQL_ENABLED: off unless explicitly turned on (1/true/yes/on). Unset or empty = off.
+fn ksql_enabled_from(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Unset or empty → None (compose passes `${VAR:-}` as an empty string; that must mean
+/// "use the default", not "false").
 fn env_truthy(key: &str) -> Option<bool> {
-    env::var(key).ok().map(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 pub fn is_weak_token(v: &str) -> bool {
@@ -440,4 +538,61 @@ pub fn is_weak_token(v: &str) -> bool {
         || t.eq_ignore_ascii_case("changeme")
         || t.eq_ignore_ascii_case("secret")
         || t.eq_ignore_ascii_case("password")
+}
+
+#[cfg(test)]
+mod app_mode_tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_three_modes_in_common_spellings() {
+        for v in ["Production", "PRODUCTION", "prod"] {
+            assert_eq!(AppMode::parse(v), Some(AppMode::Production), "{v}");
+        }
+        for v in ["MAINTENANCE", "Maintenance", " maintainance ", "maint"] {
+            assert_eq!(AppMode::parse(v), Some(AppMode::Maintenance), "{v}");
+        }
+        for v in ["ENHANCED", "Enhanced", "enhance", "Enhancement"] {
+            assert_eq!(AppMode::parse(v), Some(AppMode::Enhanced), "{v}");
+        }
+        for v in ["", "dev", "uat", "sit"] {
+            assert_eq!(AppMode::parse(v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn resolves_app_mode_then_retired_orch_env_then_production() {
+        assert_eq!(
+            AppMode::resolve(Some("Enhanced"), Some("prod")),
+            AppMode::Enhanced
+        );
+        assert_eq!(AppMode::resolve(None, Some("dev")), AppMode::Enhanced);
+        assert_eq!(AppMode::resolve(None, Some("prod")), AppMode::Production);
+        assert_eq!(AppMode::resolve(Some("bogus"), None), AppMode::Production);
+        assert_eq!(AppMode::resolve(None, None), AppMode::Production);
+    }
+
+    #[test]
+    fn ksql_is_off_unless_turned_on() {
+        for v in [
+            None,
+            Some(""),
+            Some("false"),
+            Some("0"),
+            Some("off"),
+            Some("nope"),
+        ] {
+            assert!(!ksql_enabled_from(v), "{v:?}");
+        }
+        for v in ["true", "TRUE", "1", "yes", " on "] {
+            assert!(ksql_enabled_from(Some(v)), "{v}");
+        }
+    }
+
+    #[test]
+    fn only_production_is_hardened_by_default() {
+        assert!(AppMode::Production.hardened_by_default());
+        assert!(!AppMode::Maintenance.hardened_by_default());
+        assert!(!AppMode::Enhanced.hardened_by_default());
+    }
 }

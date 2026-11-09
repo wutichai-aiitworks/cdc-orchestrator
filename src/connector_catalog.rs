@@ -1434,6 +1434,98 @@ pub async fn postgres_primary_keys(
     ))
 }
 
+/// Key-column facts for every user table on a PostgreSQL **source** that has no
+/// PRIMARY KEY, keyed by `(schema, table)` with the names as stored (not folded).
+///
+/// Debezium emits a null record key for such tables, which a `record_key` JDBC
+/// sink cannot consume. Callers turn these facts into `message.key.columns`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeylessTable {
+    /// Narrowest valid, non-partial, non-expression UNIQUE index whose key
+    /// columns are all NOT NULL. Empty when none exists.
+    pub unique_key: Vec<String>,
+    /// Identity columns on the table or any partition ancestor.
+    pub identity: Vec<String>,
+    /// Partition-key columns of the table or any partition ancestor.
+    pub partition_key: Vec<String>,
+}
+
+impl KeylessTable {
+    /// Best record key: a real unique index, else identity + partition key
+    /// (a partitioned table can't hold a PK without its partition key).
+    pub fn derived_key(&self) -> Vec<String> {
+        if !self.unique_key.is_empty() {
+            return self.unique_key.clone();
+        }
+        if self.identity.is_empty() {
+            return Vec::new();
+        }
+        let mut key = self.identity.clone();
+        for col in &self.partition_key {
+            if !key.contains(col) {
+                key.push(col.clone());
+            }
+        }
+        key
+    }
+}
+
+pub async fn postgres_keyless_tables(
+    client: &tokio_postgres::Client,
+) -> Result<HashMap<(String, String), KeylessTable>, AppError> {
+    let rows = client
+        .query(
+            "WITH t AS ( \
+               SELECT c.oid, n.nspname, c.relname \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relkind IN ('r','p') \
+                 AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema' \
+                 AND NOT EXISTS (SELECT 1 FROM pg_index p WHERE p.indrelid = c.oid AND p.indisprimary) \
+             ), rel AS ( \
+               SELECT t.oid, t.oid AS relid FROM t \
+               UNION SELECT t.oid, a.relid FROM t, pg_partition_ancestors(t.oid) a \
+             ) \
+             SELECT t.nspname, t.relname, \
+               COALESCE((SELECT u.cols FROM ( \
+                   SELECT i.indexrelid, array_agg(a.attname::text ORDER BY x.ord) AS cols, \
+                          bool_and(a.attnotnull) AS nn \
+                   FROM pg_index i \
+                   JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord) ON x.ord <= i.indnkeyatts \
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = x.attnum \
+                   WHERE i.indrelid = t.oid AND i.indisunique AND i.indisvalid \
+                     AND i.indpred IS NULL AND i.indexprs IS NULL \
+                   GROUP BY i.indexrelid) u \
+                 WHERE u.nn ORDER BY cardinality(u.cols), u.indexrelid LIMIT 1), '{}') AS unique_key, \
+               COALESCE((SELECT array_agg(DISTINCT a.attname::text) FROM rel \
+                 JOIN pg_attribute a ON a.attrelid = rel.relid \
+                 WHERE rel.oid = t.oid AND a.attidentity <> '' AND NOT a.attisdropped), '{}') AS identity_cols, \
+               COALESCE((SELECT array_agg(DISTINCT a.attname::text) FROM rel \
+                 JOIN pg_partitioned_table pt ON pt.partrelid = rel.relid \
+                 JOIN pg_attribute a ON a.attrelid = rel.relid AND a.attnum = ANY (pt.partattrs::int2[]) \
+                 WHERE rel.oid = t.oid), '{}') AS partition_cols \
+             FROM t",
+            &[],
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(format!("failed to read source key columns: {e}")))?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (Ok(schema), Ok(table)) = (row.try_get::<_, String>(0), row.try_get::<_, String>(1))
+        else {
+            continue;
+        };
+        map.insert(
+            (schema, table),
+            KeylessTable {
+                unique_key: row.try_get(2).unwrap_or_default(),
+                identity: row.try_get(3).unwrap_or_default(),
+                partition_key: row.try_get(4).unwrap_or_default(),
+            },
+        );
+    }
+    Ok(map)
+}
+
 fn quote_ident(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() || name.contains('\0') {

@@ -6,6 +6,12 @@ use crate::{
 };
 
 pub fn definitions() -> Vec<ToolDef> {
+    let mut defs = base_definitions();
+    defs.extend(crate::copy_tools::definitions());
+    defs
+}
+
+fn base_definitions() -> Vec<ToolDef> {
     vec![
         td(
             "cdc_help",
@@ -23,18 +29,18 @@ pub fn definitions() -> Vec<ToolDef> {
         td("cdc_capability", "Feature flags and stack capability.", json!({}), true),
         td(
             "cdc_migration_tools_discover",
-            "Catalog copy/sync tools: pgcopy, RedisShake, pgloader, mongocopy.",
+            "Catalog Copy & Sync tools: pgcopy, pgdump, pgloader, mongocopy, RedisShake, rsync.",
             json!({}),
             true,
         ),
         td(
             "cdc_migration_tool_contract",
-            "Profile schema, option defaults, and API map for pgcopy or redisshake.",
+            "Profile schema, option defaults, and API map for a Copy & Sync tool.",
             json!({
                 "type": "object",
                 "required": ["tool_id"],
                 "properties": {
-                    "tool_id": {"type": "string", "enum": ["pgcopy", "redisshake", "pgloader", "mongocopy"]},
+                    "tool_id": {"type": "string", "enum": ["pgcopy", "pgdump", "pgloader", "mongocopy", "redisshake", "rsync"]},
                 },
             }),
             true,
@@ -417,6 +423,9 @@ pub fn prompt_messages(name: &str, arguments: &Value) -> Result<Value, ApiError>
 }
 
 pub async fn call(state: &AppState, call: ToolCall) -> Result<Value, ApiError> {
+    if let Some(out) = crate::copy_tools::call(state, &call).await {
+        return out;
+    }
     match call.name.as_str() {
         "cdc_help" => Ok(help_catalog(state)),
         "cdc_overview" => overview(state).await,
@@ -859,22 +868,25 @@ pub async fn call(state: &AppState, call: ToolCall) -> Result<Value, ApiError> {
 fn help_catalog(state: &AppState) -> Value {
     json!({
         "service": "mcp-cdc",
-        "write_tools_enabled": state.cfg.allow_write,
+        "write_tools_enabled": crate::can_write(state),
         "how_to_prompt": [
             "What's the CDC status?",
             "Which tables are being captured?",
             "Show recent records for bookings.airports_data",
             "Create a replica (source-to-target) pipeline for schema bookings and start it",
-            "Check lag for group cdc-connect-cluster"
+            "Check lag for group cdc-connect-cluster",
+            "Configure a Postgres copy from host.docker.internal:5438 db X to cdc-postgres-target db X — don't start it"
         ],
         "read_tools": [
             "cdc_overview", "cdc_tables", "cdc_topic_messages", "cdc_topics_list",
             "cdc_profile_list", "cdc_profile_dlq", "cdc_connector_status", "cdc_kafka_lag",
-            "cdc_source_validate", "cdc_target_validate", "cdc_logs_tail"
+            "cdc_source_validate", "cdc_target_validate", "cdc_logs_tail",
+            "cdc_copy_profile_list", "cdc_copy_test_connection", "cdc_copy_jobs", "cdc_copy_job_logs"
         ],
         "write_tools": [
             "cdc_pipeline_create", "cdc_profile_action", "cdc_connector_action",
-            "cdc_topic_create", "cdc_engine_up"
+            "cdc_topic_create", "cdc_engine_up",
+            "cdc_pg_copy_create (save only)", "cdc_copy_run (starts a copy)"
         ]
     })
 }
@@ -1195,11 +1207,11 @@ fn connection_from(args: &Value, side: &str) -> Result<Value, ApiError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("demo");
-    let password = args
-        .get(&pass_key)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("demo");
+    let password = password_or_demo(
+        args.get(&pass_key).and_then(Value::as_str),
+        host,
+        &pass_key,
+    )?;
     Ok(json!({
         "host": host,
         "port": port,
@@ -1247,11 +1259,7 @@ fn db_probe_body(args: &Value, side: &str) -> Result<Value, ApiError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("demo");
-    let password = args
-        .get("password")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("demo");
+    let password = password_or_demo(args.get("password").and_then(Value::as_str), host, "password")?;
     let mut body = json!({
         "connection": {
             "host": host,
@@ -1270,6 +1278,16 @@ fn db_probe_body(args: &Value, side: &str) -> Result<Value, ApiError> {
         body["target_type"] = json!(db_type);
     }
     Ok(body)
+}
+
+/// The `demo` password is only a default for the bundled demo databases; any other host must be
+/// given a password, so a real server is never probed with a guessed credential.
+fn password_or_demo<'a>(given: Option<&'a str>, host: &str, key: &str) -> Result<&'a str, ApiError> {
+    match given.filter(|p| !p.is_empty()) {
+        Some(p) => Ok(p),
+        None if matches!(host, "cdc-postgres-source" | "cdc-postgres-target") => Ok("demo"),
+        None => Err(ApiError::Message(format!("missing {key} for host {host}; ask the user for it"))),
+    }
 }
 
 fn list_arg(args: &Value, key: &str) -> Vec<String> {

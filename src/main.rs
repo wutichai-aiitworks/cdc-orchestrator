@@ -37,9 +37,11 @@ mod rsync_handlers;
 mod saved_secret;
 mod split;
 mod store;
+mod tool_events;
 mod tool_sidecar;
 mod trigger_cdc;
 mod watcher;
+mod wireguard;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
@@ -98,6 +100,10 @@ pub struct AppState {
     pub poll_audit_offsets: PollAuditOffsets,
     /// Background initial loads, keyed by profile id (in memory, this instance only).
     pub initial_loads: initial_load::InitialLoadRegistry,
+    /// Copy & Sync timeline when rqlite is not configured (in memory, lost on restart).
+    pub tool_events_mem: tool_events::MemoryLog,
+    /// WireGuard tunnels for the Copy & Sync tools (ADR 0010).
+    pub wireguard_tunnels: wireguard::TunnelStore,
 }
 
 async fn open_rqlite(config: &AppConfig) -> Option<RqliteClient> {
@@ -190,6 +196,7 @@ async fn main() {
             None
         }
     };
+    let rqlite_for_wireguard = rqlite.clone();
     let state = AppState {
         config: config.clone(),
         http: Client::builder()
@@ -215,6 +222,8 @@ async fn main() {
         poll_audit_clock: Arc::new(RwLock::new(HashMap::new())),
         poll_audit_offsets: Arc::new(RwLock::new(HashMap::new())),
         initial_loads: Arc::new(RwLock::new(HashMap::new())),
+        tool_events_mem: tool_events::MemoryLog::default(),
+        wireguard_tunnels: wireguard::TunnelStore::new(rqlite_for_wireguard),
     };
 
     let legacy = Router::new()
@@ -339,6 +348,7 @@ async fn main() {
                 .delete(handlers::cancel_initial_load),
         )
         .route("/profiles/:id/split", post(handlers::split_profile))
+        .route("/profiles/:id/duplicate", post(handlers::duplicate_profile))
         .route(
             "/processing-pipelines",
             get(processing_api::list_pipelines).post(processing_api::create_pipeline),
@@ -535,6 +545,7 @@ async fn main() {
                 .delete(handlers::cancel_initial_load),
         )
         .route("/profiles/:id/split", post(handlers::split_profile))
+        .route("/profiles/:id/duplicate", post(handlers::duplicate_profile))
         .route(
             "/processing-pipelines",
             get(processing_api::list_pipelines).post(processing_api::create_pipeline),
@@ -566,6 +577,32 @@ async fn main() {
         )
         .route("/notifications/history", get(ops::alert_history))
         .route("/audit/events", get(ops::list_audit_events))
+        .route("/tool-events", get(tool_events::list_events))
+        .route(
+            "/wireguard/capability",
+            get(wireguard::wireguard_capability),
+        )
+        .route("/wireguard/udp-test", post(wireguard::udp_test))
+        .route(
+            "/wireguard/tunnels",
+            get(wireguard::list_tunnels).post(wireguard::create_tunnel),
+        )
+        .route(
+            "/wireguard/tunnels/:id",
+            put(wireguard::update_tunnel).delete(wireguard::delete_tunnel),
+        )
+        .route(
+            "/wireguard/tunnels/:id/site-config",
+            get(wireguard::tunnel_site_config),
+        )
+        .route(
+            "/wireguard/tunnels/:id/site-keys",
+            post(wireguard::rotate_site_keys),
+        )
+        .route(
+            "/wireguard/tunnels/:id/probe",
+            post(wireguard::probe_tunnel),
+        )
         .route("/pipeline-logs", get(ops::list_pipeline_logs))
         .route("/ws/alerts", get(ops::ws_alerts))
         .route("/metrics", get(ops::metrics))
@@ -947,6 +984,8 @@ async fn main() {
     let _pruner = watcher::spawn_changelog_pruner(Arc::new(state.clone()));
     let _refresher = watcher::spawn_refresh_scheduler(Arc::new(state.clone()));
     let _poll_audit = watcher::spawn_poll_audit(Arc::new(state.clone()));
+    let _tool_runs = tool_events::spawn_run_watcher(Arc::new(state.clone()));
+    let _wireguard = wireguard::spawn_reconcile(Arc::new(state.clone()));
 
     let autostart_state = state.clone();
     tokio::spawn(async move {
@@ -961,7 +1000,7 @@ async fn main() {
     info!(
         host = %config.host,
         port = config.port,
-        env = %config.env_mode.as_str(),
+        app_mode = %config.app_mode.as_str(),
         require_auth = config.require_auth,
         require_persistence = config.require_persistence,
         strict_persistence = config.strict_persistence,

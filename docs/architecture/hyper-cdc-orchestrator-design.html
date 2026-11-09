@@ -445,7 +445,7 @@
 
   <div class="callout">
     <span class="tag">Readiness</span>
-    Ready for <strong>single-host Docker</strong> — immediately for development, and for production after setting <code>ORCH_ENV=prod</code> and passing the soak test. Multi-tenant and multi-node high availability are explicitly out of scope today; see <a href="#readiness">Ch.21</a>.
+    Ready for <strong>single-host Docker</strong> — immediately for development, and for production after setting <code>APP_MODE=Production</code> and passing the soak test. Multi-tenant and multi-node high availability are explicitly out of scope today; see <a href="#readiness">Ch.21</a>.
   </div>
 
   <h3>1.2 How this document is organised</h3>
@@ -1749,7 +1749,7 @@ curl -sS "${AUTH[@]}" "$BASE_URL/cdc/capability"</code></pre>
     <div class="card">
       <h4>Production rules</h4>
       <ul>
-        <li><code>ORCH_ENV=prod</code> requires a strong token of at least 24 characters.</li>
+        <li><code>APP_MODE=Production</code> (or <code>ORCH_REQUIRE_AUTH=true</code>) requires a strong token of at least 24 characters.</li>
         <li>Production requires persistence configuration to be present.</li>
         <li>Bearer comparison uses constant-time equality.</li>
         <li>CORS defaults to deny for cross-origin browser access; Nuxt is same-origin.</li>
@@ -2257,11 +2257,12 @@ curl -sI http://127.0.0.1:28080/ | rg '^HTTP/'</code></pre>
   <table class="env-table">
     <thead><tr><th>Variable</th><th>Default</th><th>Role</th></tr></thead>
     <tbody>
-      <tr><td>MCP_BIND_ADDR</td><td><code>0.0.0.0:8410</code></td><td class="env-notes">Listen address; published on loopback by Compose.</td></tr>
-      <tr><td>MCP_BEARER_TOKEN</td><td>placeholder</td><td class="env-notes">MCP client authentication; at least 24 characters. Use a strong random value outside local development.</td></tr>
+      <tr><td>MCP_BIND_ADDR</td><td><code>127.0.0.1:8410</code></td><td class="env-notes">Listen address; Compose binds <code>0.0.0.0</code> in the container and publishes on loopback.</td></tr>
+      <tr><td>MCP_CLIENT_KEYS</td><td>unset</td><td class="env-notes">Per-client keys <code>name:scope:token,…</code> with scope <code>read</code> or <code>write</code> (ADR 0008). Audit actor becomes <code>mcp:&lt;name&gt;</code>.</td></tr>
+      <tr><td>MCP_BEARER_TOKEN</td><td>generated</td><td class="env-notes">Legacy single key (client <code>default</code>, write scope). <code>install.sh</code> generates it; weak or placeholder keys stop startup unless <code>MCP_ALLOW_WEAK_TOKENS=true</code> (local dev).</td></tr>
       <tr><td>CDC_ORCHESTRATOR_URL</td><td><code>http://127.0.0.1:9788</code></td><td class="env-notes">Orchestrator base URL.</td></tr>
       <tr><td>CDC_ORCHESTRATOR_TOKEN</td><td>unset</td><td class="env-notes">Forwarded as <code>Authorization: Bearer</code>; required when orchestrator auth is on.</td></tr>
-      <tr><td>ALLOW_WRITE_TOOLS</td><td><code>false</code></td><td class="env-notes"><code>true</code> for local prompting; keep <code>false</code> in shared and production environments.</td></tr>
+      <tr><td>ALLOW_WRITE_TOOLS</td><td><code>false</code></td><td class="env-notes">Global write switch. A client also needs a <code>write</code>-scoped key; keep <code>false</code> in shared and production environments unless writes are needed.</td></tr>
     </tbody>
   </table>
 
@@ -2272,14 +2273,14 @@ curl -sI http://127.0.0.1:28080/ | rg '^HTTP/'</code></pre>
 # equivalent
 cd docker &amp;&amp; docker compose --profile mcp --profile demo up -d --build mcp-cdc</code></pre>
 
-  <p>Add the gateway to <code>~/.cursor/mcp.json</code> or a project <code>.cursor/mcp.json</code>, using the same bearer as <code>MCP_BEARER_TOKEN</code>, then reload MCP servers in Cursor:</p>
+  <p>Add the gateway to <code>~/.cursor/mcp.json</code> or a project <code>.cursor/mcp.json</code>, using that client's key from <code>MCP_CLIENT_KEYS</code> (or <code>MCP_BEARER_TOKEN</code>), then reload MCP servers in Cursor:</p>
 
   <pre><code>{
   "mcpServers": {
     "hyper-cdc": {
       "url": "http://127.0.0.1:8410/mcp",
       "headers": {
-        "Authorization": "Bearer change-me-mcp-cdc-token-min24chars"
+        "Authorization": "Bearer &lt;client key&gt;"
       }
     }
   }
@@ -2291,7 +2292,8 @@ cd docker &amp;&amp; docker compose --profile mcp --profile demo up -d --build m
     <li>Prefer <code>cdc_overview</code>, <code>cdc_tables</code>, <code>cdc_topic_messages</code>, and <code>cdc_pipeline_create</code> over inventing orchestrator JSON.</li>
     <li>Call <code>cdc_help</code> when the user asks what they can do by prompting.</li>
     <li>Demo Compose defaults: source <code>cdc-postgres-source</code>, target <code>cdc-postgres-target</code>, database, user, and password all <code>demo</code>, schema <code>bookings</code>.</li>
-    <li>Writes need <code>ALLOW_WRITE_TOOLS=true</code>. If a write tool returns a gate error, tell the user to set that flag and rebuild or restart <code>mcp-cdc</code>.</li>
+    <li>Writes need <code>ALLOW_WRITE_TOOLS=true</code> and a write-scoped client key. A gate error names which is missing; tool failures arrive as results with <code>isError: true</code>.</li>
+    <li>Copy &amp; Sync: <code>cdc_copy_test_connection</code> → <code>cdc_pg_copy_create</code> (saves only) → <code>cdc_copy_run</code> only when the user asks to start.</li>
     <li>Never dump passwords or other secrets into chat summaries.</li>
     <li>Never talk to Kafka Connect, Redpanda, or the Docker API directly.</li>
   </ol>
@@ -2448,7 +2450,7 @@ SELECT * FROM cdc_raw EMIT CHANGES LIMIT 10;</code></pre>
 
   <div class="mode-legend">
     <span class="mode-pill"><span class="env-badge required">Required</span> always</span>
-    <span class="mode-pill"><span class="env-badge prod-required">Prod required</span> when <code>ORCH_ENV=prod</code></span>
+    <span class="mode-pill"><span class="env-badge prod-required">Prod required</span> when <code>APP_MODE=Production</code></span>
     <span class="mode-pill"><span class="env-badge conditional">Conditional</span> when a feature or profile is enabled</span>
     <span class="mode-pill"><span class="env-badge optional">Optional</span> tuning and overrides</span>
   </div>
@@ -2457,14 +2459,14 @@ SELECT * FROM cdc_raw EMIT CHANGES LIMIT 10;</code></pre>
   <table class="env-table">
     <thead><tr><th>Variable</th><th>Default</th><th>Mode</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>ORCH_ENV</td><td><code>dev</code></td><td><span class="env-badge required">Required</span></td><td class="env-notes"><code>dev</code> or <code>prod</code>. Production demands a strong token and rqlite persistence, and startup fails otherwise.</td></tr>
+      <tr><td>APP_MODE</td><td><code>Production</code></td><td><span class="env-badge required">Required</span></td><td class="env-notes"><code>Production</code>, <code>Maintenance</code> or <code>Enhanced</code> (replaces <code>ORCH_ENV</code>). Production demands a strong token and rqlite persistence, and startup fails otherwise. Maintenance (stable, fixes only) and Enhanced (new features) show an amber or violet corner ribbon on every page.</td></tr>
       <tr><td>ORCH_ENABLED</td><td><code>true</code></td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Master enable flag reported by <code>/health</code>.</td></tr>
       <tr><td>ORCH_API_TOKEN</td><td>unset</td><td><span class="env-badge prod-required">Prod required</span></td><td class="env-notes">Bearer token, minimum 24 random characters. Compared in constant time.</td></tr>
       <tr><td>ORCH_COMMAND_TIMEOUT_SECS</td><td><code>30</code></td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Upper bound for shelled-out commands such as <code>rpk</code> and <code>docker</code>.</td></tr>
       <tr><td>ORCH_POLL_INTERVAL_MS</td><td><code>30000</code></td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Watcher poll cadence against Kafka Connect.</td></tr>
       <tr><td>ORCH_HISTORY_CAPACITY</td><td><code>500</code></td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Cap on in-memory transition and alert history.</td></tr>
       <tr><td>ORCH_STOP_DELETES_CONNECTOR</td><td><code>false</code></td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Whether a profile <code>stop</code> action deletes the connector or only pauses it.</td></tr>
-      <tr><td>ORCH_REQUIRE_AUTH</td><td>true in prod</td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Explicit override; defaults to true when <code>ORCH_ENV=prod</code>.</td></tr>
+      <tr><td>ORCH_REQUIRE_AUTH</td><td>true in Production</td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Explicit override; defaults to true when <code>APP_MODE=Production</code>.</td></tr>
       <tr><td>ORCH_CORS_ORIGINS</td><td>empty</td><td><span class="env-badge optional">Optional</span></td><td class="env-notes">Default deny. Set an allow-list only if a browser calls the orchestrator directly.</td></tr>
     </tbody>
   </table>
@@ -2523,14 +2525,14 @@ SELECT * FROM cdc_raw EMIT CHANGES LIMIT 10;</code></pre>
       <tr><td>CDC_DEMO_DUMP_SIZE</td><td><code>3m</code></td><td class="env-notes"><code>3m</code>, <code>6m</code>, <code>1y</code>, or <code>2y</code>. Applied only on first initialization of an empty volume.</td></tr>
       <tr><td>MCP_CDC_IMAGE</td><td><code>mcp-cdc:local</code></td><td class="env-notes">MCP gateway image.</td></tr>
       <tr><td>MCP_CDC_BIND / MCP_CDC_PORT</td><td><code>127.0.0.1</code> / <code>8410</code></td><td class="env-notes">Published on loopback by default.</td></tr>
-      <tr><td>MCP_BEARER_TOKEN</td><td>placeholder</td><td class="env-notes">At least 24 characters; use a strong random value outside local development.</td></tr>
+      <tr><td>MCP_CLIENT_KEYS / MCP_BEARER_TOKEN</td><td>generated</td><td class="env-notes">One random key (≥ 24 chars) per client, read or write scope; weak keys stop startup (ADR 0008).</td></tr>
       <tr><td>ALLOW_WRITE_TOOLS</td><td><code>false</code></td><td class="env-notes">Set <code>true</code> only for local agent prompting.</td></tr>
     </tbody>
   </table>
 
   <div class="callout security">
     <span class="tag">Production</span>
-    A minimal production <code>.env</code> sets <code>ORCH_ENV=prod</code>, a random <code>ORCH_API_TOKEN</code> of at least 24 characters, <code>ORCH_RQLITE_URL</code>, and <code>HYPER_CDC_ORCHESTRATOR_BIND=127.0.0.1</code>. Startup fails when the token is missing or weak, or when the config store URL is absent.
+    A minimal production <code>.env</code> sets <code>APP_MODE=Production</code>, a random <code>ORCH_API_TOKEN</code> of at least 24 characters, <code>ORCH_RQLITE_URL</code>, and <code>HYPER_CDC_ORCHESTRATOR_BIND=127.0.0.1</code>. Startup fails when the token is missing or weak, or when the config store URL is absent.
   </div>
 </section>
 

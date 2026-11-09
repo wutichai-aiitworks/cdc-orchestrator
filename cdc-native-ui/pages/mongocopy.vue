@@ -38,7 +38,8 @@ const tool: TransferTool<MongoCopyProfile, any, MongoCopyJob> = {
   title: "Mongo copy",
   icon: Database,
   intro: "Copy MongoDB databases or collections from one server to another with mongodump and mongorestore.",
-  emptyText: "A transfer dumps a MongoDB database (or chosen collections) and restores it on another server, optionally under a new database name.",
+  noun: { one: "copy", many: "copies" },
+  emptyText: "A copy dumps a MongoDB database (or chosen collections) and restores it on another server, optionally under a new database name.",
   namePlaceholder: "App data to staging",
   api: {
     fetchProfiles: api.fetchProfiles,

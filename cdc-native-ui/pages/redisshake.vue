@@ -5,7 +5,7 @@ import { ArrowRightLeft, ChevronRight } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
 import { defaultRedisShakeOptions, type RedisShakeConn, type RedisShakeJob, type RedisShakeProfile, useRedisShake } from "~/composables/useRedisShake"
 import * as rules from "~/utils/transferTools/redisshake"
-import type { TransferTool } from "~/utils/transferTools/types"
+import type { StartMode, TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
 
@@ -18,7 +18,8 @@ const toPayload = (d: any) => ({
   name: d.name.trim(),
   source: { ...d.source, type: "redis" },
   target: { ...d.target, type: "redis" },
-  options: { ...d.options },
+  // A target database only applies to a single source database, and only when it differs.
+  options: { ...d.options, source_dbs: d.options.source_dbs || [], target_db: rules.targetDb(d.options) ?? null },
 })
 const test = transferTester("redisshake")
 const kind = (o: Record<string, any>, side: string) => [o[`${side}_cluster`] ? "Cluster" : "Single server", o[`${side}_tls`] && "TLS"].filter(Boolean).join(", ")
@@ -31,6 +32,7 @@ const tool: TransferTool<RedisShakeProfile, any, RedisShakeJob> = {
   title: "Redis sync",
   icon: ArrowRightLeft,
   intro: "Copy every key from one Redis to another, then keep applying changes live until you stop the sync.",
+  noun: { one: "sync", many: "syncs" },
   emptyText: "A sync copies all keys from a source Redis to a target with RedisShake, then streams changes so the target stays current.",
   namePlaceholder: "Cache to new cluster",
   continuous: true,
@@ -62,7 +64,38 @@ const tool: TransferTool<RedisShakeProfile, any, RedisShakeJob> = {
   changeLabels: rules.changeLabels,
   verb: rules.verb,
   startedToast: rules.startedToast,
-  modeLabel: (p) => (p.options.sync_aof !== false ? "Full copy, then live changes" : "Full copy only"),
+  modeLabel: (p) => ({ once: "One-time sync", cdc: "CDC with initial snapshot", "cdc-live": "CDC, changes only" })[rules.defaultMode(p.options)],
+  // Main button = the profile's default; the others are one-off starts in the "Start as" menu.
+  startModes: (p) => {
+    const def = rules.defaultMode(p.options || {})
+    const mk = (key: rules.StartModeKey, run: (id: string) => Promise<RedisShakeJob>) => ({
+      key,
+      label: rules.MODE_LABELS[key],
+      help: rules.MODE_HELP[key],
+      startedToast: key === "once" ? "One-time sync started" : "CDC started",
+      primary: key === def,
+      effects: rules.effects(p, key),
+      run,
+    })
+    const modes: StartMode<RedisShakeJob>[] = [
+      mk("cdc", (id) => api.runProfile(id, "cdc", true)),
+      mk("cdc-live", (id) => api.runProfile(id, "cdc", false)),
+      mk("once", (id) => api.runProfile(id, "once")),
+    ]
+    // A one-off "start clean": only offered when the profile does not empty the target anyway.
+    if (!p.options?.empty_target) {
+      modes.push({
+        key: "once-empty",
+        label: "Empty target, then one-time sync",
+        help: `Delete ${rules.emptyScopeText(p)}, then copy every key once.`,
+        startedToast: "Target emptied, one-time sync started",
+        primary: false,
+        effects: rules.effects(p, "once", true),
+        run: (id: string) => api.runProfile(id, "once", undefined, true),
+      })
+    }
+    return modes
+  },
   runResult: rules.runResult,
   steps: (p, job, log) => rules.steps(p, job, log),
   summary: rules.summary,
@@ -70,13 +103,13 @@ const tool: TransferTool<RedisShakeProfile, any, RedisShakeJob> = {
   problems: rules.problems,
   // Runs before per-run job ids used the profile id as the job id.
   jobsOf: (jobs, id) => jobs.filter((j) => (j.profile_id || j.id) === id),
-  routeSource: (p, checks) => ({ engine: "redis", role: `Source${ver(checks.source, "Redis")}`, title: p.source.host, detail: `port ${p.source.port || "6379"}, ${kind(p.options, "source").toLowerCase()}` }),
+  routeSource: (p, checks) => ({ engine: "redis", role: `Source${ver(checks.source, "Redis")}`, title: p.source.host, detail: `port ${p.source.port || "6379"}, ${kind(p.options, "source").toLowerCase()}${(p.options.source_dbs || []).length ? `, db ${p.options.source_dbs.join(", ")}` : ""}` }),
   routeDestinations: (p, checks) => [
     {
       engine: "redis",
       role: `Target${ver(checks.target, "Redis")}`,
       title: p.target.host,
-      detail: `port ${p.target.port || "6379"}, ${kind(p.options, "target").toLowerCase()}`,
+      detail: `port ${p.target.port || "6379"}, ${kind(p.options, "target").toLowerCase()}${rules.targetDb(p.options) !== undefined ? `, db ${rules.targetDb(p.options)}` : ""}`,
       overwrite: (p.options.rdb_restore_command_behavior || "panic") === "rewrite" ? "Overwrites existing keys" : undefined,
     },
   ],
@@ -92,12 +125,22 @@ const tool: TransferTool<RedisShakeProfile, any, RedisShakeJob> = {
   sections: () => [
     { id: "rs-source", label: "Source Redis" },
     { id: "rs-target", label: "Target Redis" },
-    { id: "rs-what", label: "What to sync" },
+    { id: "rs-what", label: "Start mode" },
     { id: "rs-existing", label: "Existing keys" },
     { id: "rs-advanced", label: "Advanced" },
   ],
 }
 const CHECK_NOTE = "Tested from the redisshake container, the same way a run connects."
+const START_OPTIONS = [
+  { value: "cdc", label: "CDC", help: rules.MODE_HELP.cdc },
+  { value: "cdc-live", label: "CDC from now", help: rules.MODE_HELP["cdc-live"] },
+  { value: "once", label: "One-time sync", help: rules.MODE_HELP.once },
+]
+/** Default start mode → the stored RedisShake switches (full copy = sync_rdb, live changes = sync_aof). */
+const setDefaultMode = (o: Record<string, any>, mode: string) => {
+  o.sync_rdb = mode !== "cdc-live"
+  o.sync_aof = mode !== "once"
+}
 const choiceModel = (o: Record<string, any>) => o.rdb_restore_command_behavior || "panic"
 </script>
 
@@ -158,12 +201,47 @@ const choiceModel = (o: Record<string, any>) => o.rdb_restore_command_behavior |
         </TransferConnection>
       </TransferSection>
 
-      <TransferSection id="rs-what" title="What to sync" why="A full copy sends every key once. Live changes keep the target current until you stop the sync.">
-        <TransferSwitch v-model="draft.options.sync_rdb" label="Full copy" help="Copy every key that exists when the sync starts." />
-        <TransferSwitch v-model="draft.options.sync_aof" label="Live changes" help="Then keep applying writes made on the source. Off: the sync ends after the full copy." />
-        <p v-if="draft.options.sync_rdb === false && draft.options.sync_aof === false" class="text-xs text-amber-600 dark:text-amber-400">
-          Both are off, so the sync would copy nothing.
-        </p>
+      <TransferSection
+        id="rs-what"
+        title="Start mode"
+        why="CDC keeps the target in step with the source until you stop it; a one-time sync copies once and ends. This is the main Start button; the others are always available under “Start as”."
+      >
+        <TransferSegmented
+          :model-value="rules.defaultMode(draft.options)"
+          :options="START_OPTIONS"
+          label="Default start"
+          @update:model-value="setDefaultMode(draft.options, $event)"
+        />
+        <TransferSwitch
+          v-model="draft.options.empty_target"
+          label="Empty the target before a full copy"
+          :help="
+            rules.defaultMode(draft.options) === 'cdc-live'
+              ? 'Not used by CDC from now (there is no full copy). Applies when you run a one-time sync or CDC from Start as.'
+              : `Deletes ${rules.emptyScopeText(draft)} before copying, so the target ends up an exact copy (no leftover keys). Without it, existing keys follow “Existing keys” below.`
+          "
+          danger="Deletes data on the target"
+        />
+        <TransferTokens
+          :model-value="rules.dbTokens(draft.options)"
+          label="Source databases"
+          help="Database numbers to sync, for example 0 or 2. Keys keep their database number on the target. Leave empty to sync every database."
+          placeholder="All databases"
+          @update:model-value="draft.options.source_dbs = rules.parseDbs($event)"
+        />
+        <label v-if="(draft.options.source_dbs || []).length === 1" class="block max-w-xs">
+          <span class="auth-label !mb-1.5">Write into target database</span>
+          <input
+            v-model.number="draft.options.target_db"
+            type="number"
+            min="0"
+            max="9999"
+            class="auth-input tabular-nums"
+            :placeholder="`Same as source (db ${draft.options.source_dbs[0]})`"
+          />
+          <span class="mt-1 block text-xs text-muted-foreground">Leave empty to keep the same number.</span>
+        </label>
+        <p v-if="rules.dbProblem(draft.options)" class="text-xs text-amber-600 dark:text-amber-400">{{ rules.dbProblem(draft.options) }}</p>
       </TransferSection>
 
       <TransferSection id="rs-existing" title="Existing keys" why="What happens when a key from the source already exists on the target during the full copy.">

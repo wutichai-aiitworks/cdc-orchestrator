@@ -24,6 +24,8 @@ import type { ConnCheck, TransferTool } from "~/utils/transferTools/types"
 
 const props = defineProps<{ tool: TransferTool }>()
 const tool = props.tool
+const noun = tool.noun ?? { one: "transfer", many: "transfers" }
+const Noun = noun.one.charAt(0).toUpperCase() + noun.one.slice(1)
 const toast = useToast()
 const route = useRoute()
 const router = useRouter()
@@ -38,7 +40,7 @@ const loadError = ref("")
 const now = ref(Date.now())
 const logs = reactive<Record<string, string>>({})
 
-type Tab = "overview" | "config" | "runs"
+type Tab = "overview" | "config" | "runs" | "timeline"
 const NEW = "new"
 const selectedId = ref("")
 const tab = ref<Tab>("overview")
@@ -75,7 +77,7 @@ const routeJob = computed(() => (dirty.value ? undefined : activeJob.value || la
 const steps = computed(() => tool.steps(payload.value, routeJob.value, routeJob.value ? logs[routeJob.value.id] || "" : "", now.value))
 const routeSource = computed(() => tool.routeSource(payload.value, checks))
 const routeDestinations = computed(() => tool.routeDestinations(payload.value, checks, capability.value))
-const result = (j: any) => tool.runResult(j)
+const result = (j: any) => tool.runResult(j, logs[j.id] || "")
 const railItems = computed(() => {
   const items = profiles.value.map((p) => {
     const [from] = tool.railEngines(p)
@@ -83,13 +85,13 @@ const railItems = computed(() => {
   })
   if (isNew.value) {
     const [from] = tool.railEngines({ ...payload.value, id: NEW })
-    items.unshift({ id: NEW, name: draft.value.name || "New transfer", route: "Not saved yet", from, status: { tone: "idle" as Tone, text: "Draft" } })
+    items.unshift({ id: NEW, name: draft.value.name || `New ${noun.one}`, route: "Not saved yet", from, status: { tone: "idle" as Tone, text: "Draft" } })
   }
   return items
 })
 
 const runBlockedReason = computed(() => {
-  if (isNew.value) return "Create the transfer first"
+  if (isNew.value) return `Save the ${noun.one} first`
   if (dirty.value) return "Save your changes first"
   if (activeJob.value) return tool.continuous ? "The sync is running" : "A run is in progress"
   return ""
@@ -148,11 +150,11 @@ const loadAll = async () => {
     if (first) {
       selectedId.value = first.id
       loadDraft(first)
-      tab.value = (["overview", "config", "runs"].includes(String(route.query.tab)) ? route.query.tab : "overview") as Tab
+      tab.value = (["overview", "config", "runs", "timeline"].includes(String(route.query.tab)) ? route.query.tab : "overview") as Tab
       if (route.query.run) openRunId.value = String(route.query.run)
     }
   } catch (e: any) {
-    loadError.value = formatApiError(e, `Could not load ${tool.title} transfers`)
+    loadError.value = formatApiError(e, `Could not load ${tool.title} ${noun.many}`)
   } finally {
     loading.value = false
   }
@@ -240,7 +242,7 @@ onBeforeRouteLeave(() => (dirty.value ? window.confirm("Leave without saving you
 const saving = ref(false)
 const save = async () => {
   if (!draft.value.name?.trim()) {
-    toast.error("Give the transfer a name")
+    toast.error(`Give the ${noun.one} a name`)
     tab.value = "config"
     nextTick(() => document.getElementById("tw-name")?.focus())
     return
@@ -254,7 +256,7 @@ const save = async () => {
       profiles.value.push(created)
       selectedId.value = created.id
       loadDraft(created)
-      toast.success("Transfer created")
+      toast.success(`${Noun} ${tool.createLabel ? "saved" : "created"}`)
     } else {
       const updated = await tool.api.updateProfile(selectedId.value, body)
       const i = profiles.value.findIndex((p) => p.id === updated.id)
@@ -272,12 +274,27 @@ const save = async () => {
 
 const confirmRun = ref(false)
 const starting = ref(false)
-const requestRun = () => {
+// Start modes (Redis sync: CDC / one-time sync). Without them, Run uses the profile as saved.
+const startModes = computed(() => tool.startModes?.(payload.value) || [])
+const primaryMode = computed(() => startModes.value.find((m) => m.primary) || startModes.value[0])
+const otherModes = computed(() => startModes.value.filter((m) => m !== primaryMode.value))
+const startMenu = computed(() => otherModes.value.map((m) => ({ key: m.key, label: m.label })))
+/** The mode chosen for the run being confirmed (null = the default Run). */
+const pendingMode = ref<any>(null)
+const runLabel = computed(() => (pendingMode.value || primaryMode.value)?.label || verb.value)
+const requestRun = (mode: any = primaryMode.value || null) => {
   if (runBlockedReason.value) return
-  if (effects.value.length) confirmRun.value = true
+  pendingMode.value = mode
+  if ((mode?.effects || effects.value).length) confirmRun.value = true
   else run()
 }
-const run = () => startJob((id) => tool.api.runProfile(id), tool.startedToast(payload.value))
+const onStartMenu = (key: string) => requestRun(startModes.value.find((m) => m.key === key))
+const run = () => {
+  const mode = pendingMode.value
+  return mode
+    ? startJob(mode.run, mode.startedToast)
+    : startJob((id) => tool.api.runProfile(id), tool.startedToast(payload.value))
+}
 const runPreview = () => tool.preview && startJob(tool.preview.run, tool.preview.startedToast)
 const startJob = async (start: (profileId: string) => Promise<any>, startedText: string) => {
   if (!current.value) return
@@ -342,9 +359,9 @@ const deleteProfile = async () => {
     selectedId.value = first?.id || ""
     loadDraft(first)
     tab.value = "overview"
-    toast.success("Transfer deleted")
+    toast.success(`${Noun} deleted`)
   } catch (e: any) {
-    toast.error(formatApiError(e, "Could not delete the transfer"))
+    toast.error(formatApiError(e, `Could not delete the ${noun.one}`))
   } finally {
     deleting.value = false
   }
@@ -352,7 +369,7 @@ const deleteProfile = async () => {
 
 const menuItems = computed(() => [
   { key: "duplicate", label: "Duplicate", icon: Copy, disabled: isNew.value },
-  { key: "delete", label: "Delete transfer", icon: Trash2, destructive: true, separatorBefore: true, disabled: isNew.value },
+  { key: "delete", label: `Delete ${noun.one}`, icon: Trash2, destructive: true, separatorBefore: true, disabled: isNew.value },
 ])
 const onMenu = (key: string) => {
   if (key === "duplicate" && current.value) startNew(current.value)
@@ -389,6 +406,7 @@ const tabs = computed(() => [
   { key: "overview" as Tab, label: "Overview" },
   { key: "config" as Tab, label: "Configuration" },
   { key: "runs" as Tab, label: tool.latestOnly ? "Last run" : "Runs", count: tool.latestOnly ? 0 : profileJobs.value.length },
+  { key: "timeline" as Tab, label: "Timeline" },
 ])
 const onTabKey = (e: KeyboardEvent) => {
   const keys = tabs.value.map((t) => t.key)
@@ -424,21 +442,22 @@ const slotProps = computed(() => ({
       <code class="font-mono text-xs">ORCH_{{ tool.key.toUpperCase() }}_URL</code> points at it.
     </p>
 
-    <AppStateBlock v-if="loading" kind="loading" message="Loading transfers…" />
+    <AppStateBlock v-if="loading" kind="loading" :message="`Loading ${noun.many}…`" />
     <AppStateBlock v-else-if="loadError" kind="error" :message="loadError" />
 
     <div v-else-if="!profiles.length && !isNew" class="mx-auto max-w-lg rounded-xl border border-dashed border-border px-6 py-12 text-center">
       <component :is="tool.icon" class="mx-auto h-8 w-8 text-muted-foreground" :stroke-width="1.5" />
-      <h2 class="mt-3 text-base font-semibold text-foreground">No {{ tool.title }} transfers yet</h2>
+      <h2 class="mt-3 text-base font-semibold text-foreground">No {{ tool.title }} {{ noun.many }} yet</h2>
       <p class="mt-1 text-sm text-muted-foreground">{{ tool.emptyText }}</p>
-      <AppButton variant="primary" class="mt-5" @click="startNew()"><Plus class="h-4 w-4" :stroke-width="2" />New transfer</AppButton>
+      <AppButton variant="primary" class="mt-5" @click="startNew()"><Plus class="h-4 w-4" :stroke-width="2" />New {{ noun.one }}</AppButton>
     </div>
 
     <div v-else class="flex flex-col gap-6 lg:flex-row lg:items-start">
       <TransferRail
         :items="railItems"
         :selected="selectedId"
-        purpose="Saved transfers and their last result."
+        :purpose="`Saved ${noun.many} and their last result.`"
+        :noun="noun"
         new-label="New"
         class="lg:sticky lg:top-0 lg:max-h-[calc(100vh-8rem)]"
         @select="select"
@@ -448,7 +467,7 @@ const slotProps = computed(() => ({
       <main class="min-w-0 flex-1 space-y-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0">
-            <h2 class="truncate text-base font-semibold text-foreground">{{ draft.name || "New transfer" }}</h2>
+            <h2 class="truncate text-base font-semibold text-foreground">{{ draft.name || `New ${noun.one}` }}</h2>
             <div class="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
               <span>{{ tool.modeLabel(payload) }}</span>
               <span v-if="lastJob" class="inline-flex items-center gap-1.5">
@@ -465,16 +484,29 @@ const slotProps = computed(() => ({
             <AppButton v-if="!activeJob && tool.preview" variant="secondary" :disabled="!!runBlockedReason || starting" :title="runBlockedReason" @click="runPreview">
               <Eye class="h-4 w-4" :stroke-width="1.75" />{{ tool.preview.label }}
             </AppButton>
-            <AppButton v-if="!activeJob" variant="primary" :disabled="!!runBlockedReason || starting" :title="runBlockedReason" @click="requestRun">
-              <Play class="h-4 w-4" :stroke-width="1.75" />{{ starting ? "Starting…" : verb }}
+            <AppButton
+              v-if="!activeJob"
+              variant="primary"
+              :disabled="!!runBlockedReason || starting"
+              :title="runBlockedReason || primaryMode?.help"
+              @click="requestRun()"
+            >
+              <Play class="h-4 w-4" :stroke-width="1.75" />{{ starting ? "Starting…" : primaryMode?.label || verb }}
             </AppButton>
+            <AppActionMenu
+              v-if="!activeJob && startMenu.length"
+              label="Start as"
+              :items="startMenu"
+              :disabled="!!runBlockedReason || starting"
+              @select="onStartMenu"
+            />
             <AppActionMenu label="More" :items="menuItems" @select="onMenu" />
           </div>
         </div>
 
         <TransferRoute :source="routeSource" :steps="steps" :destinations="routeDestinations" :live="!!activeJob && !dirty" />
 
-        <div class="flex gap-1 border-b border-border" role="tablist" aria-label="Transfer views" @keydown="onTabKey">
+        <div class="flex gap-1 border-b border-border" role="tablist" :aria-label="`${Noun} views`" @keydown="onTabKey">
           <button
             v-for="t in tabs"
             :id="`tw-tab-${t.key}`"
@@ -526,7 +558,7 @@ const slotProps = computed(() => ({
           </div>
 
           <div>
-            <h3 class="mb-3 text-sm font-semibold text-foreground">What this transfer does</h3>
+            <h3 class="mb-3 text-sm font-semibold text-foreground">What this {{ noun.one }} does</h3>
             <dl class="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-[9rem_minmax(0,1fr)]">
               <template v-for="row in summary" :key="row.label">
                 <dt class="text-muted-foreground">{{ row.label }}</dt>
@@ -543,7 +575,7 @@ const slotProps = computed(() => ({
         <!-- ── Configuration ────────────────────────────────────────── -->
         <section v-else-if="tab === 'config'" role="tabpanel" aria-labelledby="tw-tab-config" class="flex gap-8">
           <div class="min-w-0 max-w-4xl flex-1">
-            <TransferSection id="tw-general" title="Transfer" why="The name appears in the list, run history and audit log.">
+            <TransferSection id="tw-general" :title="Noun" why="The name appears in the list, run history and audit log.">
               <label class="block max-w-md">
                 <span class="auth-label !mb-1.5">Name</span>
                 <input id="tw-name" v-model="draft.name" class="auth-input" :placeholder="tool.namePlaceholder" />
@@ -551,11 +583,11 @@ const slotProps = computed(() => ({
               <slot name="general" v-bind="slotProps" />
             </TransferSection>
             <slot name="config" v-bind="slotProps" />
-            <TransferSaveBar :changes="changes" :saving="saving" :is-new="isNew" @save="save" @discard="discard" />
+            <TransferSaveBar :changes="changes" :saving="saving" :is-new="isNew" :noun="noun.one" :create-label="tool.createLabel" @save="save" @discard="discard" />
           </div>
           <nav class="sticky top-0 hidden w-44 shrink-0 self-start xl:block" aria-label="Sections">
             <ul class="space-y-1 border-l border-border text-sm">
-              <li v-for="s in [{ id: 'tw-general', label: 'Transfer' }, ...sections]" :key="s.id">
+              <li v-for="s in [{ id: 'tw-general', label: Noun }, ...sections]" :key="s.id">
                 <button type="button" class="-ml-px border-l-2 border-transparent px-3 py-1 text-left text-muted-foreground hover:border-border hover:text-foreground" @click="jump(s.id)">
                   {{ s.label }}
                 </button>
@@ -565,7 +597,7 @@ const slotProps = computed(() => ({
         </section>
 
         <!-- ── Runs ─────────────────────────────────────────────────── -->
-        <section v-else role="tabpanel" aria-labelledby="tw-tab-runs" class="space-y-3">
+        <section v-else-if="tab === 'runs'" role="tabpanel" aria-labelledby="tw-tab-runs" class="space-y-3">
           <p v-if="tool.latestOnly && profileJobs.length" class="text-xs text-muted-foreground">
             Only the latest run is kept. Starting a new run replaces it and its log.
           </p>
@@ -629,13 +661,24 @@ const slotProps = computed(() => ({
             </table>
           </div>
         </section>
+
+        <!-- ── Timeline (audit trail, ADR 0009) ─────────────────────── -->
+        <section v-else role="tabpanel" aria-labelledby="tw-tab-timeline" class="max-w-5xl">
+          <TransferTimeline
+            :tool="tool.key"
+            :profile-id="selectedId"
+            :profile-name="current?.name"
+            :retained-run-ids="profileJobs.map((j: any) => j.id)"
+            @open-run="openLatestRun"
+          />
+        </section>
       </main>
     </div>
 
-    <AppConfirmDialog :open="confirmRun" :title="`${verb}?`" :confirm-label="verb" danger :loading="starting" @update:open="confirmRun = $event" @confirm="run">
+    <AppConfirmDialog :open="confirmRun" :title="`${runLabel}?`" :confirm-label="runLabel" danger :loading="starting" @update:open="confirmRun = $event" @confirm="run">
       <p>This changes another database:</p>
       <ul class="mt-2 list-disc space-y-1 pl-5 text-foreground">
-        <li v-for="e in effects" :key="e">{{ e }}</li>
+        <li v-for="e in pendingMode?.effects || effects" :key="e">{{ e }}</li>
       </ul>
     </AppConfirmDialog>
     <AppConfirmDialog :open="!!pendingNav" title="Discard unsaved changes?" confirm-label="Discard changes" danger @update:open="pendingNav = null" @confirm="confirmDiscard">
@@ -646,8 +689,8 @@ const slotProps = computed(() => ({
     </AppConfirmDialog>
     <AppConfirmDialog
       :open="confirmDeleteProfile"
-      :title="`Delete ${current?.name || 'this transfer'}?`"
-      confirm-label="Delete transfer"
+      :title="`Delete ${current?.name || `this ${noun.one}`}?`"
+      :confirm-label="`Delete ${noun.one}`"
       danger
       :loading="deleting"
       @update:open="confirmDeleteProfile = $event"

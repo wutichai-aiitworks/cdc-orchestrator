@@ -22,9 +22,9 @@ const klass = computed(() => {
     primary: "btn-primary",
     secondary: "btn-secondary",
     ghost:
-      "inline-flex h-10 min-h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:pointer-events-none disabled:opacity-50",
+      "inline-flex h-9 min-h-9 items-center justify-center gap-2 rounded-lg px-3 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:pointer-events-none disabled:opacity-50",
     destructive:
-      "inline-flex h-10 min-h-10 items-center justify-center gap-2 rounded-xl bg-destructive px-4 text-sm font-semibold text-destructive-foreground hover:brightness-95 focus:outline-none focus:ring-1 focus:ring-ring disabled:pointer-events-none disabled:opacity-50",
+      "inline-flex h-9 min-h-9 items-center justify-center gap-2 rounded-lg bg-destructive px-3.5 text-sm font-semibold text-destructive-foreground hover:brightness-95 focus:outline-none focus:ring-1 focus:ring-ring disabled:pointer-events-none disabled:opacity-50",
   }
   return [
     variants[props.variant],

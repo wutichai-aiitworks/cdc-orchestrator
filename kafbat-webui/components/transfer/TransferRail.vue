@@ -1,11 +1,14 @@
 <script setup lang="ts">
-// List of saved transfers with their last result. ↑/↓ move, Enter opens.
+// List of saved profiles with their last result. ↑/↓ move, Enter opens.
 import { Plus, Search } from "@lucide/vue"
 import type { Tone } from "~/utils/transferView"
 
 export type RailItem = { id: string; name: string; route: string; status: { tone: Tone; text: string }; from: string }
 
-const props = defineProps<{ items: RailItem[]; selected: string; purpose: string; newLabel?: string }>()
+const props = withDefaults(defineProps<{ items: RailItem[]; selected: string; purpose: string; newLabel?: string; noun?: { one: string; many: string } }>(), {
+  noun: () => ({ one: "transfer", many: "transfers" }),
+})
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 const emit = defineEmits<{ select: [id: string]; new: [] }>()
 const q = ref("")
 const filtered = computed(() => {
@@ -32,16 +35,16 @@ const dot: Record<Tone, string> = {
 </script>
 
 <template>
-  <aside class="flex min-h-0 flex-col gap-3 lg:w-72 lg:shrink-0" aria-label="Transfers">
+  <aside class="flex min-h-0 flex-col gap-3 lg:w-72 lg:shrink-0" :aria-label="cap(noun.many)">
     <div class="flex items-start justify-between gap-2">
       <p class="text-xs leading-5 text-muted-foreground">{{ purpose }}</p>
       <AppButton size="sm" @click="emit('new')"><Plus class="h-3.5 w-3.5" :stroke-width="2" />{{ newLabel || "New" }}</AppButton>
     </div>
     <label v-if="items.length > 4" class="relative block">
       <Search class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" :stroke-width="1.75" />
-      <input v-model="q" type="search" class="auth-input w-full !pl-9" placeholder="Find a transfer" aria-label="Find a transfer" />
+      <input v-model="q" type="search" class="auth-input w-full !pl-9" :placeholder="`Find a ${noun.one}`" :aria-label="`Find a ${noun.one}`" />
     </label>
-    <div ref="list" class="flex flex-col gap-1 overflow-auto" role="listbox" aria-label="Saved transfers" @keydown="onKey">
+    <div ref="list" class="flex flex-col gap-1 overflow-auto" role="listbox" :aria-label="`Saved ${noun.many}`" @keydown="onKey">
       <button
         v-for="item in filtered"
         :key="item.id"
@@ -66,7 +69,7 @@ const dot: Record<Tone, string> = {
           </span>
         </span>
       </button>
-      <p v-if="items.length && !filtered.length" class="px-3 py-2 text-xs text-muted-foreground">No transfer matches “{{ q }}”.</p>
+      <p v-if="items.length && !filtered.length" class="px-3 py-2 text-xs text-muted-foreground">No {{ noun.one }} matches “{{ q }}”.</p>
     </div>
   </aside>
 </template>

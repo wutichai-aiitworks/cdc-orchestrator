@@ -40,7 +40,7 @@ const visual = computed((): { tone: string; icon: Component; motion: Motion } =>
   if (has("running", "healthy", "online", "live", "stable", "up")) {
     return { tone: "badge-success", icon: Activity, motion: "none" }
   }
-  if (has("ok", "success", "enabled", "ready", "resolved", "valid", "connected", "configured")) {
+  if (has("ok", "success", "enabled", "ready", "resolved", "recovered", "valid", "connected", "configured", "allow")) {
     return { tone: "badge-success", icon: CheckCircle2, motion: "none" }
   }
   if (has("failed", "error", "unhealthy", "dead", "down", "offline", "invalid", "unassigned")) {
@@ -70,15 +70,31 @@ const visual = computed((): { tone: string; icon: Component; motion: Motion } =>
   return { tone: "badge-neutral", icon: HelpCircle, motion: "none" }
 })
 
-const display = computed(() => props.label || props.status || "Unknown")
+/** "RUNNING" / "UNASSIGNED_TASK" → "Running" / "Unassigned task"; mixed-case labels stay as given. */
+const display = computed(() => {
+  const raw = String(props.label || props.status || "Unknown")
+  if (raw !== raw.toUpperCase() || !/[A-Z]/.test(raw)) return raw
+  const words = raw.toLowerCase().replace(/_/g, " ")
+  return words.charAt(0).toUpperCase() + words.slice(1)
+})
+/** Errors and in-progress keep an icon (they need attention / are moving); the rest is a dot. */
+const showIcon = computed(() => visual.value.motion !== "none" || visual.value.tone === "badge-error")
+const DOT: Record<string, string> = {
+  "badge-success": "bg-emerald-500",
+  "badge-warning": "bg-amber-500",
+  "badge-info": "bg-blue-500",
+  "badge-neutral": "bg-zinc-400 dark:bg-zinc-500",
+  "badge-error": "bg-red-500",
+}
 </script>
 
 <template>
   <span :class="visual.tone" role="status" :title="display">
-    <span class="relative inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+    <span v-if="!showIcon" class="h-1.5 w-1.5 shrink-0 rounded-full" :class="DOT[visual.tone]" aria-hidden="true" />
+    <span v-else class="relative inline-flex h-3 w-3 shrink-0 items-center justify-center">
       <component
         :is="visual.icon"
-        class="relative h-3.5 w-3.5"
+        class="relative h-3 w-3"
         :class="{
           'animate-spin motion-reduce:animate-none': visual.motion === 'spin',
           'animate-pulse motion-reduce:animate-none': visual.motion === 'pulse',

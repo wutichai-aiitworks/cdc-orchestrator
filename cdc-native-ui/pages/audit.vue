@@ -313,7 +313,7 @@ onUnmounted(() => {
                 <button
                   v-if="row.profile_id"
                   type="button"
-                  class="text-left text-sm text-brand-500 hover:underline"
+                  class="whitespace-nowrap text-left text-sm text-brand-500 hover:underline"
                   @click.stop="openInvestigate(row.profile_id!, row.profile_name)"
                 >
                   {{ row.profile_name || row.profile_id }}

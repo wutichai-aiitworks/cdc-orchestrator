@@ -271,6 +271,94 @@ fn apply_postgres_debezium(
         cfg.insert("schema.include.list".into(), src.schemas.join(","));
     }
     insert_table_include(cfg, profile);
+    // Explicit overrides only; `reconcile_start` re-applies with catalog-derived keys.
+    let _ = apply_message_key_columns(cfg, profile, &HashMap::new());
+}
+
+/// Set Debezium `message.key.columns` for source tables without a PRIMARY KEY.
+///
+/// Without it Debezium emits a null record key and the `record_key` JDBC sink
+/// fails the whole task ("primary key mode 'record_key' cannot have null schema").
+/// `source.connection.message_key_columns` (Debezium syntax,
+/// `schema.table:c1,c2;...`) wins per table; other keyless tables get the key
+/// derived from the catalog. A Source→Target pipeline with a keyless table and
+/// no derivable key is refused up front instead of crashing the sink later.
+pub(crate) fn apply_message_key_columns(
+    cfg: &mut HashMap<String, String>,
+    profile: &CdcProfile,
+    keyless: &HashMap<(String, String), crate::connector_catalog::KeylessTable>,
+) -> Result<(), AppError> {
+    let src = &profile.source;
+    let mut entries: Vec<String> = Vec::new();
+    let mut overridden: Vec<String> = Vec::new();
+    if let Some(raw) = src.connection.get("message_key_columns") {
+        for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            if let Some((table, _)) = entry.split_once(':') {
+                overridden.push(table.trim().replace("\\.", ".").to_ascii_lowercase());
+            }
+            entries.push(entry.to_string());
+        }
+    }
+
+    let include: Vec<String> = source_table_include_list(profile)
+        .iter()
+        .map(|t| t.trim().to_ascii_lowercase())
+        .collect();
+    let schemas: Vec<String> = if src.schema_mode == SchemaSelectionMode::SpecificSchemas {
+        src.schemas
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut candidates: Vec<_> = keyless
+        .iter()
+        .filter(|((schema, table), _)| {
+            let qualified = format!("{schema}.{table}").to_ascii_lowercase();
+            if !include.is_empty() {
+                include.contains(&qualified)
+            } else {
+                schemas.is_empty() || schemas.contains(&schema.to_ascii_lowercase())
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut missing = Vec::new();
+    for ((schema, table), facts) in candidates {
+        let qualified = format!("{schema}.{table}");
+        if overridden.contains(&qualified.to_ascii_lowercase()) {
+            continue;
+        }
+        let key = facts.derived_key();
+        if key.is_empty() {
+            missing.push(qualified);
+        } else {
+            entries.push(format!(
+                "{}\\.{}:{}",
+                regex_escape(schema),
+                regex_escape(table),
+                key.join(",")
+            ));
+        }
+    }
+
+    if !missing.is_empty() && profile.pattern == ProfilePattern::SourceToTarget {
+        return Err(AppError::BadRequest(format!(
+            "source table(s) without a primary key or usable unique key: {}. \
+             Add a PRIMARY KEY on the source, or set source connection \
+             `message_key_columns` (e.g. `schema.table:col1,col2`).",
+            missing.join(", ")
+        )));
+    }
+    if entries.is_empty() {
+        cfg.remove("message.key.columns");
+    } else {
+        cfg.insert("message.key.columns".into(), entries.join(";"));
+    }
+    Ok(())
 }
 
 fn insert_table_include(cfg: &mut HashMap<String, String>, profile: &CdcProfile) {
@@ -449,6 +537,35 @@ fn apply_sink_mapping_transforms(cfg: &mut HashMap<String, String>, profile: &Cd
     apply_sink_transforms(cfg, profile, true);
 }
 
+/// `TopicNameMatches` pattern that selects one mapped table's capture topic.
+///
+/// The topic shape depends on the capture engine, the same split as
+/// `profile_table_status::capture_topic`:
+/// - Debezium (Logical / SyncOnce): `{prefix}.{schema}.{table}` → match schema + table;
+/// - JDBC source (Trigger / Incremental, table mode or per-table query mode):
+///   `{prefix}.{TABLE}` with no schema segment → match the table name alone.
+///
+/// Emitting the Debezium shape for a JDBC pipeline never matched, so the rename SMT
+/// was skipped, the fallback `route` SMT produced the raw source name and the sink
+/// auto-created a second table (e.g. `"PAT_CARMODEL"` beside the mapped
+/// `pat_carmodel`). The JDBC form is case-insensitive because dialects differ in how
+/// they case the table name in the topic.
+pub(crate) fn sink_topic_predicate(
+    profile: &CdcProfile,
+    mapping: &crate::models::TableMapping,
+) -> String {
+    use crate::models::CaptureMode;
+    let table = regex_escape(mapping.source_table.trim());
+    let schema = mapping.source_schema.trim();
+    match profile.source.capture_mode {
+        CaptureMode::Logical | CaptureMode::SyncOnce if !schema.is_empty() => {
+            format!(r".*{}\.{table}$", regex_escape(schema))
+        }
+        CaptureMode::Logical | CaptureMode::SyncOnce => format!(r".*\.{table}$"),
+        CaptureMode::Trigger | CaptureMode::Incremental => format!(r"(?i).*\.{table}$"),
+    }
+}
+
 /// SMT chain for the JDBC sink. Debezium envelopes need `unwrap`; JDBC source
 /// records are already flat, so incremental capture passes `unwrap=false`.
 pub(crate) fn apply_sink_transforms(
@@ -474,15 +591,7 @@ pub(crate) fn apply_sink_transforms(
         let route = format!("map{i}");
         predicate_names.push(pred.clone());
 
-        let table = regex_escape(mapping.source_table.trim());
-        let pattern = if mapping.source_schema.trim().is_empty() {
-            format!(r".*\.{table}$")
-        } else {
-            format!(
-                r".*{}\.{table}$",
-                regex_escape(mapping.source_schema.trim())
-            )
-        };
+        let pattern = sink_topic_predicate(profile, mapping);
         cfg.insert(
             format!("predicates.{pred}.type"),
             "org.apache.kafka.connect.transforms.predicates.TopicNameMatches".into(),
@@ -809,7 +918,38 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
                 .map(|spec| (spec.name, spec.config))
                 .collect()
         }
-        _ => vec![(name.clone(), build_debezium_config(profile, &registry)?)],
+        _ => {
+            let mut cfg = build_debezium_config(profile, &registry)?;
+            if matches!(
+                profile
+                    .source
+                    .source_type
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "postgres" | "postgresql"
+            ) {
+                let insight = crate::connector_catalog::insight_from_connection(
+                    "postgres",
+                    &profile.source.connection,
+                );
+                // Best effort: if the orchestrator can't reach the source, start with
+                // explicit overrides only (Connect may still reach it on its network).
+                let keyless = match crate::connector_catalog::postgres_client(&insight).await {
+                    Ok(client) => crate::connector_catalog::postgres_keyless_tables(&client).await,
+                    Err(e) => Err(e),
+                };
+                match keyless {
+                    Ok(keyless) => apply_message_key_columns(&mut cfg, profile, &keyless)?,
+                    Err(err) => tracing::warn!(
+                        connector = %name,
+                        error = %err,
+                        "could not read source keys; keyless tables will emit null record keys"
+                    ),
+                }
+            }
+            vec![(name.clone(), cfg)]
+        }
     };
     cleanup_leftover_connectors(state, profile).await;
     for stale in existing_poll_connectors(state, profile).await {
@@ -1733,6 +1873,93 @@ mod tests {
         );
     }
 
+    fn bookings_a_profile() -> CdcProfile {
+        profile_with_mapping(TableMapping {
+            source_schema: "bookings".into(),
+            source_table: "a".into(),
+            target_schema: "bookings".into(),
+            target_table: "a".into(),
+            identical: true,
+            columns: vec![],
+            pk_columns: vec![],
+        })
+    }
+
+    fn keyless(
+        table: &str,
+        facts: crate::connector_catalog::KeylessTable,
+    ) -> HashMap<(String, String), crate::connector_catalog::KeylessTable> {
+        HashMap::from([(("bookings".to_string(), table.to_string()), facts)])
+    }
+
+    #[test]
+    fn keyless_partition_gets_identity_plus_partition_key() {
+        let profile = bookings_a_profile();
+        let mut cfg = build_debezium_config(&profile, "http://cdc-message:8081").unwrap();
+        assert!(!cfg.contains_key("message.key.columns"));
+        let facts = crate::connector_catalog::KeylessTable {
+            unique_key: vec![],
+            identity: vec!["id".into()],
+            partition_key: vec!["created_at".into(), "id".into()],
+        };
+        apply_message_key_columns(&mut cfg, &profile, &keyless("a", facts)).unwrap();
+        assert_eq!(
+            cfg.get("message.key.columns").unwrap(),
+            "bookings\\.a:id,created_at"
+        );
+    }
+
+    #[test]
+    fn keyless_unique_index_wins_and_unselected_tables_ignored() {
+        let profile = bookings_a_profile();
+        let mut cfg = HashMap::new();
+        let mut map = keyless(
+            "a",
+            crate::connector_catalog::KeylessTable {
+                unique_key: vec!["code".into()],
+                identity: vec!["id".into()],
+                partition_key: vec![],
+            },
+        );
+        map.insert(
+            ("bookings".into(), "other".into()),
+            crate::connector_catalog::KeylessTable::default(),
+        );
+        apply_message_key_columns(&mut cfg, &profile, &map).unwrap();
+        assert_eq!(cfg.get("message.key.columns").unwrap(), "bookings\\.a:code");
+    }
+
+    #[test]
+    fn keyless_without_derivable_key_is_refused_for_target_sink() {
+        let profile = bookings_a_profile();
+        let mut cfg = HashMap::new();
+        let err = apply_message_key_columns(
+            &mut cfg,
+            &profile,
+            &keyless("a", crate::connector_catalog::KeylessTable::default()),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("bookings.a"));
+    }
+
+    #[test]
+    fn explicit_message_key_columns_override_wins() {
+        let mut profile = bookings_a_profile();
+        profile
+            .source
+            .connection
+            .insert("message_key_columns".into(), "bookings.a:x,y".into());
+        let mut cfg = build_debezium_config(&profile, "http://cdc-message:8081").unwrap();
+        assert_eq!(cfg.get("message.key.columns").unwrap(), "bookings.a:x,y");
+        apply_message_key_columns(
+            &mut cfg,
+            &profile,
+            &keyless("a", crate::connector_catalog::KeylessTable::default()),
+        )
+        .unwrap();
+        assert_eq!(cfg.get("message.key.columns").unwrap(), "bookings.a:x,y");
+    }
+
     #[test]
     fn sync_once_uses_initial_only_snapshot() {
         let mut profile = profile_with_mapping(TableMapping {
@@ -1832,6 +2059,8 @@ mod tests {
         let cfg = build_jdbc_sink_config(&profile, "http://cdc-message:8081").unwrap();
         assert_eq!(cfg.get("transforms").unwrap(), "unwrap,map0,cols0,route");
         assert_eq!(cfg.get("predicates").unwrap(), "p0");
+        // Debezium topic shape: {prefix}.{schema}.{table}
+        assert_eq!(cfg.get("predicates.p0.pattern").unwrap(), r".*bookings\.a$");
         assert_eq!(cfg.get("transforms.map0.replacement").unwrap(), "b");
         assert_eq!(cfg.get("transforms.cols0.include").unwrap(), "id");
         assert_eq!(cfg.get("transforms.cols0.renames").unwrap(), "id:ticket_id");

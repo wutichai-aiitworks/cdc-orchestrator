@@ -98,13 +98,13 @@ if [[ "$FULL" -eq 1 ]]; then
   compose up -d --build --no-deps cdc-connect
   echo "Waiting for Kafka Connect (can take ~90s after message restart)…"
   wait_container_healthy cdc-connect 180
-  compose up -d --no-deps cdc-ksqldb
+  #compose up -d --no-deps cdc-ksqldb
   compose up -d --build --force-recreate --no-deps cdc-jdbc-admin
   wait_container_healthy cdc-jdbc-admin 60
-  compose up -d --build --no-deps cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync
+  compose up -d --build --no-deps cdc-wireguard cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync
   compose up -d --build --force-recreate --no-deps cdc-orchestrator
   wait_container_healthy cdc-orchestrator 90
-  compose up -d --no-deps cdc-admin
+  #compose up -d --no-deps cdc-admin
   compose --profile vector up -d --no-deps cdc-vector
   compose --profile native-ui up -d --build --no-deps cdc-native-ui
   echo "Done (full)."

@@ -18,6 +18,7 @@ pub const KIND_PGLOADER: &str = "pgloader_profile";
 pub const KIND_MONGOCOPY: &str = "mongocopy_profile";
 pub const KIND_PGDUMP: &str = "pgdump_profile";
 pub const KIND_RSYNC: &str = "rsync_profile";
+pub const KIND_WIREGUARD: &str = "wireguard_tunnel";
 
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_config (
   kind TEXT NOT NULL,
@@ -44,6 +45,26 @@ const AUDIT_INDEX_ACTION: &str =
     "CREATE INDEX IF NOT EXISTS idx_cdc_audit_action ON cdc_audit_events(action)";
 const AUDIT_INDEX_PROFILE: &str =
     "CREATE INDEX IF NOT EXISTS idx_cdc_audit_profile ON cdc_audit_events(profile_id)";
+
+/// Copy & Sync tool timeline (ADR 0009): profile changes, run start/finish, stops, connection
+/// tests. Separate from cdc_audit_events so pipeline noise cannot evict run history.
+const TOOL_EVENTS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_tool_events (
+  event_id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  profile_id TEXT,
+  profile_name TEXT,
+  job_id TEXT,
+  kind TEXT NOT NULL,
+  status TEXT,
+  actor TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  detail TEXT NOT NULL
+)";
+const TOOL_EVENTS_INDEX_PROFILE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_tool_events_profile ON cdc_tool_events(tool, profile_id, timestamp)";
+const TOOL_EVENTS_INDEX_TS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_tool_events_ts ON cdc_tool_events(timestamp)";
 
 const PIPELINE_LOG_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_pipeline_logs (
   log_id TEXT PRIMARY KEY,
@@ -131,6 +152,9 @@ impl RqliteClient {
             PIPELINE_LOG_INDEX_TS,
             PIPELINE_LOG_INDEX_PROFILE,
             PIPELINE_LOG_INDEX_ACTION,
+            TOOL_EVENTS_TABLE_SQL,
+            TOOL_EVENTS_INDEX_PROFILE,
+            TOOL_EVENTS_INDEX_TS,
         ] {
             self.execute(json!([sql])).await?;
         }
@@ -328,6 +352,73 @@ impl RqliteClient {
         Ok(())
     }
 
+    /// Insert a tool event. Ids are deterministic for run events, so a repeated insert (watcher
+    /// poll, restart) is ignored rather than duplicated.
+    pub async fn insert_tool_event(&self, e: &ToolEventRow) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "INSERT OR IGNORE INTO cdc_tool_events(event_id, timestamp, tool, profile_id, profile_name, job_id, kind, status, actor, summary, detail) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            e.event_id,
+            e.timestamp,
+            e.tool,
+            e.profile_id,
+            e.profile_name,
+            e.job_id,
+            e.kind,
+            e.status,
+            e.actor,
+            e.summary,
+            e.detail
+        ]]))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_tool_events(
+        &self,
+        limit: usize,
+        tool: Option<&str>,
+        profile_id: Option<&str>,
+        kind_prefix: Option<&str>,
+        status: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<ToolEventRow>, PersistError> {
+        self.query_event_rows(
+            "SELECT event_id, timestamp, tool, profile_id, profile_name, job_id, kind, status, actor, summary, detail \
+             FROM cdc_tool_events",
+            limit,
+            |sql, params| {
+                push_eq_filter(sql, params, "tool", tool);
+                push_eq_filter(sql, params, "profile_id", profile_id);
+                if let Some(k) = kind_prefix {
+                    sql.push_str(" AND kind LIKE ?");
+                    params.push(json!(format!("{k}%")));
+                }
+                push_eq_filter(sql, params, "status", status);
+                push_ge_filter(sql, params, "timestamp", since);
+                push_le_filter(sql, params, "timestamp", until);
+            },
+            decode_tool_event_row,
+        )
+        .await
+    }
+
+    /// Retention: drop events older than `before` (RFC 3339), then keep at most `max_rows`.
+    pub async fn trim_tool_events(
+        &self,
+        before: &str,
+        max_rows: usize,
+    ) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "DELETE FROM cdc_tool_events WHERE timestamp < ?",
+            before
+        ]]))
+        .await?;
+        self.trim_oldest_by_timestamp("cdc_tool_events", "event_id", max_rows)
+            .await
+    }
+
     async fn query_event_rows<T, F, G>(
         &self,
         select_from: &str,
@@ -498,6 +589,47 @@ pub struct AuditEventRow {
     pub detail: String,
     pub profile_id: Option<String>,
     pub profile_name: Option<String>,
+}
+
+/// One entry of a Copy & Sync profile's timeline (ADR 0009). `detail` is a JSON string.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolEventRow {
+    pub event_id: String,
+    pub timestamp: String,
+    pub tool: String,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub job_id: Option<String>,
+    pub kind: String,
+    pub status: Option<String>,
+    pub actor: String,
+    pub summary: String,
+    pub detail: String,
+}
+
+fn decode_tool_event_row(row: &[Value]) -> Result<ToolEventRow, PersistError> {
+    let col = |i: usize| -> Option<String> {
+        row.get(i).and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+    };
+    Ok(ToolEventRow {
+        event_id: col(0)
+            .ok_or_else(|| PersistError::Internal("tool event missing event_id".into()))?,
+        timestamp: col(1)
+            .ok_or_else(|| PersistError::Internal("tool event missing timestamp".into()))?,
+        tool: col(2).unwrap_or_default(),
+        profile_id: col(3),
+        profile_name: col(4),
+        job_id: col(5),
+        kind: col(6).unwrap_or_default(),
+        status: col(7),
+        actor: col(8).unwrap_or_default(),
+        summary: col(9).unwrap_or_default(),
+        detail: col(10).unwrap_or_else(|| "{}".into()),
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

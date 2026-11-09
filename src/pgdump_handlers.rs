@@ -17,6 +17,7 @@ use crate::pgdump::{
     self, fill_send_secrets, keep_destination_secrets, profile_run_payload, validate_destinations,
     validate_profile, MODE_DUMP_RESTORE,
 };
+use crate::tool_events;
 use crate::AppState;
 
 use crate::saved_secret::{keep_password, REDACTED};
@@ -85,6 +86,14 @@ pub async fn stop_pgdump_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let out = pgdump::stop_job(&state.config, &state.http, &job_id).await?;
+    tool_events::stop_requested(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        &job_id,
+        &out,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "pgdump.job.stop",
@@ -226,6 +235,15 @@ pub async fn create_pgdump_profile(
         updated_at: now,
     };
     state.pgdump_profiles.upsert(&profile).await?;
+    tool_events::profile_created(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        profile.id,
+        &profile.name,
+        &profile,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "pgdump.profile.create",
@@ -290,11 +308,21 @@ pub async fn update_pgdump_profile(
         include_tables: req.include_tables,
         options: req.options,
         destinations,
-        last_job_id: existing.last_job_id,
+        last_job_id: existing.last_job_id.clone(),
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
     state.pgdump_profiles.upsert(&profile).await?;
+    tool_events::profile_updated(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        id,
+        &profile.name,
+        &existing,
+        &profile,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "pgdump.profile.update",
@@ -310,7 +338,22 @@ pub async fn delete_pgdump_profile(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
+    let deleted_name = state
+        .pgdump_profiles
+        .get(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.name);
     state.pgdump_profiles.delete(id).await?;
+    tool_events::profile_deleted(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        id,
+        deleted_name.as_deref(),
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "pgdump.profile.delete",
@@ -333,7 +376,23 @@ pub async fn run_pgdump_profile(
         profile.options.format.as_deref(),
     )?;
     validate_destinations(&profile.destinations)?;
-    let job = pgdump::start_job(&state.config, &state.http, profile_run_payload(&profile)).await?;
+    // WireGuard (ADR 0010): connections with a tunnel go to a gateway forward.
+    let mut run_body = profile_run_payload(&profile);
+    let started = match crate::wireguard::route_payload(&state, &mut run_body).await {
+        Ok(_) => pgdump::start_job(&state.config, &state.http, run_body).await,
+        Err(e) => Err(e),
+    };
+    tool_events::run_requested(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        id,
+        &profile.name,
+        &started,
+        false,
+    )
+    .await;
+    let job = started?;
     if let Some(job_id) = job.get("id").and_then(|v| v.as_str()) {
         profile.last_job_id = Some(job_id.to_string());
         profile.updated_at = Utc::now();
@@ -370,12 +429,17 @@ pub struct PgDumpTestConnectionRequest {
 /// A failed connection is a normal answer (`ok: false`, `error`, `hint`).
 pub async fn test_pgdump_connection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<PgDumpTestConnectionRequest>,
 ) -> Result<Json<Value>, AppError> {
     let side = req.side.as_deref().unwrap_or("source");
     if side != "source" && side != "target" {
         return Err(AppError::BadRequest("side must be source or target".into()));
     }
+    let tested = match req.profile_id {
+        Some(id) => load(&state, id).await.ok().map(|p| (id, p.name)),
+        None => None,
+    };
     let mut conn = req.connection;
     if conn.password == REDACTED {
         let stored = match req.profile_id {
@@ -394,9 +458,22 @@ pub async fn test_pgdump_connection(
     validate_profile(pgdump::MODE_DUMP, &conn, None, None)?;
     let body =
         json!({ "connection": conn, "sslmode": req.sslmode.filter(|s| !s.trim().is_empty()) });
-    Ok(Json(
-        pgdump::test_connection(&state.config, &state.http, body).await?,
-    ))
+    let mut body = body;
+    let via = crate::wireguard::route_payload(&state, &mut body).await?;
+    let mut out = pgdump::test_connection(&state.config, &state.http, body).await?;
+    if !via.is_empty() {
+        out["via_tunnel"] = json!(via.join(", "));
+    }
+    tool_events::connection_tested(
+        &state,
+        "pgdump",
+        &actor_from_headers(&headers),
+        tested,
+        side,
+        &out,
+    )
+    .await;
+    Ok(Json(out))
 }
 
 #[derive(serde::Deserialize)]

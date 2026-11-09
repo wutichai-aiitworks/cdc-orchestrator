@@ -43,7 +43,8 @@ const tool: TransferTool<PgLoaderProfile, any, PgLoaderJob> = {
   title: "Load to Postgres",
   icon: Database,
   intro: "Load a MySQL, MariaDB, SQL Server or SQLite database, or a CSV file, into PostgreSQL. Types are converted for you.",
-  emptyText: "A transfer loads another database or a CSV file into PostgreSQL with pgloader, creating the tables and converting types.",
+  noun: { one: "load", many: "loads" },
+  emptyText: "A load brings another database or a CSV file into PostgreSQL with pgloader, creating the tables and converting types.",
   namePlaceholder: "Legacy shop to Postgres",
   api: {
     fetchProfiles: api.fetchProfiles,

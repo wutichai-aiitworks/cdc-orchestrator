@@ -23,6 +23,8 @@ If MCP is not connected, tell the user to start `./install.sh --mcp --demo` and 
 | Sample records | `cdc_topics_list` (search) → `cdc_topic_messages` |
 | Create pipeline from chat | `cdc_source_validate` → `cdc_pipeline_create` (`start: true` only for replica / `source_to_target`). |
 | Start/pause/stop | `cdc_profile_action` |
+| Postgres copy (pgcopydb), configure only | `cdc_copy_test_connection` → `cdc_pg_copy_create` |
+| Start a saved copy (only when asked) | `cdc_copy_run` → `cdc_copy_jobs` / `cdc_copy_job_logs` |
 
 ## Configure from prompts
 
@@ -49,7 +51,7 @@ Demo compose defaults (in-network hostnames):
 
 Ask for missing passwords. Do not print secrets in summaries.
 
-Writes require `ALLOW_WRITE_TOOLS=true` on `mcp-cdc`.
+Writes require `ALLOW_WRITE_TOOLS=true` on `mcp-cdc` **and** a write-scoped client key (ADR 0008). A failed tool returns `isError: true` with the reason — read it and fix the arguments rather than retrying blindly. Host-machine databases are `host.docker.internal` from the sidecars.
 
 ## Do not
 

@@ -13,6 +13,7 @@ use crate::models::{
     ValidationResponse,
 };
 use crate::rsync::{self, keep_endpoint_secrets, profile_run_payload, validate_profile};
+use crate::tool_events;
 use crate::AppState;
 
 fn actor_from_headers(headers: &HeaderMap) -> String {
@@ -79,6 +80,14 @@ pub async fn stop_rsync_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let out = rsync::stop_job(&state.config, &state.http, &job_id).await?;
+    tool_events::stop_requested(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        &job_id,
+        &out,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "rsync.job.stop",
@@ -134,6 +143,15 @@ pub async fn create_rsync_profile(
         updated_at: now,
     };
     state.rsync_profiles.upsert(&profile).await?;
+    tool_events::profile_created(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        profile.id,
+        &profile.name,
+        &profile,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "rsync.profile.create",
@@ -172,11 +190,21 @@ pub async fn update_rsync_profile(
         source: req.source,
         target: req.target,
         options: req.options,
-        last_job_id: existing.last_job_id,
+        last_job_id: existing.last_job_id.clone(),
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
     state.rsync_profiles.upsert(&profile).await?;
+    tool_events::profile_updated(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        id,
+        &profile.name,
+        &existing,
+        &profile,
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "rsync.profile.update",
@@ -193,6 +221,13 @@ pub async fn delete_rsync_profile(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
+    let deleted_name = state
+        .rsync_profiles
+        .get(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.name);
     state.rsync_profiles.delete(id).await?;
     let staging = match rsync::delete_staging(&state.config, &state.http, &id.to_string()).await {
         Ok(_) => "deleted",
@@ -202,6 +237,14 @@ pub async fn delete_rsync_profile(
             "kept"
         }
     };
+    tool_events::profile_deleted(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        id,
+        deleted_name.as_deref(),
+    )
+    .await;
     log_action(
         &actor_from_headers(&headers),
         "rsync.profile.delete",
@@ -228,12 +271,23 @@ pub async fn run_rsync_profile(
 ) -> Result<Json<Value>, AppError> {
     let mut profile = load(&state, id).await?;
     validate_profile(&profile.source, &profile.target, &profile.options)?;
-    let job = rsync::start_job(
-        &state.config,
-        &state.http,
-        profile_run_payload(&profile, q.dry_run),
+    // WireGuard (ADR 0010): endpoints with a tunnel go to a gateway forward (relay transport).
+    let mut run_body = profile_run_payload(&profile, q.dry_run);
+    let started = match crate::wireguard::route_payload(&state, &mut run_body).await {
+        Ok(_) => rsync::start_job(&state.config, &state.http, run_body).await,
+        Err(e) => Err(e),
+    };
+    tool_events::run_requested(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        id,
+        &profile.name,
+        &started,
+        q.dry_run.unwrap_or(profile.options.dry_run),
     )
-    .await?;
+    .await;
+    let job = started?;
     if let Some(job_id) = job.get("id").and_then(|v| v.as_str()) {
         profile.last_job_id = Some(job_id.to_string());
         profile.updated_at = Utc::now();
@@ -288,19 +342,37 @@ pub struct RsyncTestConnectionRequest {
 /// host key. A failed login is a normal answer (`ok: false`, `error`, `hint`).
 pub async fn test_rsync_connection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RsyncTestConnectionRequest>,
 ) -> Result<Json<Value>, AppError> {
     let side = req.side.as_deref().unwrap_or("source");
     if side != "source" && side != "target" {
         return Err(AppError::BadRequest("side must be source or target".into()));
     }
+    let tested = match req.profile_id {
+        Some(id) => load(&state, id).await.ok().map(|p| (id, p.name)),
+        None => None,
+    };
     let mut endpoint = req.endpoint;
     with_saved(&state, req.profile_id, side, &mut endpoint).await?;
     rsync::check_endpoint(side, &endpoint)?;
     let body = json!({ "endpoint": endpoint, "side": side });
-    Ok(Json(
-        rsync::test_connection(&state.config, &state.http, body).await?,
-    ))
+    let mut body = body;
+    let via = crate::wireguard::route_payload(&state, &mut body).await?;
+    let mut out = rsync::test_connection(&state.config, &state.http, body).await?;
+    if !via.is_empty() {
+        out["via_tunnel"] = json!(via.join(", "));
+    }
+    tool_events::connection_tested(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        tested,
+        side,
+        &out,
+    )
+    .await;
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -314,16 +386,34 @@ pub struct RsyncTestRouteRequest {
 /// Would a run go direct? Logs in to the source and from there to the target with the forwarded key.
 pub async fn test_rsync_route(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RsyncTestRouteRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let tested = match req.profile_id {
+        Some(id) => load(&state, id).await.ok().map(|p| (id, p.name)),
+        None => None,
+    };
     let (mut source, mut target) = (req.source, req.target);
     with_saved(&state, req.profile_id, "source", &mut source).await?;
     with_saved(&state, req.profile_id, "target", &mut target).await?;
     validate_profile(&source, &target, &RsyncOptions::default())?;
     let body = json!({ "source": source, "target": target });
-    Ok(Json(
-        rsync::test_route(&state.config, &state.http, body).await?,
-    ))
+    let mut body = body;
+    let via = crate::wireguard::route_payload(&state, &mut body).await?;
+    let mut out = rsync::test_route(&state.config, &state.http, body).await?;
+    if !via.is_empty() {
+        out["via_tunnel"] = json!(via.join(", "));
+    }
+    tool_events::connection_tested(
+        &state,
+        "rsync",
+        &actor_from_headers(&headers),
+        tested,
+        "route",
+        &out,
+    )
+    .await;
+    Ok(Json(out))
 }
 
 pub async fn list_rsync_staging(State(state): State<AppState>) -> Result<Json<Value>, AppError> {

@@ -14,8 +14,10 @@ const pendingAction = ref<"up" | "down" | "restart" | null>(null)
 const runningServices = computed(
   () => status.value?.services?.filter((service) => service.state.toLowerCase().includes("running")).length || 0
 )
+const allRunning = computed(() => !!status.value?.services?.length && runningServices.value === status.value.services.length)
 const healthyServices = computed(
-  () => status.value?.services?.filter((service) => String(service.health || "").toLowerCase() === "healthy").length || 0
+  // Docker reports "Up 27 minutes (healthy)"; "unhealthy" must not count.
+  () => status.value?.services?.filter((service) => /(^|\()healthy(\)|$)/.test(String(service.health || "").toLowerCase())).length || 0
 )
 
 const refresh = async () => {
@@ -89,7 +91,7 @@ onMounted(refresh)
           <AppSectionTitle title="Runtime Controls" hint="Actions affect the managed CDC containers on this host." />
         </div>
         <div class="flex flex-wrap gap-2">
-          <AppButton variant="primary" :disabled="actionLoading" @click="pendingAction = 'up'">
+          <AppButton :variant="allRunning ? 'secondary' : 'primary'" :disabled="actionLoading || allRunning" :title="allRunning ? 'Every managed service is already running' : undefined" @click="pendingAction = 'up'">
             <Power class="h-4 w-4" :stroke-width="1.75" />
             Start Runtime
           </AppButton>

@@ -4,7 +4,7 @@ Single-host CDC stack: **Redpanda + Debezium Connect + ksqlDB + Kafbat + Redis +
 
 | Ready? | Answer |
 |--------|--------|
-| Control plane ready to use? | **Yes** for single-host Docker (dev / hardened prod with `ORCH_ENV=prod`) |
+| Control plane ready to use? | **Yes** for single-host Docker (`APP_MODE=Enhanced` / `Maintenance`, or hardened with `APP_MODE=Production`) |
 | Needs Kafka Connect stack? | **Yes** — this compose file starts it |
 | Multi-tenant / multi-node? | **No** (out of scope) |
 
@@ -58,7 +58,7 @@ Existing pipelines keep their previous converter until you **Enable / Start / Re
 
 ## ksqlDB
 
-`cdc-ksqldb` listens on host `28088`. The native UI **KSQL DB** page talks to it through the orchestrator (`ORCH_KSQL_URL=http://cdc-ksqldb:8088`). Default value format is **Avro**. Example:
+`cdc-ksqldb` listens on host `28088`. The native UI **KSQL DB** page talks to it through the orchestrator (`ORCH_KSQL_URL=http://cdc-ksqldb:8088`). The feature is **off by default** (`ORCH_KSQL_ENABLED=false`): the API refuses KSQL calls and the UI hides the page. Set `ORCH_KSQL_ENABLED=true` and restart the orchestrator to turn it on (`install.sh --no-ops` skips the ksqlDB container when you don't need it). Default value format is **Avro**. Example:
 
 ```sql
 -- After a pipeline is running with Avro (Enable / Start / Restart)
@@ -215,7 +215,9 @@ Full fork workflow: [compendium Ch.14](docs/architecture/hyper-cdc-orchestrator-
 
 ```bash
 # .env
-ORCH_ENV=prod
+# Production | Maintenance | Enhanced. Production requires the token + rqlite below (no ribbon);
+# Maintenance / Enhanced show an amber / violet corner ribbon — set ORCH_REQUIRE_* explicitly there.
+APP_MODE=Production
 ORCH_API_TOKEN=<random ≥24 chars>
 ORCH_RQLITE_URL=http://cdc-rqlite:4001
 ORCH_JDBC_ADMIN_URL=http://cdc-jdbc-admin:8084

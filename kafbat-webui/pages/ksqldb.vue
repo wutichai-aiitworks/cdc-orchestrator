@@ -8,6 +8,7 @@ const toast = useToast()
 const tab = ref<"tables" | "streams" | "queries" | "editor">("tables")
 const loading = ref(false)
 const error = ref("")
+const enabled = ref(true)
 const configured = ref(true)
 const reachable = ref(true)
 const ksqlVersion = ref("")
@@ -55,6 +56,7 @@ const load = async () => {
       fetchKsqlQueries(),
     ])
     if (infoData.status === "fulfilled") {
+      enabled.value = infoData.value.enabled !== false
       configured.value = infoData.value.configured !== false
       reachable.value = infoData.value.reachable !== false
       const info = infoData.value.info as { KsqlServerInfo?: { version?: string } } | undefined
@@ -217,12 +219,17 @@ onMounted(load)
       </AppMetricCard>
       <AppMetricCard
         label="Server"
-        :value="!configured ? 'Off' : reachable ? (ksqlVersion || 'Up') : 'Down'"
+        :value="!enabled ? 'Disabled' : !configured ? 'Off' : reachable ? (ksqlVersion || 'Up') : 'Down'"
         :tone="!configured || !reachable ? undefined : 'success'"
       />
     </section>
 
     <AppStateBlock v-if="error" kind="error" :message="error" />
+    <AppStateBlock
+      v-else-if="!enabled"
+      kind="empty"
+      message="KSQL DB is off: the orchestrator runs with ORCH_KSQL_ENABLED=false (the default). Only if you want it on: set ORCH_KSQL_ENABLED=true in docker/.env and restart the orchestrator."
+    />
     <AppStateBlock
       v-else-if="!configured"
       kind="empty"

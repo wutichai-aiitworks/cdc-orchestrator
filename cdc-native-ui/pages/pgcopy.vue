@@ -38,8 +38,10 @@ const tool: TransferTool<PgCopyProfile, any, PgCopyJob> = {
   title: "Postgres copy",
   icon: Copy,
   intro: "Copy a whole PostgreSQL database into another one in parallel, and optionally keep following its changes.",
-  emptyText: "A transfer copies schema, data and indexes from one PostgreSQL database into another with pgcopydb. Use it to seed a replica or move a database.",
+  emptyText: "A saved copy moves schema, data and indexes from one PostgreSQL database into another with pgcopydb. Use it to seed a replica or move a database.",
   namePlaceholder: "Orders replica seed",
+  noun: { one: "copy", many: "copies" },
+  createLabel: "Save",
   api: {
     fetchProfiles: api.fetchProfiles,
     createProfile: api.createProfile,

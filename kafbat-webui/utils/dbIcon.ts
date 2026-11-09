@@ -7,6 +7,7 @@ const DB_ICONS: Record<string, string> = {
   db2:        "/images/drivers/db2_i_icon_big.png",
   informix:   "/images/drivers/informix_icon_big.png",
   sqlite:     "/images/drivers/sqlite_icon_big.png",
+  redis:      "/images/drivers/redis_icon_big.png",
 }
 
 const FALLBACK = "/images/drivers/database_icon@2x.png"

@@ -185,7 +185,7 @@ onMounted(load)
 
         <!-- Actions -->
         <div class="flex items-end gap-2">
-          <AppButton variant="primary" class="flex-1" :disabled="loading" @click="load">Apply</AppButton>
+          <AppButton class="flex-1" :disabled="loading" @click="load">Apply filters</AppButton>
           <AppButton v-if="activeFilters > 0 || search || host" variant="ghost" @click="clearFilters">
             <X class="h-4 w-4" :stroke-width="1.75" />
           </AppButton>

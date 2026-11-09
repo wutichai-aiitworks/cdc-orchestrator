@@ -1,4 +1,17 @@
 import type { H3Event } from "h3"
+import { isAuthDisabled } from "~/utils/authMode"
+import { getSessionConfig, getSessionSecret } from "./sessionConfig"
+
+/** Signed-in user for the orchestrator's audit trail (`x-user`): email, else user id. */
+const sessionUser = async (event: H3Event): Promise<string> => {
+  try {
+    if (isAuthDisabled(useRuntimeConfig(event)) || getSessionSecret().length < 32) return ""
+    const data = (await useSession(event, getSessionConfig())).data || {}
+    return String(data.email || data.userId || "").slice(0, 200)
+  } catch {
+    return ""
+  }
+}
 
 export const orchestratorFetch = async <T>(
   event: H3Event,
@@ -12,6 +25,8 @@ export const orchestratorFetch = async <T>(
   if (config.orchestratorToken) {
     headers.Authorization = `Bearer ${config.orchestratorToken}`
   }
+  const user = await sessionUser(event)
+  if (user) headers["x-user"] = user
   try {
     return (await $fetch<T>(url, {
       ...options,

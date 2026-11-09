@@ -102,6 +102,19 @@ const catalogPageSize = ref("20")
 const connectorNames = computed(() => Object.keys(connectors.value).sort())
 const selected = computed(() => (selectedName.value ? connectors.value[selectedName.value] : null))
 const selectedState = computed(() => selected.value?.status?.connector?.state || "UNKNOWN")
+// Actions that make sense in the current state; rare or destructive ones live in "More".
+const stateUpper = computed(() => String(selectedState.value).toUpperCase())
+const canPause = computed(() => stateUpper.value === "RUNNING")
+const canResume = computed(() => ["PAUSED", "STOPPED"].includes(stateUpper.value))
+const canStop = computed(() => ["RUNNING", "PAUSED", "FAILED"].includes(stateUpper.value))
+const connectorMenu = computed(() => [
+  { key: "reset", label: "Reset offsets…", icon: RefreshCcwDot, disabled: actionLoading.value },
+  { key: "delete", label: "Delete connector…", icon: Trash2, destructive: true, separatorBefore: true, disabled: actionLoading.value },
+])
+const onConnectorMenu = (key: string) => {
+  if (key === "reset") pendingResetOffsets.value = true
+  if (key === "delete") requestDelete()
+}
 const selectedConfig = computed<Record<string, string>>(
   () => selected.value?.info?.config || {}
 )
@@ -642,7 +655,7 @@ onUnmounted(() => {
       <AppMetricCard label="Running" :value="summary.running" helper="Healthy connector tasks" tone="brand">
         <Play class="h-5 w-5" :stroke-width="1.75" />
       </AppMetricCard>
-      <AppMetricCard label="Failed" :value="summary.failed" helper="Needs attention" tone="danger">
+      <AppMetricCard label="Failed" :value="summary.failed" helper="Needs attention" :tone="summary.failed ? 'danger' : 'neutral'">
         <Plug class="h-5 w-5" :stroke-width="1.75" />
       </AppMetricCard>
     </div>
@@ -769,30 +782,23 @@ onUnmounted(() => {
                 <Plug class="h-4 w-4" :stroke-width="1.75" />
                 {{ probeLoading ? "Testing..." : "Test Connectivity" }}
               </AppButton>
-              <AppButton :disabled="actionLoading" @click="runConnectorAction('pause')">
+              <AppButton v-if="canPause" :disabled="actionLoading" @click="runConnectorAction('pause')">
                 <Pause class="h-4 w-4" :stroke-width="1.75" />
                 Pause
               </AppButton>
-              <AppButton :disabled="actionLoading" @click="runConnectorAction('resume')">
+              <AppButton v-if="canResume" :disabled="actionLoading" @click="runConnectorAction('resume')">
                 <Play class="h-4 w-4" :stroke-width="1.75" />
                 Resume
-              </AppButton>
-              <AppButton :disabled="actionLoading" @click="runConnectorAction('stop')">
-                <Square class="h-4 w-4" :stroke-width="1.75" />
-                Stop
               </AppButton>
               <AppButton :disabled="actionLoading" @click="runConnectorAction('restart')">
                 <RotateCw class="h-4 w-4" :stroke-width="1.75" />
                 Restart
               </AppButton>
-              <AppButton :disabled="actionLoading" @click="pendingResetOffsets = true">
-                <RefreshCcwDot class="h-4 w-4" :stroke-width="1.75" />
-                Reset Offsets
+              <AppButton v-if="canStop" :disabled="actionLoading" @click="runConnectorAction('stop')">
+                <Square class="h-4 w-4" :stroke-width="1.75" />
+                Stop
               </AppButton>
-              <AppButton variant="destructive" :disabled="actionLoading" @click="requestDelete">
-                <Trash2 class="h-4 w-4" :stroke-width="1.75" />
-                Delete
-              </AppButton>
+              <AppActionMenu label="More" :items="connectorMenu" @select="onConnectorMenu" />
             </div>
             <p
               v-if="probeResult"

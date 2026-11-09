@@ -272,9 +272,11 @@ fn redisshake_contract_body() -> Value {
         "options": {
             "booleans": [
                 "source_cluster", "target_cluster", "source_tls", "target_tls",
-                "sync_rdb", "sync_aof", "prefer_replica", "try_diskless", "off_reply",
+                "sync_rdb", "sync_aof", "prefer_replica", "try_diskless", "off_reply", "empty_target",
             ],
             "strings": ["rdb_restore_command_behavior"],
+            "integer_lists": ["source_dbs"],
+            "integers": ["target_db"],
             "enum": {
                 "rdb_restore_command_behavior": ["panic", "rewrite", "skip"],
             },
@@ -282,10 +284,21 @@ fn redisshake_contract_body() -> Value {
                 "sync_rdb": true,
                 "sync_aof": true,
                 "rdb_restore_command_behavior": "panic",
+                "source_dbs": [],
+                "target_db": null,
             },
             "hints": {
                 "sync_aof": "Disable for one-time full copy; job exits after RDB phase.",
                 "sync_rdb": "Full snapshot; usually leave enabled.",
+                "source_dbs": "Source database numbers to sync (RedisShake allow_db). Empty = all. Cluster sources: only 0.",
+                "target_db": "Write into this target database instead of the same number. Needs exactly one source_dbs entry.",
+            },
+            "run_modes": {
+                "query": "POST /cdc/redisshake/profiles/{id}/run?mode=once|cdc[&snapshot=true|false]",
+                "once": "One-time sync: full copy, then the run ends (sync_rdb=true, sync_aof=false).",
+                "cdc": "CDC: follow source changes until stopped (sync_aof=true); snapshot=true (default from the profile) copies everything first, false streams changes from now only.",
+                "default": "Without mode, the profile's sync_rdb/sync_aof decide.",
+                "empty_target": "&empty_target=true|false: delete the target's keys right before the full copy (FLUSHDB on the synced databases, FLUSHALL when syncing all). Refused with mode=cdc&snapshot=false.",
             },
         },
         "sidecar_limits_env": [

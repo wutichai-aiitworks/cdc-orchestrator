@@ -180,7 +180,7 @@ export const useKafkaAdmin = () => {
     )
 
   const fetchKsqlInfo = () =>
-    $fetch<{ configured: boolean; reachable?: boolean; info?: Record<string, unknown>; error?: string }>(
+    $fetch<{ enabled?: boolean; configured: boolean; reachable?: boolean; info?: Record<string, unknown>; error?: string }>(
       "/api/cdc/ksqldb/info"
     )
   const fetchKsqlTables = () =>

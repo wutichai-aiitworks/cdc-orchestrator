@@ -1424,6 +1424,8 @@ pub struct CapabilityFeatures {
     pub brokers: bool,
     pub schema_registry: bool,
     pub ksql: bool,
+    /// ORCH_KSQL_ENABLED; false hides the KSQL DB feature (ksql is then false too).
+    pub ksql_enabled: bool,
     pub acls: bool,
     pub pgcopy: bool,
     pub redisshake: bool,
@@ -1667,6 +1669,9 @@ pub struct SchemaCompareConn {
     /// Optional schema filter (blank = all schemas).
     #[serde(default)]
     pub schema: String,
+    /// Reach this server through a WireGuard tunnel (ADR 0010); host/port are as seen from the site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2035,6 +2040,17 @@ pub struct RedisShakeSyncOptions {
     pub off_reply: bool,
     #[serde(default)]
     pub rdb_restore_command_behavior: Option<String>,
+    /// Source database numbers to sync (RedisShake `[filter] allow_db`). Empty = every database.
+    #[serde(default)]
+    pub source_dbs: Vec<u32>,
+    /// Write everything into this database on the target instead of the same number.
+    /// Only with exactly one source database (two sources would merge into one keyspace).
+    #[serde(default)]
+    pub target_db: Option<u32>,
+    /// Delete the target's keys right before a full copy (one-time sync or CDC with snapshot):
+    /// FLUSHDB on the databases the sync writes, FLUSHALL when it syncs every database.
+    #[serde(default)]
+    pub empty_target: bool,
 }
 
 fn default_true() -> bool {
@@ -2397,11 +2413,20 @@ fn default_ssh_port() -> String {
 /// One SSH host (Linux or macOS) and the directory on it.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RsyncEndpoint {
+    /// `ssh` (default) or `daemon`: an rsync daemon (rsync://host:873/module/path, no shell).
+    /// Daemon endpoints always use the relay; meant for a WireGuard tunnel (plain-text protocol).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protocol: String,
+    /// Daemon only: the module name (a `[name]` section in the site's rsyncd.conf).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
     #[serde(default)]
     pub name: String,
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub port: String,
+    /// SSH login, or the daemon's `auth users` name (empty = anonymous module).
+    #[serde(default)]
     pub username: String,
     /// `key` or `password`. Direct mode needs `key` on the target (it is forwarded via ssh-agent).
     #[serde(default)]
@@ -2419,6 +2444,9 @@ pub struct RsyncEndpoint {
     /// Optional pin, e.g. `SHA256:1ZCE…` from `ssh-keygen -lf`; mismatch aborts the run.
     #[serde(default)]
     pub host_key_fingerprint: String,
+    /// Reach this host through a WireGuard tunnel (ADR 0010); forces the relay transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<Uuid>,
     /// Optional rsync binary on this host (e.g. `/opt/homebrew/bin/rsync`); auto-detected if empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rsync_path: String,

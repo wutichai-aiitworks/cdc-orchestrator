@@ -151,6 +151,8 @@ services:
       - "${CDC_NATIVE_UI_HOST_PORT:-4320}:3000"
     environment:
       APP_NAME: CDC WebUI
+      # Production (default, no ribbon) | Maintenance (amber ribbon) | Enhanced (violet ribbon).
+      APP_MODE: ${APP_MODE:-Production}
       ORCHESTRATOR_URL: http://cdc-orchestrator:9788
       PUBLIC_ORCHESTRATOR_URL: http://127.0.0.1:${CDC_ORCHESTRATOR_PORT:-9788}
       ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
@@ -348,7 +350,8 @@ services:
     environment:
       ORCH_HOST: 0.0.0.0
       ORCH_PORT: 9788
-      ORCH_ENV: ${ORCH_ENV:-dev}
+      # Production | Maintenance | Enhanced. Production defaults ORCH_REQUIRE_* below to true.
+      APP_MODE: ${APP_MODE:-Production}
       ORCH_ENGINE_PROVIDER: docker_api
       ORCH_CONTAINER_PROJECT_NAME: cdc-stack
       ORCH_MANAGED_CONTAINERS: ${ORCH_MANAGED_CONTAINERS:-cdc-message,cdc-connect,cdc-jdbc-admin,cdc-redis,cdc-rqlite}
@@ -356,6 +359,11 @@ services:
       ORCH_CONNECT_BASE_URL: http://cdc-connect:8083
       ORCH_SCHEMA_REGISTRY_URL: ${ORCH_SCHEMA_REGISTRY_URL:-http://cdc-message:8081}
       ORCH_KSQL_URL: ${ORCH_KSQL_URL:-http://cdc-ksqldb:8088}
+      # Off by default; true turns on the KSQL DB API and page (also start ksqlDB: install.sh without --no-ops).
+      ORCH_KSQL_ENABLED: ${ORCH_KSQL_ENABLED:-false}
+      ORCH_TOOL_EVENTS_RETENTION_DAYS: ${ORCH_TOOL_EVENTS_RETENTION_DAYS:-365}
+      ORCH_TOOL_EVENTS_MAX_ROWS: ${ORCH_TOOL_EVENTS_MAX_ROWS:-200000}
+      ORCH_TOOL_EVENTS_POLL_SECS: ${ORCH_TOOL_EVENTS_POLL_SECS:-15}
       ORCH_REDPANDA_CONTAINER: cdc-message
       ORCH_CONTAINER_CONNECT: cdc-connect
       ORCH_CONTAINER_KAFKA: cdc-message
@@ -379,6 +387,9 @@ services:
       ORCH_PGDUMP_TOKEN: ${ORCH_PGDUMP_TOKEN:-}
       ORCH_RSYNC_URL: ${ORCH_RSYNC_URL:-http://cdc-rsync:8090}
       ORCH_RSYNC_TOKEN: ${ORCH_RSYNC_TOKEN:-}
+      # WireGuard gateway (ADR 0010); unset ORCH_WIREGUARD_URL to turn tunnels off.
+      ORCH_WIREGUARD_URL: ${ORCH_WIREGUARD_URL:-http://cdc-wireguard:8091}
+      ORCH_WIREGUARD_TOKEN: ${ORCH_WIREGUARD_TOKEN:-}
       ORCH_REQUIRE_AUTH: ${ORCH_REQUIRE_AUTH:-}
       # Fail startup if rqlite is down (avoid empty in-memory UI after redeploy --no-deps).
       ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-true}
@@ -421,7 +432,12 @@ services:
       - "${MCP_CDC_BIND:-127.0.0.1}:${MCP_CDC_PORT:-8410}:8410"
     environment:
       MCP_BIND_ADDR: 0.0.0.0:8410
-      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:-change-me-mcp-cdc-token-min24}
+      # Per-client keys (ADR 0008): name:scope:token,... (scope read|write). mcp-cdc refuses to
+      # start with no key or a weak/placeholder key; install.sh generates MCP_BEARER_TOKEN.
+      MCP_CLIENT_KEYS: ${MCP_CLIENT_KEYS:-}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:-}
+      MCP_RATE_LIMIT_RPM: ${MCP_RATE_LIMIT_RPM:-300}
+      MCP_CORS_ORIGINS: ${MCP_CORS_ORIGINS:-}
       CDC_ORCHESTRATOR_URL: http://cdc-orchestrator:9788
       CDC_ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
       # Local prompting: set ALLOW_WRITE_TOOLS=true in .env

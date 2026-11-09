@@ -1135,6 +1135,11 @@ pub async fn delete_schema_version(
 // ── KSQL DB ───────────────────────────────────────────────────────────────────
 
 fn ksql_base(state: &AppState) -> Result<String, AppError> {
+    if !state.config.ksql_enabled {
+        return Err(AppError::BadRequest(
+            "KSQL DB is disabled (ORCH_KSQL_ENABLED=false)".into(),
+        ));
+    }
     state
         .config
         .ksql_url
@@ -1381,7 +1386,11 @@ async fn ksql_post_json(
 
 pub async fn ksql_info(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let Ok(base) = ksql_base(&state) else {
-        return Ok(Json(json!({ "configured": false, "reachable": false })));
+        return Ok(Json(json!({
+            "enabled": state.config.ksql_enabled,
+            "configured": false,
+            "reachable": false,
+        })));
     };
     let url = format!("{base}/info");
     match state

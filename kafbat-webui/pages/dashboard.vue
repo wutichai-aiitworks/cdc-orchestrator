@@ -87,7 +87,7 @@ onMounted(refresh)
     <AppCard>
       <AppResultsHeader label="Brokers" :total="brokers?.items?.length || 0" :loading="loading" :last-updated="lastUpdated" />
       <p class="mb-3 text-sm text-muted-foreground">
-        Cluster {{ brokers?.cluster_id || "local" }} · Version {{ brokers?.version || "—" }}
+        Cluster {{ brokers?.cluster_id || "local" }} · Version {{ String(brokers?.version || "—").replace(/^version:\s*/i, "") }}
       </p>
       <AppTable>
         <thead>
