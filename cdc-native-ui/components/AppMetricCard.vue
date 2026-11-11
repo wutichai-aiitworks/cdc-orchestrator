@@ -4,11 +4,12 @@
 withDefaults(
   defineProps<{
     label: string
-    value: string | number
+    /** Plain value; omit it and use the `#value` slot for rich content (e.g. a badge). */
+    value?: string | number
     helper?: string
     tone?: "brand" | "success" | "warning" | "danger" | "error" | "info" | "neutral"
   }>(),
-  { helper: "", tone: "neutral" }
+  { value: "", helper: "", tone: "neutral" }
 )
 
 const iconClass = {
@@ -45,7 +46,7 @@ const isFigure = (v: string | number) => typeof v === "number" || /^[\d\s.,:/%â€
     <p
       class="mt-1.5 truncate font-semibold tracking-tight"
       :class="[valueClass[tone], isFigure(value) ? 'text-2xl tabular-nums' : 'text-base leading-8']"
-      :title="String(value)"
-    >{{ value }}</p>
+      :title="$slots.value ? undefined : String(value)"
+    ><slot name="value">{{ value }}</slot></p>
   </section>
 </template>

@@ -13,6 +13,8 @@ steps:
     commands:
       # rdkafka builds librdkafka from source (cmake-build feature).
       - apt-get update && apt-get install -y --no-install-recommends cmake zlib1g-dev
+      # The rust image ships the minimal profile (no rustfmt/clippy).
+      - rustup component add rustfmt clippy
       - cargo fmt --all -- --check
       - cargo test --locked --all-targets
       - cargo clippy --all-targets -- -D warnings
@@ -23,6 +25,7 @@ steps:
     commands:
       # mcp/ is a standalone crate, not a workspace member, so the root
       # cargo invocations above do not cover it.
+      - rustup component add rustfmt clippy
       - cd mcp
       - cargo fmt --all -- --check
       - cargo test --locked --all-targets

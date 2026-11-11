@@ -53,14 +53,16 @@ function isMachineTokenRejection(err: any): boolean {
 
 export default defineEventHandler(async (event) => {
   const cfg = useRuntimeConfig(event)
-  const body = (await readBody<{
+  type ExchangeBody = {
     provider?: string
     ticket?: string
     next?: string
     code?: string
     state?: string
     code_verifier?: string
-  }>(event).catch(() => ({}))) || {}
+  }
+  // Annotated: `.catch(() => ({}))` would otherwise widen the type to `ExchangeBody | {}`.
+  const body: ExchangeBody = (await readBody<ExchangeBody>(event).catch(() => ({}))) || {}
   const provider = String(body.provider || cfg.public.ssoProvider || "supertokens_gateway").trim().toLowerCase()
   let next = sanitizeNextPath(body.next)
 

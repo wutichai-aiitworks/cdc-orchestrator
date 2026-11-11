@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Download, MoreVertical, RefreshCw, RotateCcw, Search, Trash2, Users } from "@lucide/vue"
+import type { PagedGroups } from "~/composables/useKafkaM1"
 import { formatApiError } from "~/utils/apiError"
 import { downloadCsv } from "~/utils/csv"
 
@@ -22,12 +23,8 @@ const lastUpdated = ref("")
 
 let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
-const groups = ref<{
-  items: Array<{ group: string; state?: string | null; members?: number | null; total_lag?: number | null }>
-  total: number
-  page: number
-  page_size: number
-} | null>(null)
+// Same shape the API returns (incl. topic_count / coordinator shown in the table).
+const groups = ref<PagedGroups | null>(null)
 
 const totalPages = computed(() => Math.max(1, Math.ceil((groups.value?.total ?? 0) / pageSize.value)))
 

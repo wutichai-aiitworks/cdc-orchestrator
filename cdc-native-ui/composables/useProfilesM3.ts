@@ -132,6 +132,8 @@ export type ProfilePayload = {
     name?: string
     target_type: DatabaseType
     connection: Record<string, string>
+    /** Catalog schema filter (backend TargetConfig.schemas, optional). */
+    schemas?: string[]
   } | null
   lake?: LakeDestination | null
   governance?: GovernanceConfig
@@ -275,12 +277,13 @@ export const useProfilesM3 = () => {
     $fetch(`/api/cdc/profiles/${encodeURIComponent(id)}`, { method: "DELETE" })
   const fetchDlqStatus = (id: string) =>
     $fetch<ProfileDlqStatus>(`/api/cdc/profiles/${encodeURIComponent(id)}/dlq`)
-  const validateSource = (body: ProfilePayload["source"]) =>
+  // profile_id (optional): the server merges stored credentials for a saved pipeline.
+  const validateSource = (body: ProfilePayload["source"] & { profile_id?: string | null }) =>
     $fetch<{ valid: boolean; message: string }>("/api/cdc/profiles/validate/source", {
       method: "POST",
       body,
     })
-  const validateTarget = (body: NonNullable<ProfilePayload["target"]>) =>
+  const validateTarget = (body: NonNullable<ProfilePayload["target"]> & { profile_id?: string | null }) =>
     $fetch<{ valid: boolean; message: string }>("/api/cdc/profiles/validate/target", {
       method: "POST",
       body,
@@ -339,6 +342,8 @@ export const useProfilesM3 = () => {
   const previewSourceTriggers = (body: {
     source: ProfilePayload["source"]
     tables?: string[]
+    /** Backend TriggerInstallRequest: merges stored credentials for a saved pipeline. */
+    profile_id?: string | null
   }) =>
     $fetch<{
       tables: string[]
@@ -351,6 +356,8 @@ export const useProfilesM3 = () => {
   const installSourceTriggers = (body: {
     source: ProfilePayload["source"]
     tables?: string[]
+    /** Backend TriggerInstallRequest: merges stored credentials for a saved pipeline. */
+    profile_id?: string | null
   }) =>
     $fetch<{
       installed: string[]
@@ -363,6 +370,8 @@ export const useProfilesM3 = () => {
   const sourceTriggerStatus = (body: {
     source: ProfilePayload["source"]
     tables?: string[]
+    /** Backend TriggerInstallRequest: merges stored credentials for a saved pipeline. */
+    profile_id?: string | null
   }) =>
     $fetch<{
       change_log_present: boolean
