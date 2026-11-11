@@ -574,12 +574,14 @@ def update_meta(job_id: str, **fields: Any) -> dict[str, Any]:
 
 
 def job_status(job_id: str) -> dict[str, Any]:
-    meta = read_json(job_dir(job_id) / "job.json")
-    if not meta:
-        return {"id": job_id, "status": "unknown"}
+    # Read job.json under _lock: _send_worker pops _sending and appends to uploads in
+    # one locked step, so reading the file first could see neither (send "vanishes").
     with _lock:
+        meta = read_json(job_dir(job_id) / "job.json")
         rt = dict(_runtime.get(job_id) or {})
         sending = dict(_sending[job_id]) if job_id in _sending else None
+    if not meta:
+        return {"id": job_id, "status": "unknown"}
     meta.update(rt)
     if sending is not None:
         meta["uploads"] = list(meta.get("uploads") or []) + [sending]
@@ -930,9 +932,12 @@ def send_file(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
         if job_id in _sending:
             raise BadRequest("this file is already being sent; wait for it or stop it", 409)
         _sending[job_id] = dict(describe_destination(dest), status="pending", adhoc=True, started_at=utc_now())
+    # Snapshot before the worker starts: a fast send could otherwise finish first and the
+    # response would not show the send it just accepted (sending=True, pending entry).
+    accepted = job_status(job_id)
     threading.Thread(target=_send_worker, args=(job_id, dest, path, art.get("sha256") or ""), daemon=True,
                      name=f"pgdump-send-{job_id[:8]}").start()
-    return job_status(job_id)
+    return accepted
 
 
 def _send_worker(job_id: str, dest: dict[str, Any], path: Path, digest: str) -> None:
