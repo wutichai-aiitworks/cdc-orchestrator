@@ -32,7 +32,7 @@ Production hardening: **[compendium Ch.18](docs/architecture/hyper-cdc-orchestra
 |----------|-----|
 | Orchestrator health | http://127.0.0.1:9788/health |
 | Connect REST | http://127.0.0.1:28083/ |
-| Kafbat UI | http://127.0.0.1:4321 |
+| Kafbat UI | http://127.0.0.1:28080 |
 | Native Level-3 UI *(optional profile)* | http://127.0.0.1:4320 |
 | Demo Postgres source *(optional `--demo`)* | `127.0.0.1:25432` (`cdc-postgres-source:5432`) |
 | Demo Postgres target *(optional `--demo`)* | `127.0.0.1:25433` (`cdc-postgres-target:5432`) |
@@ -183,7 +183,7 @@ Your Kafka/Connect stack is already on the compose host ports, so this mainly bu
 | Orchestrator | http://127.0.0.1:9788/health |
 | Native UI (cdc-native-ui) | http://127.0.0.1:4320 |
 | Connect REST | http://127.0.0.1:28083 |
-| Kafbat UI | http://127.0.0.1:4321 |
+| Kafbat UI | http://127.0.0.1:28080 |
 | Kafka (Redpanda) | 127.0.0.1:19092 |
 | MCP gateway *(profile `mcp`)* | http://127.0.0.1:8410/mcp |
 

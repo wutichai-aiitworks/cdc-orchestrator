@@ -2,7 +2,7 @@
 
 Status: Accepted
 Owner: Wutichai
-Last updated: 2026-11-01
+Last updated: 2026-11-11
 
 ## Context
 
@@ -49,6 +49,42 @@ not shipped to customers. Browsers reach `:4320` directly — no reverse proxy.
    (`.menu-panel` / `.menu-item`, shared classes in `assets/css/main.css`) with the
    user and **Sign out**. Visible whenever auth is not `none`.
 
+## Amendment 2026-11-11 — break-glass admin channel (`:4321`)
+
+**Problem.** With `AUTH_MODE=sso`, an SSO outage (SuperTokens gateway / Authelia
+down, exchange failing) locks the operator out of the UI entirely.
+
+**Decision.**
+
+1. **Same container, second process.** `cdc-native-ui`'s entrypoint
+   (`start-ui.mjs`) runs the normal UI on `:3000` and, when `ADMIN_PORT` is set
+   (compose: `3001`), a second Nitro process from the same build with
+   `AUTH_MODE=local` forced (not env-driven) and the shared `ADMIN_USERNAME` /
+   `ADMIN_PASSWORD`. The launcher is a minimal supervisor: if either process exits
+   it stops the other and exits, so `restart: unless-stopped` restarts both; logs
+   are prefixed `[ui]` / `[admin]`; the image healthcheck probes both ports.
+2. **Loopback only:** published as `127.0.0.1:${CDC_NATIVE_UI_ADMIN_PORT:-4321}:3001`.
+   The bind address is not configurable. Remote access = SSH tunnel
+   (`ssh -L 4321:127.0.0.1:4321 <host>`), which piggybacks on host SSH auth.
+3. **Session isolation:** cookies are scoped by host, not port, so the admin
+   instance uses its own cookie (`SESSION_COOKIE_NAME=cdc-admin-session`) and its
+   own secret (`ADMIN_SESSION_SECRET`, default empty ⇒ per-process random). A local
+   login on `:4321` is never a valid session on `:4320` and vice versa.
+4. `TRUST_PROXY=false` fixed; lockout keys on the Docker gateway IP (shared by all
+   loopback clients — acceptable for a single-operator break-glass path).
+5. Kafbat UI's dev default moved `4321 → 28080` (already the production value).
+
+**Rejected.** A separate `cdc-native-ui-admin` service (first cut; dropped
+2026-11-11 to keep one UI container); one Nitro process on two ports with auth chosen per listener (needs
+a custom server entry, couples SSO and local code paths); a runtime "fallback to
+local when SSO fails" switch on `:4320` (turns an SSO outage into an auth downgrade
+on the exposed port); compose profile opt-in (must already be running when SSO fails).
+
+**Reusable pattern** for other repos: `docs/patterns/break-glass-admin/` (SKILL.md, templates, agent prompt).
+
+**Consequence.** With `AUTH_MODE=sso` in production, `ADMIN_PASSWORD` must not stay
+`admin` — anyone with a shell on the host can reach `:4321`.
+
 ## Consequences
 
 - Once `install.sh` generates a token, host-side callers of `:9788`
@@ -78,4 +114,6 @@ password, `ADMIN_PASSWORD_HASH`, `TRUST_PROXY=cloudflare` (`CF-Connecting-IP`),
 | Startup checks | `server/plugins/security-startup.ts` |
 | Client | `composables/useAuth.ts`, `plugins/auth-guard.client.ts`, `pages/auth/login.vue` |
 | Avatar menu | `components/AppUserMenu.vue`, `layouts/default.vue`, `assets/css/main.css` |
-| Deploy | `docker/docker-compose.yaml`, `docker/.env.example`, `docker/install.sh` |
+| Deploy | `docker/docker-compose.yaml` (`cdc-native-ui`: ports 4320 + 127.0.0.1:4321), `docker/.env.example`, `docker/install.sh`, `docker/deploy.sh` |
+| Cookie name | `server/utils/sessionConfig.ts` (`SESSION_COOKIE_NAME`) |
+| Admin listener | `start-ui.mjs`, `Dockerfile` (entrypoint, healthcheck) |

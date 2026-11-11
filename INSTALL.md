@@ -15,7 +15,7 @@ Single-host CDC stack: **Redpanda + Debezium Connect + ksqlDB + Kafbat + Redis +
 | `cdc-message` | Redpanda (Kafka API + Schema Registry + `rpk`) | `19092` / SR `18081` |
 | `cdc-connect` | Debezium Kafka Connect (Avro default) | `28083` |
 | `cdc-ksqldb` | ksqlDB (Avro + Schema Registry) | `28088` |
-| `cdc-admin` | Kafbat UI | `4321` |
+| `cdc-admin` | Kafbat UI | `28080` |
 | `cdc-native-ui` *(optional)* | Level-3 native web UI | `4320` |
 | `cdc-redis` | Redis | `26379` |
 | `cdc-rqlite` | rqlite config store (pipelines, drafts, rules) | `14001` |
@@ -72,7 +72,7 @@ Existing JSON connectors need a restart before Avro `CREATE STREAM` can infer co
 
 - Docker Engine 24+ with Compose v2
 - ~4 GB RAM free for the full stack
-- Ports free: `9788`, `28083`, `4321`, `19092`, Schema Registry `18081`, ksqlDB `28088`, rqlite `14001` (and optional native UI `4320`, demo Postgres source `25432` / target `25433`, MCP `8410`)
+- Ports free: `9788`, `28083`, `28080`, `19092`, Schema Registry `18081`, ksqlDB `28088`, rqlite `14001` (and optional native UI `4320` + break-glass admin `127.0.0.1:4321`, demo Postgres source `25432` / target `25433`, MCP `8410`)
 
 ## Quick install
 

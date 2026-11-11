@@ -36,6 +36,8 @@ import { isAuthDisabled } from "~/utils/authMode"
 const route = useRoute()
 const { ribbon: modeRibbon } = useAppMode()
 const cfg = useRuntimeConfig()
+// Same value as the login page: `v1.2.3` for v* tags, else `<branch>_<short-sha>` (CI build arg).
+const appVersion = computed(() => String(cfg.public.appVersion || "dev"))
 const authEnabled = computed(() => !isAuthDisabled(cfg))
 const {
   data: capability,
@@ -350,6 +352,14 @@ onUnmounted(() => {
         </div>
       </nav>
 
+      <!-- Version above the separator (same placement as hyper-dataservice-webui / supertokens-webui) -->
+      <div
+        v-show="sidebarOpen"
+        class="flex flex-shrink-0 justify-center px-5 pb-2"
+        :title="`Build ${appVersion}`"
+      >
+        <span class="truncate text-center text-xs text-muted-foreground">{{ appVersion }}</span>
+      </div>
       <div class="flex-shrink-0 border-t border-sidebar-border px-2 py-4">
         <button
           type="button"

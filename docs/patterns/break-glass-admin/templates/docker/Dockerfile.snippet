@@ -1,0 +1,16 @@
+# Runtime stage additions for the break-glass admin pattern.
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+
+COPY --from=builder /app/.output ./.output
+COPY start-ui.mjs /app/
+# COPY map-env.mjs start-ui.mjs /app/   # if the app has a map-env shim
+
+USER node
+# 3000 = UI (AUTH_MODE as configured); ADMIN_PORT (3001) = break-glass local login.
+EXPOSE 3000 3001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["node", "-e", "const e=process.env;Promise.all([e.PORT||'3000',e.ADMIN_PORT].filter(Boolean).map((p)=>fetch('http://127.0.0.1:'+p+'/').then((r)=>{if(!r.ok)throw r.status}))).catch(()=>process.exit(1))"]
+ENTRYPOINT ["node", "/app/start-ui.mjs"]
+CMD ["./.output/server/index.mjs"]

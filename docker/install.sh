@@ -164,10 +164,11 @@ echo
 echo "Stack is up."
 echo "  Orchestrator : ${ORCH_URL}"
 echo "  Connect REST : ${CONNECT_URL}"
-echo "  Kafbat UI    : http://127.0.0.1:${CDC_ADMIN_HOST_PORT:-4321}"
+echo "  Kafbat UI    : http://127.0.0.1:${CDC_ADMIN_HOST_PORT:-28080}"
 echo "  Kafbat image : ${CDC_ADMIN_IMAGE:-ghcr.io/kafbat/kafka-ui:latest}"
 if [[ "$WITH_NATIVE_UI" -eq 1 ]]; then
   echo "  Native UI    : http://127.0.0.1:${CDC_NATIVE_UI_HOST_PORT:-4320}"
+  echo "  Admin (break-glass, loopback, local login): http://127.0.0.1:${CDC_NATIVE_UI_ADMIN_PORT:-4321}"
 fi
 if [[ "$WITH_DEMO" -eq 1 ]]; then
   echo "  Demo PG source: 127.0.0.1:${CDC_POSTGRES_HOST_PORT:-25432}  db=demo  dump=${CDC_DEMO_DUMP_SIZE:-3m}"

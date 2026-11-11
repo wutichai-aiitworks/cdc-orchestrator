@@ -55,7 +55,7 @@ services:
       cdc-connect:
         condition: service_healthy
     ports:
-      - "${CDC_ADMIN_HOST_PORT:-4321}:8080"
+      - "${CDC_ADMIN_HOST_PORT:-28080}:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: cdc-message:9092

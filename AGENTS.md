@@ -38,6 +38,7 @@ Instructions for AI coding agents working with the CDC control plane.
 | `docs/adr/0002-native-ui-local-auth.md` | Native WebUI login (`AUTH_MODE=local`), threat model, decisions |
 | `docs/adr/0011-app-mode.md` | `APP_MODE=Production\|Maintenance\|Enhanced` (the one mode variable), corner ribbon, Production-default hardening |
 | `docs/patterns/deployment-mode/SKILL.md` | Reusable version of APP_MODE for other repos: contract, gotchas, templates (Rust/Python/Go/Nuxt/ops), agent prompt |
+| `docs/patterns/break-glass-admin/SKILL.md` | Reusable break-glass admin port (`127.0.0.1:4321`, local login beside SSO, same container): contract, gotchas, templates, agent prompt |
 | `docs/testing/api-test-plan.md` | How to run tests, coverage map, **known-bug register** (B-xx) and fix order |
 
 ## Demo defaults (compose profile `demo`)
@@ -48,7 +49,8 @@ Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`,
 
 1. **One UI tree: `cdc-native-ui/`.** All UI work goes there only (decided 2026-11-07). `kafbat-webui/` is frozen: do **not** copy changes into it, and do not delete it unless asked. `scripts/check-native-ui-parity.sh` is legacy (no longer part of `npm run check`).
 2. **Auth modes:** `AUTH_MODE = none | local | sso`. `local` = env-only `ADMIN_USERNAME` / `ADMIN_PASSWORD` (default `admin` / `admin`). Decisions and rejected options live in ADR 0002 — don't re-propose forced password change, hashing, or public exposure unless the deployment model changes.
-3. **Threat model:** internal/VPN, single operator, direct `:4320`. Lockout keys on socket IP; `TRUST_PROXY=true` only behind a proxy that overwrites `X-Forwarded-For`.
+3. **Break-glass admin (`127.0.0.1:4321`):** second process in the `cdc-native-ui` container (`start-ui.mjs`, `ADMIN_PORT=3001`), `AUTH_MODE=local` fixed, loopback only, own cookie `cdc-admin-session`. Use when SSO is down; remote via `ssh -L 4321:127.0.0.1:4321`. Never publish it on `0.0.0.0` (ADR 0002 amendment).
+3a. **Threat model:** internal/VPN, single operator, direct `:4320`. Lockout keys on socket IP; `TRUST_PROXY=true` only behind a proxy that overwrites `X-Forwarded-For`.
 4. **Orchestrator token:** `docker/install.sh` generates `ORCH_API_TOKEN` into `docker/.env` if missing. Host-side callers of `:9788` need `Authorization: Bearer $ORCH_API_TOKEN`.
 5. **UI conventions:** icons `class="h-4 w-4" :stroke-width="1.75"`; brand chips `bg-brand-500/10 text-primary`; focus `ring-1 ring-ring`; popovers teleport to body (see `AppInfoHint`, `AppUserMenu`); reuse `.icon-button`, `.avatar`, `.menu-panel`, `.menu-item`, `.auth-input`, `.btn-primary`, `.alert-*` instead of ad-hoc classes.
 6. **Verify:** `npm run build` then run `.output` with `AUTH_MODE=local node map-env.mjs ./.output/server/index.mjs` and exercise `/api/auth/login`, `/api/auth/me`, `/api/auth/logout`. Don't commit unless asked.
@@ -68,6 +70,7 @@ Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`,
 | Say | Agent does |
 |-----|-----------|
 | "change admin password / username" | Set `ADMIN_PASSWORD` / `ADMIN_USERNAME` in `docker/.env`, recreate `cdc-native-ui` |
+| "SSO is down / break-glass login" | Tunnel `ssh -L 4321:127.0.0.1:4321 <host>`, open `http://127.0.0.1:4321`, log in with `ADMIN_*`; if refused, check `docker logs cdc-native-ui \| grep '\[admin\]'` |
 | "enable local login" | Set `AUTH_MODE=local` in `docker/.env`, recreate `cdc-native-ui` |
 | "native ui behind proxy" | Set `TRUST_PROXY=true`; re-check ADR 0002 "Revisit when" |
 | "grill native ui auth" | Re-read ADR 0002, interview only on what changed since |

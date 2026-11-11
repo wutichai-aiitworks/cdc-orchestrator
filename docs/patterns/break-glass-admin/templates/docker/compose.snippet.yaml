@@ -1,0 +1,21 @@
+# Break-glass admin pattern: add to the existing UI service (no new service).
+services:
+  <app>-ui:
+    ports:
+      - "${<APP>_HOST_PORT:-4320}:3000"
+      # Break-glass admin listener: AUTH_MODE=local forced by start-ui.mjs.
+      # Loopback only — never 0.0.0.0, bind not configurable. Remote: ssh -L 4321:127.0.0.1:4321 <host>
+      - "127.0.0.1:${<APP>_ADMIN_PORT:-4321}:3001"
+    environment:
+      AUTH_MODE: ${AUTH_MODE:-sso}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}   # must be changed when AUTH_MODE=sso
+      ADMIN_PORT: "3001"                          # empty disables the admin listener
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:-}   # empty => random per process
+    restart: unless-stopped   # the launcher exits if either process dies
+
+# .env.example
+#   <APP>_ADMIN_PORT=4321
+#   ADMIN_USERNAME=admin
+#   ADMIN_PASSWORD=change-me        # required in prod with AUTH_MODE=sso
+#   ADMIN_SESSION_SECRET=           # >=32 chars to survive restarts

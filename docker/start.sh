@@ -130,7 +130,7 @@ echo "Engine provider     : ${ORCH_ENGINE_PROVIDER}"
 echo "Container project   : ${ORCH_CONTAINER_PROJECT_NAME}"
 echo "Managed containers  : ${ORCH_MANAGED_CONTAINERS}"
 echo "Connect base URL    : ${ORCH_CONNECT_BASE_URL}"
-echo "Kafbat UI           : http://127.0.0.1:${CDC_ADMIN_HOST_PORT:-4321}"
+echo "Kafbat UI           : http://127.0.0.1:${CDC_ADMIN_HOST_PORT:-28080}"
 echo "Native UI           : cd cdc-native-ui && ./start.sh --build .env_local"
 echo
 

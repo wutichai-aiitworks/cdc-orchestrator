@@ -152,6 +152,10 @@ services:
         required: false
     ports:
       - "${CDC_NATIVE_UI_HOST_PORT:-4320}:3000"
+      # Break-glass admin listener (ADR 0002 amendment): same container, second process,
+      # AUTH_MODE=local fixed. Loopback only — never 0.0.0.0. Use when SSO is down;
+      # remote host: ssh -L 4321:127.0.0.1:4321 <host>.
+      - "127.0.0.1:${CDC_NATIVE_UI_ADMIN_PORT:-4321}:3001"
     environment:
       APP_NAME: CDC WebUI
       # Production (default, no ribbon) | Maintenance (amber ribbon) | Enhanced (violet ribbon).
@@ -165,6 +169,10 @@ services:
       ALLOW_OPEN_AUTH: ${ALLOW_OPEN_AUTH:-true}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # Container port of the break-glass listener; empty disables it.
+      ADMIN_PORT: "3001"
+      # Own cookie (cdc-admin-session) + own secret; empty => per-process random.
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:-}
       # true only behind a reverse proxy that overwrites X-Forwarded-For
       TRUST_PROXY: ${TRUST_PROXY:-false}
       SESSION_SECRET: ${SESSION_SECRET:-}

@@ -24,6 +24,8 @@ export default defineNuxtConfig({
     sessionCookieSecure:
       cookieSecure === "true" ? true : cookieSecure === "false" ? false : process.env.NODE_ENV === "production",
     sessionSecret: env("SESSION_SECRET"),
+    // Distinct name for the break-glass admin listener (cdc-native-ui-admin, :4321).
+    sessionCookieName: env("SESSION_COOKIE_NAME") || "cdc-session",
     adminUsername: env("ADMIN_USERNAME") || "admin",
     adminPassword: env("ADMIN_PASSWORD") || "admin",
     ssoExchangeUrl: env("SSO_EXCHANGE_URL"),
