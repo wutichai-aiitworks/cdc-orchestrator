@@ -1,5 +1,9 @@
 # Single pipeline: tests (rust, webui, sidecars) → sonar → multi-arch push of every
-# production image → Discord (with a pinned-digest images.env attached).
+# production image → Discord (same pattern as supertokens-gateway).
+#
+# Each step writes .ci-status/<key>: "running" first, "success" last. A failing step leaves
+# "running", a step that never ran leaves no file. scripts/ci/notify-discord.sh turns that
+# into the ✅ / ❌ / ⏭️ flow in the Discord embed.
 when:
   - event: [push, manual]
     branch:
@@ -11,34 +15,49 @@ steps:
   test-orchestrator:
     image: rust:1.97-bookworm
     commands:
-      # rdkafka builds librdkafka from source (cmake-build feature).
-      - apt-get update && apt-get install -y --no-install-recommends cmake zlib1g-dev
-      # The rust image ships the minimal profile (no rustfmt/clippy).
-      - rustup component add rustfmt clippy
-      - cargo fmt --all -- --check
-      - cargo test --locked --all-targets
-      - cargo clippy --all-targets -- -D warnings
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/rust"
+        # rdkafka builds librdkafka from source (cmake-build feature).
+        apt-get update && apt-get install -y --no-install-recommends cmake zlib1g-dev
+        # The rust image ships the minimal profile (no rustfmt/clippy).
+        rustup component add rustfmt clippy
+        cargo fmt --all -- --check
+        cargo test --locked --all-targets
+        cargo clippy --all-targets -- -D warnings
+        echo success > "$${ST}/rust"
 
   test-mcp:
     image: rust:1.97-bookworm
     depends_on: [test-orchestrator]
     commands:
-      # mcp/ is a standalone crate, not a workspace member, so the root
-      # cargo invocations above do not cover it.
-      - rustup component add rustfmt clippy
-      - cd mcp
-      - cargo fmt --all -- --check
-      - cargo test --locked --all-targets
-      - cargo clippy --all-targets -- -D warnings
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/mcp"
+        rustup component add rustfmt clippy
+        # mcp/ is a standalone crate, not a workspace member, so the root
+        # cargo invocations above do not cover it.
+        cd mcp
+        cargo fmt --all -- --check
+        cargo test --locked --all-targets
+        cargo clippy --all-targets -- -D warnings
+        echo success > "$${ST}/mcp"
 
   webui:
     image: node:22-bookworm
     commands:
-      - cd cdc-native-ui
-      - npm ci
-      - npm run openapi:check
-      - npm run typecheck
-      - npm run build
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/webui"
+        cd cdc-native-ui
+        npm ci
+        npm run openapi:check
+        npm run typecheck
+        npm run build
+        echo success > "$${ST}/webui"
 
   test-sidecars:
     image: python:3.12-slim-bookworm
@@ -47,27 +66,40 @@ steps:
     commands:
       - |
         set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/sidecars"
         # stdlib unittest only; pgdump imports paramiko lazily (image-only dependency).
         for D in sidecar_common pgcopydb pgdump pgloader redisshake mongocopy rsync; do
           echo "==> docker/$${D}"
           (cd "docker/$${D}" && PYTHONPATH=../sidecar_common python -m unittest discover -p 'test_*.py')
         done
+        echo success > "$${ST}/sidecars"
 
   test-wireguard:
     image: golang:1.26-alpine
     environment:
       CGO_ENABLED: "0"
     commands:
-      - cd docker/wireguard
-      - go vet ./...
-      - go test ./...
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/wireguard"
+        cd docker/wireguard
+        go vet ./...
+        go test ./...
+        echo success > "$${ST}/wireguard"
 
   test-jdbc-admin:
     image: maven:3.9.9-eclipse-temurin-17
     commands:
-      # Unit tests run against in-memory H2; no external database needed.
-      - cd docker/jdbc-admin
-      - mvn -B -q test
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/jdbc-admin"
+        # Unit tests run against in-memory H2; no external database needed.
+        cd docker/jdbc-admin
+        mvn -B -q test
+        echo success > "$${ST}/jdbc-admin"
 
   sonar:
     image: sonarsource/sonar-scanner-cli:11
@@ -79,8 +111,11 @@ steps:
     commands:
       - |
         set -e
+        # Runs as a non-root user: .ci-status was created (chmod 777) by the rust steps.
+        echo running > .ci-status/sonar
         echo "SonarQube at $${SONAR_HOST_URL}"
         sonar-scanner -Dsonar.qualitygate.wait=true
+        echo success > .ci-status/sonar
 
   build-and-push:
     image: docker:27-cli
@@ -96,22 +131,12 @@ steps:
       - |
         set -e
         mkdir -p .ci-status
-        chmod a+rwx .ci-status || true
+        chmod 777 .ci-status 2>/dev/null || true
         echo running > .ci-status/build
-        echo running > .ci-status/publish
 
-        SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
-        BRANCH="$${CI_COMMIT_BRANCH:-}"
-        BRANCH_SLUG="$$(echo "$${BRANCH}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9_.-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##')"
-        # Same string is the image tag and the version shown on the WebUI login page:
-        #   v* tag → the tag as-is (v1.2.3), no commit id; otherwise <branch-slug>_<short-sha>.
-        if [ -n "$${CI_COMMIT_TAG:-}" ]; then
-          VERSION="$${CI_COMMIT_TAG}"
-          RELEASE=1
-        else
-          VERSION="$${BRANCH_SLUG:-sha}_$${SHORT_SHA}"
-          RELEASE=0
-        fi
+        # Image tag == WebUI login-page version (rule in scripts/ci/version.sh).
+        VERSION="$$(sh scripts/ci/version.sh)"
+        if [ -n "$${CI_COMMIT_TAG:-}" ]; then RELEASE=1; else RELEASE=0; fi
         echo "$${VERSION}" > .ci-status/version
         CREATED="$$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -123,30 +148,20 @@ steps:
         docker buildx create --use --name multiarch || docker buildx use multiarch
         docker buildx inspect --bootstrap
 
-        # ENV_VAR (compose image variable) | image name | dockerfile | context | extra buildx args
-        # Orchestrator and Connect build from the repo root (Cargo sources / kafka-connect-jdbc fork).
-        # PG_MAJOR=18 matches the compose default: pg_dump must be >= every source server major.
+        # Image list: scripts/ci/images.txt (shared with the Discord notifier).
+        # Each image writes .ci-status/image-<name> (running → success) for the per-image lines.
+        # Read on fd 3 so nothing in the loop body can consume the list from stdin.
         : > .ci-status/images.env.tmp
-        for SPEC in \
-          "CDC_ORCHESTRATOR_IMAGE|cdc-orchestrator|docker/Dockerfile|.|" \
-          "CDC_CONNECT_IMAGE|cdc-connect|docker/connect/Dockerfile|.|" \
-          "CDC_NATIVE_UI_IMAGE|cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui|--build-arg APP_VERSION=$${VERSION}" \
-          "MCP_CDC_IMAGE|cdc-mcp|mcp/Dockerfile|mcp|" \
-          "CDC_JDBC_ADMIN_IMAGE|cdc-jdbc-admin|docker/jdbc-admin/Dockerfile|docker/jdbc-admin|" \
-          "CDC_WIREGUARD_IMAGE|cdc-wireguard|docker/wireguard/Dockerfile|docker/wireguard|" \
-          "CDC_PGCOPY_IMAGE|cdc-pgcopydb|docker/pgcopydb/Dockerfile|docker/pgcopydb|--build-context common=docker/sidecar_common --build-arg PG_MAJOR=18" \
-          "CDC_PGDUMP_IMAGE|cdc-pgdump|docker/pgdump/Dockerfile|docker/pgdump|--build-arg PG_MAJOR=18" \
-          "CDC_PGLOADER_IMAGE|cdc-pgloader|docker/pgloader/Dockerfile|docker/pgloader|--build-context common=docker/sidecar_common" \
-          "CDC_REDIS_SHAKE_IMAGE|cdc-redisshake|docker/redisshake/Dockerfile|docker/redisshake|--build-context common=docker/sidecar_common" \
-          "CDC_MONGOCOPY_IMAGE|cdc-mongocopy|docker/mongocopy/Dockerfile|docker/mongocopy|--build-context common=docker/sidecar_common" \
-          "CDC_RSYNC_IMAGE|cdc-rsync|docker/rsync/Dockerfile|docker/rsync|" ; do
+        while IFS= read -r SPEC <&3; do
+          case "$${SPEC}" in ''|'#'*) continue ;; esac
 
           VAR="$$(echo "$${SPEC}" | cut -d'|' -f1)"
           NAME="$$(echo "$${SPEC}" | cut -d'|' -f2)"
           FILE="$$(echo "$${SPEC}" | cut -d'|' -f3)"
           CONTEXT="$$(echo "$${SPEC}" | cut -d'|' -f4)"
-          EXTRA="$$(echo "$${SPEC}" | cut -d'|' -f5)"
+          EXTRA="$$(echo "$${SPEC}" | cut -d'|' -f5 | sed "s#{VERSION}#$${VERSION}#g")"
           IMAGE="$${REGISTRY_NAMESPACE}/$${NAME}"
+          echo running > ".ci-status/image-$${NAME}"
 
           echo "==> $${IMAGE}:$${VERSION}  ($${FILE} @ $${CONTEXT})"
           # $${EXTRA} is intentionally unquoted (word-split into flags).
@@ -172,13 +187,15 @@ steps:
           DIGEST="$$(sed -n 's/.*"containerimage.digest": *"\(sha256:[0-9a-f]*\)".*/\1/p' ".ci-status/$${NAME}.json" | head -1)"
           if [ -z "$${DIGEST}" ]; then echo "no digest for $${IMAGE}" >&2; exit 1; fi
           echo "$${VAR}=$${IMAGE}:$${VERSION}@$${DIGEST}" >> .ci-status/images.env.tmp
-        done
+          echo success > ".ci-status/image-$${NAME}"
+        done 3< scripts/ci/images.txt
+        echo success > .ci-status/build
 
-        # Paste-ready block for docker/.env.production (tag + immutable digest).
+        # publish = release manifest + 'latest'. 'latest' moves only after every image built,
+        # so it never points at a half-released set.
+        echo running > .ci-status/publish
         mv .ci-status/images.env.tmp .ci-status/images.env
         cat .ci-status/images.env
-
-        # Move 'latest' only after every image built, so it never points at a half-released set.
         if [ "$${RELEASE}" = "1" ]; then
           while IFS='=' read -r VAR REF; do
             IMAGE="$${REF%%:*}"
@@ -186,94 +203,17 @@ steps:
             docker buildx imagetools create -t "$${IMAGE}:latest" "$${IMAGE}@$${REF##*@}"
           done < .ci-status/images.env
         fi
-
-        echo success > .ci-status/build
         echo success > .ci-status/publish
 
   notify-discord:
     image: curlimages/curl:8.7.1
-    depends_on: [build-and-push]
+    depends_on: [test-orchestrator, test-mcp, webui, test-sidecars, test-wireguard, test-jdbc-admin, sonar, build-and-push]
     when:
-      status: [success]
+      status: [success, failure]
     environment:
       DISCORD_WEBHOOK:
         from_secret: DISCORD_WEBHOOK
       REGISTRY_NAMESPACE:
         from_secret: REGISTRY_NAMESPACE
     commands:
-      - |
-        set -e
-        SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
-        VERSION="$$(cat .ci-status/version)"
-        REF="$${CI_COMMIT_TAG:-$${CI_COMMIT_BRANCH:-unknown}}"
-        if [ -n "$${CI_COMMIT_TAG:-}" ]; then TAGS="\`latest\`, \`$${VERSION}\`"; else TAGS="\`$${VERSION}\`"; fi
-        COUNT="$$(wc -l < .ci-status/images.env | tr -d ' ')"
-        NAMES="$$(cut -d= -f2 .ci-status/images.env | cut -d: -f1 | sed 's#.*/##' | tr '\n' ' ')"
-        BUILD_NO="$${CI_PIPELINE_NUMBER:-n/a}"
-        RUN_URL="$${CI_PIPELINE_URL:-$${CI_BUILD_LINK}}"
-        COMMIT_URL="$${CI_COMMIT_LINK:-$${CI_REPO_LINK}/commit/$${CI_COMMIT_SHA}}"
-        TS="$$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-        cat > payload.json <<EOF
-        {
-          "embeds": [
-            {
-              "title": "🚀 cdc-orchestrator images pushed",
-              "description": "Multi-arch publish completed. Attached images.env pins every image by digest for docker/.env.production.",
-              "color": 5763719,
-              "fields": [
-                { "name": "Project", "value": "$${CI_REPO_NAME}", "inline": true },
-                { "name": "Ref", "value": "$${REF}", "inline": true },
-                { "name": "Triggered by", "value": "$${CI_COMMIT_AUTHOR}", "inline": true },
-                { "name": "Images ($${COUNT})", "value": "\`$${REGISTRY_NAMESPACE}/\` $${NAMES}", "inline": false },
-                { "name": "Tags", "value": "$${TAGS}", "inline": true },
-                { "name": "Platforms", "value": "\`linux/amd64\`, \`linux/arm64\`", "inline": true },
-                { "name": "Commit", "value": "[\`$${SHORT_SHA}\`]($${COMMIT_URL})", "inline": true },
-                { "name": "Pipeline", "value": "[#$${BUILD_NO}]($${RUN_URL})", "inline": true }
-              ],
-              "footer": { "text": "Woodpecker CI" },
-              "timestamp": "$${TS}"
-            }
-          ]
-        }
-        EOF
-
-        # One POST: embed + images.env attachment. -f fails the step on a Discord error.
-        curl -sSf -X POST "$${DISCORD_WEBHOOK}" \
-          -F "payload_json=<payload.json" \
-          -F "files[0]=@.ci-status/images.env;filename=images-$${VERSION}.env"
-
-  notify-discord-failure:
-    image: curlimages/curl:8.7.1
-    depends_on: [build-and-push]
-    when:
-      status: [failure]
-    environment:
-      DISCORD_WEBHOOK:
-        from_secret: DISCORD_WEBHOOK
-    commands:
-      - |
-        set -e
-        SHORT_SHA="$$(echo "$${CI_COMMIT_SHA}" | cut -c1-7)"
-        REF="$${CI_COMMIT_TAG:-$${CI_COMMIT_BRANCH:-unknown}}"
-        RUN_URL="$${CI_PIPELINE_URL:-$${CI_BUILD_LINK}}"
-        TS="$$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-        cat > payload.json <<EOF
-        {
-          "embeds": [
-            {
-              "title": "❌ cdc-orchestrator pipeline failed",
-              "description": "\`latest\` was not moved. Check the failing step.",
-              "color": 15548997,
-              "fields": [
-                { "name": "Ref", "value": "$${REF}", "inline": true },
-                { "name": "Commit", "value": "\`$${SHORT_SHA}\`", "inline": true },
-                { "name": "Pipeline", "value": "[#$${CI_PIPELINE_NUMBER:-n/a}]($${RUN_URL})", "inline": true }
-              ],
-              "footer": { "text": "Woodpecker CI" },
-              "timestamp": "$${TS}"
-            }
-          ]
-        }
-        EOF
-        curl -sSf -X POST "$${DISCORD_WEBHOOK}" -H "Content-Type: application/json" --data-binary @payload.json
+      - sh scripts/ci/notify-discord.sh

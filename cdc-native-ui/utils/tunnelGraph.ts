@@ -2,13 +2,15 @@
 // degree-weighted repulsion, linear attraction along edges, gravity to the centre) of the gateway,
 // the sites and the databases used through them, plus a GEXF export to open it in Gephi itself.
 // Deterministic, so the picture does not jump between refreshes. Tested in tests/unit/tunnelGraph.test.ts.
+// Point lives in dragNodes only: Nuxt auto-imports utils/ exports, so a second
+// `export type Point` here triggers a "Duplicated imports" build warning.
+import type { Point } from "./dragNodes"
 import type { Tone } from "./transferView"
 import { engineOf, siteTone, type TopoTunnel } from "./tunnelTopology"
 
 export type GraphNode = { id: string; kind: "gateway" | "site" | "db"; label: string; sub: string; tone: Tone; degree: number; siteId?: string; active?: number }
 export type GraphEdge = { source: string; target: string; live: boolean; tone: Tone }
 export type Graph = { nodes: GraphNode[]; edges: GraphEdge[] }
-export type Point = { x: number; y: number }
 
 export const GATEWAY_ID = "gateway"
 

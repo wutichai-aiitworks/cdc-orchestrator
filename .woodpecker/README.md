@@ -13,8 +13,7 @@ this directory, so extra files here would show up as separate pipelines.
 | `test-jdbc-admin` | — | `mvn test` in `docker/jdbc-admin` (in-memory H2) |
 | `sonar` | rust tests | `sonar-scanner` against `sonar-project.properties`, waits for the quality gate |
 | `build-and-push` | `sonar`, `webui`, all sidecar tests | Builds and pushes all twelve images multi-arch |
-| `notify-discord` | `build-and-push` (success) | Discord embed + `images-<version>.env` attachment |
-| `notify-discord-failure` | `build-and-push` (failure) | Discord embed with the failing pipeline link |
+| `notify-discord` | every step (success **or** failure) | `scripts/ci/notify-discord.sh`: one Discord embed for the whole run |
 
 Runs on push / manual (not `main`) and on `v*` tags.
 
@@ -46,6 +45,45 @@ Each build also carries:
   security patches on every build.
 - Registry layer cache at `<image>:buildcache` (Docker Hub supports it with
   `image-manifest=true`). A cache export error does not fail the build.
+
+## Discord notification
+
+Same pattern as `supertokens-gateway`. Every step writes `.ci-status/<key>` (`running` first,
+`success` last); `scripts/ci/notify-discord.sh` reads them into a flow block:
+
+```
+checkout   ✅
+rust       ✅
+...
+sonar      ✅
+build      ❌
+  cdc-orchestrator  ✅
+  ...
+  cdc-pgcopydb      ❌          <- image-cdc-pgcopydb left at "running"
+  cdc-pgdump        ⏭️ skipped  <- not reached
+  ...
+publish    ⏭️ skipped           <- no file: step never ran
+```
+
+The per-image lines come from `.ci-status/image-<name>`, written by the build loop for each
+entry in `scripts/ci/images.txt`. That file is the single image list for both the build and
+the notifier; add a new image there, not in the YAML. Image lines appear only when the build
+step ran (a test failure shows just `build ⏭️ skipped`).
+
+Green "cdc-orchestrator pipeline succeeded" or red "… failed". Fields: Project, Branch/Tag,
+Triggered by, Images, Tags, Platforms, Commit, Pipeline. The Images/Tags fields say what
+actually reached the registry:
+
+| Outcome | Images / Tags |
+|---------|---------------|
+| publish ✅ | image list + `images-<version>.env` attached; tags pushed |
+| build ✅, publish ❌ | all pushed under the version tag; `latest` unchanged |
+| build ❌ | failed partway: earlier images may be pushed (`incomplete`) |
+| build skipped | not published; version `(not pushed)` |
+
+The version rule lives in `scripts/ci/version.sh` (shared by build and notify, so a failed
+run still reports the right version). The curl image runs as non-root, so the payload is
+written to `/tmp`, not the workspace.
 
 ## Release manifest (`images.env`)
 
@@ -98,7 +136,7 @@ server's major version, so bump it here and in compose together.
 | `DOCKERHUB_USERNAME` | `build-and-push` |
 | `DOCKERHUB_TOKEN` | `build-and-push` (needs read/write: it also pushes `:buildcache`) |
 | `REGISTRY_NAMESPACE` | `build-and-push`, `notify-discord` (image name prefix) |
-| `DISCORD_WEBHOOK` | `notify-discord`, `notify-discord-failure` |
+| `DISCORD_WEBHOOK` | `notify-discord` |
 | `SONAR_TOKEN` | `sonar` (token for `https://sonarqube.b-quik-connect.com`, project `hyper-cdc-orchestrator`) |
 
 All steps need the secrets above (no pull-request path).

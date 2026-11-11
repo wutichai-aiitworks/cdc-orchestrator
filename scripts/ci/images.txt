@@ -1,0 +1,19 @@
+# Images built by .woodpecker/main-ci.yml (build-and-push), in build order.
+# Also read by scripts/ci/notify-discord.sh for the per-image lines in the Discord embed.
+#
+# ENV_VAR (compose image variable) | image name | dockerfile | context | extra buildx args
+# {VERSION} in extra args is replaced with the build version (scripts/ci/version.sh).
+# Orchestrator and Connect build from the repo root (Cargo sources / kafka-connect-jdbc fork).
+# PG_MAJOR=18 matches the compose default: pg_dump must be >= every source server major.
+CDC_ORCHESTRATOR_IMAGE|cdc-orchestrator|docker/Dockerfile|.|
+CDC_CONNECT_IMAGE|cdc-connect|docker/connect/Dockerfile|.|
+CDC_NATIVE_UI_IMAGE|cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui|--build-arg APP_VERSION={VERSION}
+MCP_CDC_IMAGE|cdc-mcp|mcp/Dockerfile|mcp|
+CDC_JDBC_ADMIN_IMAGE|cdc-jdbc-admin|docker/jdbc-admin/Dockerfile|docker/jdbc-admin|
+CDC_WIREGUARD_IMAGE|cdc-wireguard|docker/wireguard/Dockerfile|docker/wireguard|
+CDC_PGCOPY_IMAGE|cdc-pgcopydb|docker/pgcopydb/Dockerfile|docker/pgcopydb|--build-context common=docker/sidecar_common --build-arg PG_MAJOR=18
+CDC_PGDUMP_IMAGE|cdc-pgdump|docker/pgdump/Dockerfile|docker/pgdump|--build-arg PG_MAJOR=18
+CDC_PGLOADER_IMAGE|cdc-pgloader|docker/pgloader/Dockerfile|docker/pgloader|--build-context common=docker/sidecar_common
+CDC_REDIS_SHAKE_IMAGE|cdc-redisshake|docker/redisshake/Dockerfile|docker/redisshake|--build-context common=docker/sidecar_common
+CDC_MONGOCOPY_IMAGE|cdc-mongocopy|docker/mongocopy/Dockerfile|docker/mongocopy|--build-context common=docker/sidecar_common
+CDC_RSYNC_IMAGE|cdc-rsync|docker/rsync/Dockerfile|docker/rsync|
