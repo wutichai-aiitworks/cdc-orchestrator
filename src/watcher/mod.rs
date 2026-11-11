@@ -64,11 +64,18 @@ async fn run_refresh_loop(state: Arc<AppState>) {
 /// Using the persisted history instead of in-memory state means a restart does not
 /// trigger an immediate extra refresh.
 fn minutes_since_last_refresh(history: &[crate::models::HistoryItem]) -> Option<i64> {
+    last_full_refresh_at(history).map(|at| (chrono::Utc::now() - at).num_minutes())
+}
+
+/// Timestamp of the last completed full refresh (resync) in a pipeline's history.
+pub fn last_full_refresh_at(
+    history: &[crate::models::HistoryItem],
+) -> Option<chrono::DateTime<chrono::Utc>> {
     history
         .iter()
         .rev()
         .find(|item| item.event == REFRESH_EVENT)
-        .map(|item| (chrono::Utc::now() - item.timestamp).num_minutes())
+        .map(|item| item.timestamp)
 }
 
 const REFRESH_EVENT: &str = "profile_resynced";

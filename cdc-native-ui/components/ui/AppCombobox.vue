@@ -27,7 +27,10 @@ const panel = ref<HTMLElement | null>(null)
 const open = ref(false)
 const typed = ref(false)
 const active = ref(-1)
-const pos = ref({ top: 0, left: 0, width: 0 })
+const GAP = 4
+const EDGE = 8
+const MAX_PANEL = 256 // keeps the old max-h-64 cap when the viewport has room
+const pos = ref({ top: 0, left: 0, width: 0, maxHeight: MAX_PANEL, ready: false })
 const listId = `combo-${Math.random().toString(36).slice(2, 9)}`
 
 const current = computed(() => String(props.modelValue ?? ""))
@@ -39,10 +42,44 @@ const visible = computed(() => {
   return q ? unique.filter((o) => o.toLowerCase().includes(q)) : unique
 })
 
+/**
+ * Viewport-aware placement (same approach as AppActionMenu). A row near the bottom
+ * of the page used to push the list off-screen; now the list flips above the input
+ * when there is more room there, and its height is capped to the free space so it
+ * scrolls instead of being clipped.
+ */
 const place = () => {
   if (!open.value || !root.value) return
   const r = root.value.getBoundingClientRect()
-  pos.value = { top: r.bottom + 4, left: r.left, width: r.width }
+  const vv = window.visualViewport
+  const viewH = vv?.height ?? window.innerHeight
+  const viewW = vv?.width ?? window.innerWidth
+  const offsetTop = vv?.offsetTop ?? 0
+  const offsetLeft = vv?.offsetLeft ?? 0
+  const width = Math.max(panel.value?.offsetWidth ?? 0, r.width)
+  const height = Math.min(panel.value?.scrollHeight ?? 0, MAX_PANEL)
+  const below = viewH - r.bottom - GAP - EDGE
+  const above = r.top - GAP - EDGE
+  const up = height > below && above > below
+  const maxHeight = Math.min(MAX_PANEL, Math.max(120, up ? above : below))
+  const top = up
+    ? Math.max(EDGE, r.top - GAP - Math.min(height, maxHeight)) + offsetTop
+    : r.bottom + GAP + offsetTop
+  pos.value = {
+    top,
+    left: Math.max(EDGE, Math.min(r.left, viewW - width - EDGE)) + offsetLeft,
+    width: r.width,
+    maxHeight,
+    ready: true,
+  }
+}
+
+const schedulePlace = () => {
+  pos.value.ready = false
+  nextTick(() => {
+    place()
+    requestAnimationFrame(place)
+  })
 }
 
 const show = () => {
@@ -50,7 +87,7 @@ const show = () => {
   open.value = true
   typed.value = false
   active.value = visible.value.findIndex((o) => o.toLowerCase() === current.value.trim().toLowerCase())
-  nextTick(place)
+  schedulePlace()
 }
 
 const hide = () => {
@@ -70,7 +107,7 @@ const onInput = (event: Event) => {
   active.value = -1
   if (!open.value) {
     open.value = true
-    nextTick(place)
+    schedulePlace()
   }
 }
 
@@ -92,6 +129,12 @@ const onKeydown = (event: KeyboardEvent) => {
     hide()
   }
 }
+
+// Typing filters the list and changes its height; when the list sits above the
+// input it must be re-anchored so its bottom edge stays next to the field.
+watch(visible, () => {
+  if (open.value) nextTick(place)
+})
 
 onClickOutside(root, hide, { ignore: [panel] })
 useEventListener(window, "scroll", place, { capture: true, passive: true })
@@ -135,8 +178,14 @@ useEventListener(window, "resize", place)
         :id="listId"
         ref="panel"
         role="listbox"
-        class="menu-panel max-h-64 overflow-auto"
-        :style="{ top: `${pos.top}px`, left: `${pos.left}px`, minWidth: `${pos.width}px` }"
+        class="menu-panel overflow-auto overscroll-contain"
+        :style="{
+          top: `${pos.top}px`,
+          left: `${pos.left}px`,
+          minWidth: `${pos.width}px`,
+          maxHeight: `${pos.maxHeight}px`,
+          visibility: pos.ready ? 'visible' : 'hidden',
+        }"
       >
         <button
           v-for="(option, i) in visible"

@@ -40,6 +40,33 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # WireGuard gateway (ADR 0010): userspace wireguard-go, no NET_ADMIN / TUN. It dials out to
+  # each site's WireGuard UDP port; tools reach site databases via TCP forwards (ports 21000-21999
+  # on this network only — nothing is published). Tunnel keys live in rqlite (orchestrator) and in
+  # this process's memory, never on disk.
+  cdc-wireguard:
+    image: ${CDC_WIREGUARD_IMAGE:-cdc-wireguard:local}
+    build:
+      context: ./wireguard
+      dockerfile: Dockerfile
+    container_name: cdc-wireguard
+    environment:
+      WIREGUARD_API_TOKEN: ${ORCH_WIREGUARD_TOKEN:-}
+      WG_FORWARD_HOST: cdc-wireguard
+      WG_FORWARD_PORT_MIN: ${WG_FORWARD_PORT_MIN:-21000}
+      WG_FORWARD_PORT_MAX: ${WG_FORWARD_PORT_MAX:-21999}
+    networks: [server_zone]
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
   cdc-redisshake:
     image: ${CDC_REDIS_SHAKE_IMAGE:-cdc-redisshake:local}
     build:

@@ -1207,11 +1207,7 @@ fn connection_from(args: &Value, side: &str) -> Result<Value, ApiError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("demo");
-    let password = password_or_demo(
-        args.get(&pass_key).and_then(Value::as_str),
-        host,
-        &pass_key,
-    )?;
+    let password = password_or_demo(args.get(&pass_key).and_then(Value::as_str), host, &pass_key)?;
     Ok(json!({
         "host": host,
         "port": port,
@@ -1259,7 +1255,11 @@ fn db_probe_body(args: &Value, side: &str) -> Result<Value, ApiError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("demo");
-    let password = password_or_demo(args.get("password").and_then(Value::as_str), host, "password")?;
+    let password = password_or_demo(
+        args.get("password").and_then(Value::as_str),
+        host,
+        "password",
+    )?;
     let mut body = json!({
         "connection": {
             "host": host,
@@ -1282,11 +1282,17 @@ fn db_probe_body(args: &Value, side: &str) -> Result<Value, ApiError> {
 
 /// The `demo` password is only a default for the bundled demo databases; any other host must be
 /// given a password, so a real server is never probed with a guessed credential.
-fn password_or_demo<'a>(given: Option<&'a str>, host: &str, key: &str) -> Result<&'a str, ApiError> {
+fn password_or_demo<'a>(
+    given: Option<&'a str>,
+    host: &str,
+    key: &str,
+) -> Result<&'a str, ApiError> {
     match given.filter(|p| !p.is_empty()) {
         Some(p) => Ok(p),
         None if matches!(host, "cdc-postgres-source" | "cdc-postgres-target") => Ok("demo"),
-        None => Err(ApiError::Message(format!("missing {key} for host {host}; ask the user for it"))),
+        None => Err(ApiError::Message(format!(
+            "missing {key} for host {host}; ask the user for it"
+        ))),
     }
 }
 

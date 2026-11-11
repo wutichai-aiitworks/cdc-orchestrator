@@ -4,7 +4,7 @@ Unified Rust CDC control plane for the Debezium/Kafka Connect stack. Powers `hyp
 
 ## Is it ready to use?
 
-**Yes for single-host Docker** (dev immediately; production after `ORCH_ENV=prod` + soak test).
+**Yes for single-host Docker** (dev immediately; production after `APP_MODE=Production` + soak test; `APP_MODE=Maintenance|Enhanced` marks other releases with a corner ribbon).
 
 Not for multi-tenant or multi-node HA.
 

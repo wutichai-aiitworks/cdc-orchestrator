@@ -35,6 +35,7 @@ mod redisshake_handlers;
 mod rsync;
 mod rsync_handlers;
 mod saved_secret;
+mod schedule;
 mod split;
 mod store;
 mod tool_events;
@@ -104,6 +105,9 @@ pub struct AppState {
     pub tool_events_mem: tool_events::MemoryLog,
     /// WireGuard tunnels for the Copy & Sync tools (ADR 0010).
     pub wireguard_tunnels: wireguard::TunnelStore,
+    /// Pipelines with a lifecycle action (start / resync / …) in flight on this instance.
+    /// A second overlapping action is refused with 409 instead of racing the first one.
+    pub profile_action_locks: handlers::ProfileActionLocks,
 }
 
 async fn open_rqlite(config: &AppConfig) -> Option<RqliteClient> {
@@ -224,6 +228,7 @@ async fn main() {
         initial_loads: Arc::new(RwLock::new(HashMap::new())),
         tool_events_mem: tool_events::MemoryLog::default(),
         wireguard_tunnels: wireguard::TunnelStore::new(rqlite_for_wireguard),
+        profile_action_locks: handlers::ProfileActionLocks::default(),
     };
 
     let legacy = Router::new()
@@ -290,6 +295,7 @@ async fn main() {
         .route("/kafka/groups/:group/lag", get(handlers::kafka_group_lag))
         .route("/profiles", get(handlers::list_profiles))
         .route("/profiles", post(handlers::create_profile))
+        .route("/schedule", get(schedule::get_schedule))
         .route("/profiles/cases", post(handlers::create_profile_from_case))
         .route("/profiles/validate/source", post(handlers::validate_source))
         .route(
@@ -487,6 +493,7 @@ async fn main() {
         .route("/ksqldb/explain/:query_id", get(kafka_admin::ksql_explain))
         .route("/profiles", get(handlers::list_profiles))
         .route("/profiles", post(handlers::create_profile))
+        .route("/schedule", get(schedule::get_schedule))
         .route("/profiles/cases", post(handlers::create_profile_from_case))
         .route("/profiles/validate/source", post(handlers::validate_source))
         .route(

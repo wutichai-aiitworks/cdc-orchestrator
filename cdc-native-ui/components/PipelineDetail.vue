@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import type { Component } from "vue"
 import {
+  Tag,
   Activity,
   AlertCircle,
   AlertTriangle,
+  Copy,
   FlaskConical,
   MoreHorizontal,
   Pause,
@@ -45,6 +47,7 @@ export type PipelineDetailAction =
   | "resync"
   | "initial-load"
   | "split"
+  | "duplicate"
 
 type FlowProps = {
   sourceLabel: string
@@ -65,12 +68,37 @@ const props = defineProps<{
   canStart: boolean
   startBlockedReason: string
   supportsTestSync: boolean
+  /** A lifecycle action is in flight: block a second click until it settles. */
+  busy?: boolean
+  /** Tags used on other pipelines, offered while editing this one's tags. */
+  tagSuggestions?: string[]
+  /** Tags are being saved. */
+  tagsSaving?: boolean
 }>()
 
 const emit = defineEmits<{
   action: [action: PipelineDetailAction]
   autostart: [enabled: boolean]
+  /** Save these tags now (the parent persists them and reloads). */
+  tags: [tags: string[]]
 }>()
+
+// Inline tag editor in the header: edit, then Save or Cancel. It closes once a save
+// finishes and the reloaded profile carries the draft's tags; on error it stays open.
+const editingTags = ref(false)
+const tagDraft = ref<string[]>([])
+const startTagEdit = () => {
+  tagDraft.value = [...(props.profile.tags ?? [])]
+  editingTags.value = true
+}
+const saveTags = () => emit("tags", [...tagDraft.value])
+const tagKey = (tags: string[] | undefined) => (tags ?? []).map((t) => t.toLowerCase()).join("\u0000")
+watch(
+  () => [props.tagsSaving, tagKey(props.profile.tags)] as const,
+  ([saving]) => {
+    if (editingTags.value && !saving && tagKey(props.profile.tags) === tagKey(tagDraft.value)) editingTags.value = false
+  },
+)
 
 type TabKey = "tables" | "activity" | "logs" | "configuration"
 
@@ -185,6 +213,7 @@ const moreItems = computed<ActionMenuItem[]>(() => {
   if (supportsSplit.value) {
     items.push({ key: "split", label: "Split tables into new pipeline…", icon: Split, separatorBefore: true })
   }
+  items.push({ key: "duplicate", label: "Duplicate as new pipeline…", icon: Copy, separatorBefore: !supportsSplit.value })
   if (primary.value.key !== "toggle-enabled") {
     items.push({ key: "toggle-enabled", label: props.profile.enabled ? "Disable" : "Enable", icon: Power, separatorBefore: true })
   }
@@ -333,18 +362,34 @@ const configRows = computed(() => [
           <p class="truncate font-mono text-xs text-muted-foreground" :title="`${flow.sourceCaption} → ${flow.targetCaption}`">
             {{ flow.sourceLabel }} {{ connectionText(profile.source.connection) }} → {{ flow.targetCaption || flow.targetLabel }}
           </p>
+          <div v-if="!editingTags" class="flex flex-wrap items-center gap-1 pt-1">
+            <span v-for="tag in profile.tags ?? []" :key="tag" class="tag-chip">{{ tag }}</span>
+            <button type="button" class="btn-ghost inline-flex items-center gap-1 text-xs" @click="startTagEdit">
+              <Tag class="h-3 w-3" :stroke-width="1.75" />
+              {{ profile.tags?.length ? "Edit tags" : "Add tags" }}
+            </button>
+          </div>
+          <div v-else class="max-w-xl space-y-2 pt-1">
+            <PipelineTagInput v-model="tagDraft" :suggestions="tagSuggestions" />
+            <div class="flex gap-2">
+              <AppButton variant="primary" :disabled="tagsSaving" @click="saveTags">
+                {{ tagsSaving ? "Saving…" : "Save tags" }}
+              </AppButton>
+              <AppButton :disabled="tagsSaving" @click="editingTags = false">Cancel</AppButton>
+            </div>
+          </div>
         </div>
         <div class="relative z-20 flex flex-wrap items-center gap-2">
           <AppButton
             variant="primary"
-            :disabled="primary.disabled"
-            :title="primary.disabled ? primary.title : undefined"
+            :disabled="primary.disabled || busy"
+            :title="primary.disabled ? primary.title : busy ? 'Working…' : undefined"
             @click="emit('action', primary.key)"
           >
-            <component :is="primary.icon" class="h-4 w-4" :stroke-width="1.75" />
-            {{ primary.label }}
+            <component :is="primary.icon" class="h-4 w-4" :stroke-width="1.75" :class="{ 'animate-pulse': busy }" />
+            {{ busy && primary.key !== 'edit' ? 'Working…' : primary.label }}
           </AppButton>
-          <AppButton v-if="primary.key !== 'edit'" @click="emit('action', 'edit')">
+          <AppButton v-if="primary.key !== 'edit'" :disabled="busy" @click="emit('action', 'edit')">
             <Pencil class="h-4 w-4" :stroke-width="1.75" />
             Edit
           </AppButton>
@@ -352,6 +397,7 @@ const configRows = computed(() => [
             label="More"
             :icon="MoreHorizontal"
             :items="moreItems"
+            :disabled="busy"
             @select="(key) => emit('action', key as PipelineDetailAction)"
           />
         </div>
@@ -447,6 +493,12 @@ const configRows = computed(() => [
             <div v-if="profile.description" class="grid gap-1 px-4 py-3 sm:grid-cols-[14rem_1fr] sm:gap-4">
               <dt class="text-sm text-muted-foreground">Description</dt>
               <dd class="text-sm text-foreground">{{ profile.description }}</dd>
+            </div>
+            <div v-if="profile.tags?.length" class="grid gap-1 px-4 py-3 sm:grid-cols-[14rem_1fr] sm:gap-4">
+              <dt class="text-sm text-muted-foreground">Tags</dt>
+              <dd class="flex flex-wrap gap-1">
+                <span v-for="tag in profile.tags" :key="tag" class="tag-chip">{{ tag }}</span>
+              </dd>
             </div>
           </dl>
           <label v-if="canStart" class="flex cursor-pointer items-center gap-2 text-sm">

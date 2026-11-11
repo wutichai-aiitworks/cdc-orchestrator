@@ -5,6 +5,9 @@ import { formatBytes } from "../bytes"
 import { changedBy, formatDuration, isActive, jobDurationMs, joinList as list, railLine, type Problem, type RouteStep, type Tone } from "../transferView"
 
 export type EndLike = {
+  /** ssh (default) or daemon (rsync://host:873/module). */
+  protocol?: string
+  module?: string
   name?: string
   host: string
   port?: string
@@ -39,6 +42,8 @@ export type JobLike = {
   exit_code?: number | null
   error?: string
   first_error?: string
+  /** Every distinct rsync/ssh error line of the run (newer sidecars). */
+  errors?: string[]
   hint?: string
 }
 
@@ -140,7 +145,12 @@ export function routeSteps(p: ProfileLike, job?: JobLike, now = Date.now()): Rou
   return steps
 }
 
-export const endLabel = (e: EndLike) => `${e.username || "?"}@${e.host || "?"}${e.port && e.port !== "22" ? `:${e.port}` : ""}`
+export const isDaemonEnd = (e: EndLike) => e.protocol === "daemon"
+
+export const endLabel = (e: EndLike) =>
+  isDaemonEnd(e)
+    ? `rsync://${e.username ? `${e.username}@` : ""}${e.host || "?"}${e.port && e.port !== "873" ? `:${e.port}` : ""}/${e.module || "?"}`
+    : `${e.username || "?"}@${e.host || "?"}${e.port && e.port !== "22" ? `:${e.port}` : ""}`
 
 /** "The contents of /srv/www" vs "The folder /srv/www itself": rsync's trailing-slash rule in words. */
 export function whatIsCopied(path: string): string {
@@ -199,7 +209,7 @@ export function destructiveEffects(p: ProfileLike): string[] {
 }
 
 const endKey = (e?: EndLike) =>
-  e ? [e.host, e.port, e.username, e.auth, e.password, e.private_key, e.passphrase, e.host_key_fingerprint, e.rsync_path] : null
+  e ? [e.protocol || "ssh", e.module || "", e.host, e.port, e.username, e.auth, e.password, e.private_key, e.passphrase, e.host_key_fingerprint, e.rsync_path] : null
 
 export const rsyncChangeLabels: [string, (p: ProfileLike) => unknown][] = [
   ["name", (p) => p.name],
@@ -228,7 +238,13 @@ export function runProblems(job: JobLike): Problem[] {
   return [
     {
       title: job.error || (job.status === "failed" ? "The sync failed" : "The sync finished with errors"),
-      detail: job.first_error && job.first_error !== job.error ? job.first_error : undefined,
+      // All errors, not just the first: a harmless warning can come before the line that
+      // explains why files were skipped (e.g. "set times" before "mkdir … Permission denied").
+      detail: job.errors?.length
+        ? job.errors.join("\n")
+        : job.first_error && job.first_error !== job.error
+          ? job.first_error
+          : undefined,
       fix: job.hint,
     },
   ]

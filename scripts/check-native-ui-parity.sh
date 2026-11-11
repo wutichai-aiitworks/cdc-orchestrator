@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fail if shared native-UI files drift between kafbat-webui/ and cdc-native-ui/.
-# Both trees are kept for now (ADR 0002); auth/UI-shell changes must land in both.
+# LEGACY (2026-11-07): UI work happens in cdc-native-ui only; kafbat-webui is frozen and this check
+# is no longer part of `npm run check`. Kept for reference only.
 #   scripts/check-native-ui-parity.sh          # check
 #   scripts/check-native-ui-parity.sh --diff   # also print diffs
 set -euo pipefail

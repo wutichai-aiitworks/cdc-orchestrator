@@ -2,7 +2,13 @@ export type RsyncAuth = "key" | "password"
 export type RsyncTransport = "auto" | "direct" | "relay"
 
 /** One SSH host (Linux or macOS) and the directory on it. */
+export type RsyncProtocol = "ssh" | "daemon"
+
 export type RsyncEndpoint = {
+  /** ssh (default): SSH login. daemon: rsync://host:873/module — no shell, relay only, use a tunnel. */
+  protocol?: RsyncProtocol
+  /** Daemon only: module name (a [name] in the site's rsyncd.conf). */
+  module?: string
   name: string
   host: string
   port: string
@@ -14,6 +20,8 @@ export type RsyncEndpoint = {
   path: string
   host_key_fingerprint: string
   rsync_path: string
+  /** WireGuard tunnel to the host's site (ADR 0010); forces the relay transport. */
+  tunnel_id?: string | null
   /** Target only: address the source uses to reach it in direct mode. */
   reach_host: string
   reach_port: string
@@ -87,6 +95,7 @@ export type RsyncJob = {
   exit_code?: number | null
   error?: string
   first_error?: string
+  errors?: string[]
   hint?: string
   last_message?: string
 }
@@ -121,6 +130,8 @@ export type RsyncRouteResult = {
 export const RSYNC_REDACTED = "********"
 
 export const emptyEndpoint = (): RsyncEndpoint => ({
+  protocol: "ssh",
+  module: "",
   name: "",
   host: "",
   port: "22",

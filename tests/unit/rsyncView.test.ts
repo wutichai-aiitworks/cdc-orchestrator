@@ -91,6 +91,18 @@ test("problems, output and live facts", () => {
   assert.deepEqual(runProblems(job()), [])
   const p = runProblems(job({ status: "failed", error: "source: Permission denied (publickey).", hint: "check key", first_error: "x" }))
   assert.equal(p[0].fix, "check key")
+  // Every rsync error is shown: the warning first, then the line that explains the skipped files.
+  const multi = runProblems(job({
+    status: "completed_with_errors",
+    error: "rsync exit 23: some files or attributes were not transferred",
+    first_error: 'rsync: [generator] recv_generator: mkdir "/opt/a2" failed: Permission denied (13)',
+    errors: [
+      'rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)',
+      'rsync: [generator] recv_generator: mkdir "/opt/a2" failed: Permission denied (13)',
+    ],
+  }))
+  assert.equal(multi[0].detail!.split("\n").length, 2)
+  assert.match(multi[0].detail!, /mkdir "\/opt\/a2" failed: Permission denied/)
   assert.equal(output(job({ transport: "direct", stats: { number_of_regular_files_transferred: 1, number_of_deleted_files: 2 } })), "1 file, 2 deleted, direct")
   assert.equal(output(job({ status: "failed" })), "")
   const facts = liveFacts(job({ status: "running", transport: "relay", progress: { bytes: 1, percent: 5, rate: "3MB/s", eta: "", files_total: 10, files_to_check: 4 } }))

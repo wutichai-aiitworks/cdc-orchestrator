@@ -1,22 +1,31 @@
 <script setup lang="ts">
 import type { PipelineDetailAction } from "~/components/PipelineDetail.vue"
 import {
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
+  ArrowUpDown,
+  CalendarClock,
   CheckCircle2,
   Eye,
   Filter,
   KeyRound,
+  LayoutGrid,
   Pencil,
   Plus,
+  Radar,
   RefreshCw,
   Save,
   Search,
+  Table2,
+  Tags,
   TriangleAlert,
   Wand2,
   Trash2,
   Waves,
   Zap,
 } from "@lucide/vue"
+import type { Component } from "vue"
 import type {
   CdcProfile,
   ChangeMode,
@@ -88,6 +97,7 @@ const dbTypes = DB_TYPE_OPTIONS
 const form = reactive({
   name: "",
   description: "",
+  tags: [] as string[],
   pattern: "source_to_target" as PipelinePattern,
   sourceType: "postgres" as DatabaseType,
   host: "",
@@ -518,6 +528,29 @@ const structureDiff = ref<{ source_schema: string; source_table: string; target_
 const ddlTables = ref<Array<{ source_schema: string; source_table: string; target_schema: string; target_table: string }> | null>(null)
 const pipelineSearch = ref("")
 const pipelineStatusFilter = ref("all")
+/** "all", "__untagged__", or one tag (matched case-insensitively). */
+const pipelineTagFilter = ref("all")
+const UNTAGGED = "__untagged__"
+
+type PipelineViewMode = "table" | "cards" | "tags" | "capture" | "schedule"
+const PIPELINE_VIEW_MODES: Array<{ key: PipelineViewMode; label: string; icon: Component }> = [
+  { key: "table", label: "Table", icon: Table2 },
+  { key: "cards", label: "Cards", icon: LayoutGrid },
+  { key: "tags", label: "By tag", icon: Tags },
+  { key: "capture", label: "By capture", icon: Radar },
+  { key: "schedule", label: "Schedule", icon: CalendarClock },
+]
+const { getPref, setPref } = useViewPrefs()
+const pipelineViewMode = ref<PipelineViewMode>("table")
+onMounted(() => {
+  const saved = getPref<string>("pipelines.viewMode", "table")
+  if (PIPELINE_VIEW_MODES.some((m) => m.key === saved)) pipelineViewMode.value = saved as PipelineViewMode
+})
+watch(pipelineViewMode, (mode) => setPref("pipelines.viewMode", mode))
+/** List sort: column + direction; `null` keeps the API order (newest first). */
+type PipelineSortKey = "name" | "capture" | "pattern"
+const pipelineSortKey = ref<PipelineSortKey | null>(null)
+const pipelineSortDir = ref<"asc" | "desc">("asc")
 const mappingBulkSchema = ref("")
 const mappingSearch = ref("")
 
@@ -1073,6 +1106,7 @@ const buildPayload = (): ProfilePayload => {
   return {
   name: textValue(form.name),
   description: textValue(form.description),
+  tags: [...form.tags],
   pattern: form.pattern,
   stream_platform: form.pattern === "source_to_stream" ? form.streamPlatform : null,
   transform_strategy: form.transformPreset === "none" ? "none" : "predefined",
@@ -1196,6 +1230,7 @@ const resetForm = () => {
   Object.assign(form, {
     name: "",
     description: "",
+    tags: [],
     pattern: "source_to_target",
     sourceType: "postgres",
     host: "cdc-postgres-source",
@@ -1255,6 +1290,7 @@ const resetForm = () => {
 const payloadFromProfile = (profile: CdcProfile): ProfilePayload => ({
   name: profile.name,
   description: profile.description || "",
+  tags: profile.tags ?? [],
   pattern: profile.pattern,
   stream_platform: profile.stream_platform ?? null,
   transform_strategy: profile.transform_strategy,
@@ -1278,6 +1314,21 @@ const persistAutostart = async (autostart: boolean) => {
   }
 }
 
+const tagsSaving = ref(false)
+const persistTags = async (tags: string[]) => {
+  if (!selected.value) return
+  tagsSaving.value = true
+  try {
+    await updateProfile(selected.value.id, { ...payloadFromProfile(selected.value), tags })
+    toast.success(tags.length ? "Tags saved." : "Tags cleared.")
+    await load()
+  } catch (e: any) {
+    toast.error(formatApiError(e, "Failed to save tags"))
+  } finally {
+    tagsSaving.value = false
+  }
+}
+
 const editSelected = () => {
   if (!selected.value) return
   const profile = selected.value
@@ -1290,6 +1341,7 @@ const editSelected = () => {
   Object.assign(form, {
     name: profile.name,
     description: profile.description || "",
+    tags: [...(profile.tags ?? [])],
     pattern: profile.pattern,
     sourceType: profile.source.source_type,
     host: profile.source.connection.host || "",
@@ -1527,18 +1579,28 @@ const toggleEnabled = async () => {
 
 type LifecycleAction = "start" | "pause" | "resume" | "restart" | "stop"
 
+/**
+ * A lifecycle action is in flight. Start can take several seconds (column lookup on a
+ * remote Oracle, connector creation); a second click meanwhile used to send a second
+ * Start, which the orchestrator now refuses with 409 — so don't send it at all.
+ */
+const actionBusy = ref(false)
+
 const execute = async (action: LifecycleAction) => {
-  if (!selected.value) return
+  if (!selected.value || actionBusy.value) return
   if ((action === "start" || action === "restart") && !canStartSelected.value) {
     toast.warning(startBlockedReason(selected.value.pattern) || "Only replica pipelines can Start in this phase.")
     return
   }
+  actionBusy.value = true
   try {
     await runAction(selected.value.id, action)
     toast.success(`${action[0].toUpperCase()}${action.slice(1)} requested.`)
     await load()
   } catch (e: any) {
     error.value = formatApiError(e, "Pipeline action failed")
+  } finally {
+    actionBusy.value = false
   }
 }
 
@@ -1996,15 +2058,53 @@ const pipelineRoute = (profile: CdcProfile) => {
   return `${source} → ${profile.stream_platform || "stream"}`
 }
 
+/** Click a header: first click sorts ascending, second flips, third returns to API order. */
+const togglePipelineSort = (key: PipelineSortKey) => {
+  if (pipelineSortKey.value !== key) {
+    pipelineSortKey.value = key
+    pipelineSortDir.value = "asc"
+  } else if (pipelineSortDir.value === "asc") {
+    pipelineSortDir.value = "desc"
+  } else {
+    pipelineSortKey.value = null
+    pipelineSortDir.value = "asc"
+  }
+}
+
+const pipelineSortValue = (profile: CdcProfile, key: PipelineSortKey) => {
+  switch (key) {
+    case "name":
+      return profile.name || ""
+    case "capture":
+      return captureModeLabel(profile)
+    case "pattern":
+      return patternLabel(profile)
+  }
+}
+
+const pipelineSortIcon = (key: PipelineSortKey) =>
+  pipelineSortKey.value !== key ? ArrowUpDown : pipelineSortDir.value === "asc" ? ArrowUp : ArrowDown
+
+const pipelineAriaSort = (key: PipelineSortKey) =>
+  pipelineSortKey.value !== key ? "none" : pipelineSortDir.value === "asc" ? "ascending" : "descending"
+
 const filteredProfiles = computed(() => {
   const query = pipelineSearch.value.trim().toLowerCase()
   const status = pipelineStatusFilter.value
-  return profiles.value.filter((profile) => {
+  const key = pipelineSortKey.value
+  const dir = pipelineSortDir.value === "asc" ? 1 : -1
+  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true })
+  const tag = pipelineTagFilter.value
+  const matches = profiles.value.filter((profile) => {
     if (status !== "all" && String(profile.status || "").toLowerCase() !== status) return false
+    const tags = profile.tags ?? []
+    if (tag === UNTAGGED && tags.length) return false
+    if (tag !== "all" && tag !== UNTAGGED && !tags.some((t) => t.toLowerCase() === tag.toLowerCase())) return false
     if (!query) return true
     const haystack = [
       profile.name,
       profile.description,
+      ...tags,
       profile.status,
       profile.source.source_type,
       profile.target?.target_type,
@@ -2018,7 +2118,58 @@ const filteredProfiles = computed(() => {
       .toLowerCase()
     return haystack.includes(query)
   })
+  if (!key) return matches
+  // Stable: equal keys keep the API order, and ties on capture/pattern fall back to name.
+  return [...matches].sort((a, b) => {
+    const primary = collator.compare(pipelineSortValue(a, key), pipelineSortValue(b, key))
+    if (primary) return primary * dir
+    return key === "name" ? 0 : collator.compare(a.name || "", b.name || "")
+  })
 })
+
+/** Every tag in use, first spelling wins, sorted for the filter and suggestions. */
+const allTags = computed(() => {
+  const seen = new Map<string, string>()
+  for (const profile of profiles.value) {
+    for (const tag of profile.tags ?? []) {
+      const fold = tag.toLowerCase()
+      if (!seen.has(fold)) seen.set(fold, tag)
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }))
+})
+
+/** Tag view: one group per tag (a pipeline with two tags shows in both), untagged last. */
+const profilesByTag = computed(() => {
+  const groups = new Map<string, { key: string; label: string; items: CdcProfile[] }>()
+  for (const tag of allTags.value) groups.set(tag.toLowerCase(), { key: tag, label: tag, items: [] })
+  const untagged: CdcProfile[] = []
+  for (const profile of filteredProfiles.value) {
+    const tags = profile.tags ?? []
+    if (!tags.length) untagged.push(profile)
+    for (const tag of tags) groups.get(tag.toLowerCase())?.items.push(profile)
+  }
+  const out = [...groups.values()].filter((g) => g.items.length)
+  if (untagged.length) out.push({ key: UNTAGGED, label: "Untagged", items: untagged })
+  return out
+})
+
+/**
+ * Capture view: one group per capture mode, in catalog order, empty groups hidden.
+ * Missing/unknown modes fold into "logical" so headers agree with captureModeLabel().
+ */
+const profilesByCapture = computed(() => {
+  const groups = new Map(
+    captureModeCatalog.map((c) => [c.value, { key: c.value, label: c.title, description: c.description, items: [] as CdcProfile[] }])
+  )
+  for (const profile of filteredProfiles.value) {
+    const mode = String(profile.source.capture_mode || "logical").toLowerCase() as CaptureMode
+    ;(groups.get(mode) ?? groups.get("logical")!).items.push(profile)
+  }
+  return [...groups.values()].filter((g) => g.items.length)
+})
+
+const visibleProfileIds = computed(() => new Set(filteredProfiles.value.map((p) => p.id)))
 
 const statusFilterOptions = computed(() => {
   const seen = new Set<string>()
@@ -3275,6 +3426,13 @@ onUnmounted(() => {
                 placeholder="What this pipeline captures and where it writes."
               />
             </label>
+            <div>
+              <span class="auth-label">Tags</span>
+              <PipelineTagInput v-model="form.tags" :suggestions="allTags" />
+              <p class="mt-1 text-xs text-muted-foreground">
+                Group pipelines in the list, e.g. by system, team or schedule. Press Enter or comma to add.
+              </p>
+            </div>
           </div>
           <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
             <div class="rounded-xl border border-border bg-muted/50 p-4">
@@ -3366,12 +3524,12 @@ onUnmounted(() => {
 
     <template v-else>
       <AppCard>
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-4">
           <label class="sm:col-span-2">
             <span class="auth-label">Search</span>
             <div class="relative">
               <Search class="pointer-events-none absolute left-3 top-3 h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
-              <AppInput v-model="pipelineSearch" input-class="pl-9" placeholder="Search name, source, or target..." />
+              <AppInput v-model="pipelineSearch" input-class="pl-9" placeholder="Search name, tag, source, or target..." />
             </div>
           </label>
           <label>
@@ -3382,95 +3540,274 @@ onUnmounted(() => {
               </option>
             </AppSelect>
           </label>
+          <label>
+            <span class="auth-label">Tag</span>
+            <AppSelect v-model="pipelineTagFilter" aria-label="Filter pipelines by tag">
+              <option value="all">All tags</option>
+              <option v-for="tag in allTags" :key="tag" :value="tag">{{ tag }}</option>
+              <option :value="UNTAGGED">Untagged</option>
+            </AppSelect>
+          </label>
         </div>
       </AppCard>
 
       <AppCard>
-        <div class="mb-3 text-xs text-muted-foreground">
-          {{ filteredProfiles.length }}{{ filteredProfiles.length !== profiles.length ? ` of ${profiles.length}` : "" }}
-          pipeline{{ filteredProfiles.length === 1 ? "" : "s" }}
+        <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <p class="text-xs text-muted-foreground">
+            {{ filteredProfiles.length }}{{ filteredProfiles.length !== profiles.length ? ` of ${profiles.length}` : "" }}
+            pipeline{{ filteredProfiles.length === 1 ? "" : "s" }}
+            <button
+              v-if="pipelineTagFilter !== 'all'"
+              type="button"
+              class="ml-2 text-brand-600 hover:underline dark:text-brand-400"
+              @click="pipelineTagFilter = 'all'"
+            >
+              Clear tag filter
+            </button>
+          </p>
+          <div class="inline-flex rounded-lg border border-border bg-muted/40 p-0.5" role="tablist" aria-label="Pipeline view">
+            <button
+              v-for="mode in PIPELINE_VIEW_MODES"
+              :key="mode.key"
+              type="button"
+              role="tab"
+              :aria-selected="pipelineViewMode === mode.key"
+              class="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors"
+              :class="pipelineViewMode === mode.key ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+              @click="pipelineViewMode = mode.key"
+            >
+              <component :is="mode.icon" class="h-3.5 w-3.5" :stroke-width="1.75" />
+              <span class="hidden sm:inline">{{ mode.label }}</span>
+            </button>
+          </div>
         </div>
-        <AppTable>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Source → target</th>
-              <th>Capture</th>
-              <th>Pattern</th>
-              <th>Status</th>
-              <th class="w-28" />
-            </tr>
-          </thead>
-          <tbody>
-            <tr
+
+        <template v-if="pipelineViewMode === 'table'">
+          <AppTable>
+            <thead>
+              <tr>
+                <th
+                  v-for="col in ([
+                    { key: 'name', label: 'Name' },
+                    { key: null, label: 'Source → target' },
+                    { key: 'capture', label: 'Capture' },
+                    { key: 'pattern', label: 'Pattern' },
+                  ] as Array<{ key: PipelineSortKey | null; label: string }>)"
+                  :key="col.label"
+                  :aria-sort="col.key ? pipelineAriaSort(col.key) : undefined"
+                >
+                  <button
+                    v-if="col.key"
+                    type="button"
+                    class="group/sort -mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground"
+                    :class="pipelineSortKey === col.key ? 'text-foreground' : ''"
+                    :title="`Sort by ${col.label.toLowerCase()}`"
+                    @click="togglePipelineSort(col.key)"
+                  >
+                    {{ col.label }}
+                    <component
+                      :is="pipelineSortIcon(col.key)"
+                      class="h-3.5 w-3.5 shrink-0"
+                      :class="pipelineSortKey === col.key ? 'opacity-100' : 'opacity-40 group-hover/sort:opacity-80'"
+                      :stroke-width="1.75"
+                    />
+                  </button>
+                  <template v-else>{{ col.label }}</template>
+                </th>
+                <th>Status</th>
+                <th class="w-28" />
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="profile in filteredProfiles"
+                :key="profile.id"
+                class="group cursor-pointer"
+                :class="{ 'bg-brand-500/5': selectedId === profile.id }"
+                @click="selectPipeline(profile.id)"
+              >
+                <td>
+                  <div class="flex items-center gap-1.5">
+                    <p class="font-medium">{{ profile.name }}</p>
+                    <!-- Description sits behind an icon so long notes don't widen the table. -->
+                    <AppInfoHint
+                      v-if="profile.description"
+                      :text="profile.description"
+                      :aria-label="`About ${profile.name}`"
+                    />
+                  </div>
+                  <div v-if="profile.tags?.length" class="mt-1 flex flex-wrap gap-1" @click.stop>
+                    <button
+                      v-for="tag in profile.tags"
+                      :key="tag"
+                      type="button"
+                      class="tag-chip hover:bg-brand-500/20"
+                      :title="`Show only '${tag}'`"
+                      @click="pipelineTagFilter = tag"
+                    >
+                      {{ tag }}
+                    </button>
+                  </div>
+                </td>
+                <td>
+                  <div class="flex items-center gap-1.5">
+                    <AppDbIcon :type="profile.source.source_type" size="sm" class="opacity-90" />
+                    <ArrowRight class="h-3 w-3 shrink-0 text-muted-foreground" :stroke-width="1.75" />
+                    <AppDbIcon
+                      v-if="profile.pattern === 'source_to_target'"
+                      :type="profile.target?.target_type || 'postgres'"
+                      size="sm"
+                      class="opacity-90"
+                    />
+                    <Waves v-else class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
+                  </div>
+                  <p class="mt-1 font-mono text-xs text-muted-foreground">{{ pipelineRoute(profile) }}</p>
+                </td>
+                <td>{{ captureModeLabel(profile) }}</td>
+                <td>{{ patternLabel(profile) }}</td>
+                <td><AppStatusBadge :status="profile.status" /></td>
+                <td>
+                  <div class="flex items-center justify-end gap-1" @click.stop>
+                    <button
+                      type="button"
+                      class="icon-button"
+                      :title="profile.status === 'draft' ? 'Continue setup' : 'Edit'"
+                      @click="openEdit(profile)"
+                    >
+                      <Pencil class="h-4 w-4" :stroke-width="1.75" />
+                    </button>
+                    <button
+                      type="button"
+                      class="icon-button text-red-500"
+                      title="Delete"
+                      @click="pendingDelete = profile"
+                    >
+                      <Trash2 class="h-4 w-4" :stroke-width="1.75" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="loading && !profiles.length">
+                <td colspan="6" class="py-6 text-center text-sm text-muted-foreground">Loading pipelines…</td>
+              </tr>
+              <tr v-else-if="!filteredProfiles.length">
+                <td colspan="6">
+                  <AppStateBlock
+                    kind="empty"
+                    :message="profiles.length ? 'No pipelines match this search.' : 'No pipelines configured yet. Use New Pipeline to add one.'"
+                  />
+                </td>
+              </tr>
+            </tbody>
+          </AppTable>
+        </template>
+
+        <template v-else-if="pipelineViewMode === 'cards'">
+          <div v-if="filteredProfiles.length" class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <PipelineCard
               v-for="profile in filteredProfiles"
               :key="profile.id"
-              class="group cursor-pointer"
-              :class="{ 'bg-brand-500/5': selectedId === profile.id }"
-              @click="selectPipeline(profile.id)"
-            >
-              <td>
-                <div class="flex items-center gap-1.5">
-                  <p class="font-medium">{{ profile.name }}</p>
-                  <!-- Description sits behind an icon so long notes don't widen the table. -->
-                  <AppInfoHint
-                    v-if="profile.description"
-                    :text="profile.description"
-                    :aria-label="`About ${profile.name}`"
-                  />
-                </div>
-              </td>
-              <td>
-                <div class="flex items-center gap-1.5">
-                  <AppDbIcon :type="profile.source.source_type" size="sm" class="opacity-90" />
-                  <ArrowRight class="h-3 w-3 shrink-0 text-muted-foreground" :stroke-width="1.75" />
-                  <AppDbIcon
-                    v-if="profile.pattern === 'source_to_target'"
-                    :type="profile.target?.target_type || 'postgres'"
-                    size="sm"
-                    class="opacity-90"
-                  />
-                  <Waves v-else class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
-                </div>
-                <p class="mt-1 font-mono text-xs text-muted-foreground">{{ pipelineRoute(profile) }}</p>
-              </td>
-              <td>{{ captureModeLabel(profile) }}</td>
-              <td>{{ patternLabel(profile) }}</td>
-              <td><AppStatusBadge :status="profile.status" /></td>
-              <td>
-                <div class="flex items-center justify-end gap-1" @click.stop>
-                  <button
-                    type="button"
-                    class="icon-button"
-                    :title="profile.status === 'draft' ? 'Continue setup' : 'Edit'"
-                    @click="openEdit(profile)"
-                  >
-                    <Pencil class="h-4 w-4" :stroke-width="1.75" />
-                  </button>
-                  <button
-                    type="button"
-                    class="icon-button text-red-500"
-                    title="Delete"
-                    @click="pendingDelete = profile"
-                  >
-                    <Trash2 class="h-4 w-4" :stroke-width="1.75" />
-                  </button>
-                </div>
-              </td>
-            </tr>
-            <tr v-if="loading && !profiles.length">
-              <td colspan="6" class="py-6 text-center text-sm text-muted-foreground">Loading pipelines…</td>
-            </tr>
-            <tr v-else-if="!filteredProfiles.length">
-              <td colspan="6">
-                <AppStateBlock
-                  kind="empty"
-                  :message="profiles.length ? 'No pipelines match this search.' : 'No pipelines configured yet. Use New Pipeline to add one.'"
+              :profile="profile"
+              :route="pipelineRoute(profile)"
+              :capture="captureModeLabel(profile)"
+              :pattern="patternLabel(profile)"
+              :selected="selectedId === profile.id"
+              @select="selectPipeline(profile.id)"
+              @edit="openEdit(profile)"
+              @delete="pendingDelete = profile"
+              @tag="pipelineTagFilter = $event"
+            />
+          </div>
+          <AppStateBlock
+            v-else
+            :kind="loading && !profiles.length ? 'loading' : 'empty'"
+            :message="loading && !profiles.length ? 'Loading pipelines…' : profiles.length ? 'No pipelines match this search.' : 'No pipelines configured yet. Use New Pipeline to add one.'"
+          />
+        </template>
+
+        <template v-else-if="pipelineViewMode === 'tags'">
+          <div v-if="profilesByTag.length" class="space-y-5">
+            <section v-for="group in profilesByTag" :key="group.key">
+              <h3 class="mb-2 flex items-center gap-2 text-sm font-semibold text-foreground">
+                <Tags class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
+                <button
+                  v-if="group.key !== UNTAGGED"
+                  type="button"
+                  class="hover:underline"
+                  :title="`Show only '${group.label}'`"
+                  @click="pipelineTagFilter = group.key"
+                >
+                  {{ group.label }}
+                </button>
+                <span v-else class="text-muted-foreground">{{ group.label }}</span>
+                <span class="badge-neutral">{{ group.items.length }}</span>
+              </h3>
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <PipelineCard
+                v-for="profile in group.items"
+                :key="profile.id"
+                :profile="profile"
+                :route="pipelineRoute(profile)"
+                :capture="captureModeLabel(profile)"
+                :pattern="patternLabel(profile)"
+                :selected="selectedId === profile.id"
+                @select="selectPipeline(profile.id)"
+                @edit="openEdit(profile)"
+                @delete="pendingDelete = profile"
+                @tag="pipelineTagFilter = $event"
+              />
+              </div>
+            </section>
+          </div>
+          <AppStateBlock
+            v-else
+            :kind="loading && !profiles.length ? 'loading' : 'empty'"
+            :message="loading && !profiles.length ? 'Loading pipelines…' : profiles.length ? 'No pipelines match this search.' : 'No pipelines configured yet. Use New Pipeline to add one.'"
+          />
+          <p v-if="profilesByTag.length && !allTags.length" class="mt-3 text-xs text-muted-foreground">
+            No tags yet. Edit a pipeline and add tags on the first step to group it here.
+          </p>
+        </template>
+
+        <template v-else-if="pipelineViewMode === 'capture'">
+          <div v-if="profilesByCapture.length" class="space-y-5">
+            <section v-for="group in profilesByCapture" :key="group.key">
+              <h3 class="flex items-center gap-2 text-sm font-semibold text-foreground">
+                <Radar class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
+                {{ group.label }}
+                <span class="badge-neutral">{{ group.items.length }}</span>
+              </h3>
+              <p class="mb-2 mt-0.5 text-xs text-muted-foreground">{{ group.description }}</p>
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                <PipelineCard
+                  v-for="profile in group.items"
+                  :key="profile.id"
+                  :profile="profile"
+                  :route="pipelineRoute(profile)"
+                  :capture="captureModeLabel(profile)"
+                  :pattern="patternLabel(profile)"
+                  :selected="selectedId === profile.id"
+                  @select="selectPipeline(profile.id)"
+                  @edit="openEdit(profile)"
+                  @delete="pendingDelete = profile"
+                  @tag="pipelineTagFilter = $event"
                 />
-              </td>
-            </tr>
-          </tbody>
-        </AppTable>
+              </div>
+            </section>
+          </div>
+          <AppStateBlock
+            v-else
+            :kind="loading && !profiles.length ? 'loading' : 'empty'"
+            :message="loading && !profiles.length ? 'Loading pipelines…' : profiles.length ? 'No pipelines match this search.' : 'No pipelines configured yet. Use New Pipeline to add one.'"
+          />
+        </template>
+
+        <PipelineScheduleView
+          v-else
+          :visible-ids="visibleProfileIds"
+          :selected-id="selectedId"
+          @select="selectPipeline"
+        />
       </AppCard>
 
       <PipelineDetail
@@ -3484,8 +3821,12 @@ onUnmounted(() => {
         :can-start="canStartSelected"
         :start-blocked-reason="startBlockedReason(selected.pattern) || ''"
         :supports-test-sync="supportsCappedTableCopy"
+        :busy="actionBusy"
         @action="onDetailAction"
         @autostart="persistAutostart"
+        :tag-suggestions="allTags"
+        :tags-saving="tagsSaving"
+        @tags="persistTags"
       />
     </template>
 

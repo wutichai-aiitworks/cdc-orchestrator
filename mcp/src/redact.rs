@@ -57,11 +57,23 @@ fn walk(v: &mut Value) {
 /// `key=value` / `"key":"value"` / `key: value` forms that appear in logs, conninfo strings
 /// and error bodies. Lowercase needles; matching is ASCII case-insensitive.
 const NEEDLES: &[&str] = &[
-    "password=", "password\":\"", "password\": \"", "password: ", "passwd=", "pwd=",
-    "secret=", "secret\":\"", "token=", "token\":\"", "apikey=", "api_key=",
+    "password=",
+    "password\":\"",
+    "password\": \"",
+    "password: ",
+    "passwd=",
+    "pwd=",
+    "secret=",
+    "secret\":\"",
+    "token=",
+    "token\":\"",
+    "apikey=",
+    "api_key=",
 ];
 
-const STOP: &[char] = &[' ', '\t', '\n', '\r', '&', ';', '"', '\'', ',', '}', ')', ']'];
+const STOP: &[char] = &[
+    ' ', '\t', '\n', '\r', '&', ';', '"', '\'', ',', '}', ')', ']',
+];
 
 /// Mask secrets inside free text: `password=…` style pairs and the password in
 /// `scheme://user:password@host` URIs.
@@ -84,7 +96,9 @@ pub(crate) fn redact_text(s: &str) -> String {
     while let Some(pos) = s[from..].find("://") {
         let auth_start = from + pos + 3;
         let rest = &s[auth_start..];
-        let auth_end = rest.find(|c: char| c == '/' || c.is_whitespace()).unwrap_or(rest.len());
+        let auth_end = rest
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(rest.len());
         if let Some(at) = rest[..auth_end].rfind('@') {
             if let Some(colon) = rest[..at].find(':') {
                 let (a, b) = (auth_start + colon + 1, auth_start + at);
@@ -141,17 +155,29 @@ mod tests {
 
     #[test]
     fn masks_secrets_in_free_text() {
-        assert_eq!(redact_text("host=db password=s3cr3t user=u"), "host=db password=******** user=u");
+        assert_eq!(
+            redact_text("host=db password=s3cr3t user=u"),
+            "host=db password=******** user=u"
+        );
         assert_eq!(redact_text("PASSWORD=abc&x=1"), "PASSWORD=********&x=1");
-        assert_eq!(redact_text(r#"{"password":"abc"}"#), r#"{"password":"********"}"#);
+        assert_eq!(
+            redact_text(r#"{"password":"abc"}"#),
+            r#"{"password":"********"}"#
+        );
         assert_eq!(
             redact_text("postgres://user:p%40ss@db:5432/app and mongodb://u:pw@m/x"),
             "postgres://user:********@db:5432/app and mongodb://u:********@m/x"
         );
-        assert_eq!(redact_text("https://example.com/path"), "https://example.com/path");
+        assert_eq!(
+            redact_text("https://example.com/path"),
+            "https://example.com/path"
+        );
         assert_eq!(redact_text("http://user@host/"), "http://user@host/");
         assert_eq!(redact_text("password=********"), "password=********");
-        assert_eq!(redact_text("ทดสอบ password=ค่า ok"), "ทดสอบ password=******** ok");
+        assert_eq!(
+            redact_text("ทดสอบ password=ค่า ok"),
+            "ทดสอบ password=******** ok"
+        );
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub enum AppError {
     BadRequest(String),
     Unauthorized(String),
     NotFound(String),
+    /// Another request is already acting on the same resource (HTTP 409).
+    Conflict(String),
     Upstream(String),
     Internal(String),
 }
@@ -19,6 +21,7 @@ impl fmt::Display for AppError {
             Self::BadRequest(m)
             | Self::Unauthorized(m)
             | Self::NotFound(m)
+            | Self::Conflict(m)
             | Self::Upstream(m)
             | Self::Internal(m) => write!(f, "{m}"),
         }
@@ -39,6 +42,7 @@ impl AppError {
             Self::BadRequest(m)
             | Self::Unauthorized(m)
             | Self::NotFound(m)
+            | Self::Conflict(m)
             | Self::Upstream(m)
             | Self::Internal(m) => m.clone(),
         }
@@ -60,6 +64,7 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
             Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };

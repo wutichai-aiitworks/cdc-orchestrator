@@ -313,6 +313,7 @@ mod tests {
 
     fn pg(host: &str) -> SchemaCompareConn {
         SchemaCompareConn {
+            tunnel_id: None,
             db_type: "postgres".into(),
             host: host.into(),
             port: "5432".into(),

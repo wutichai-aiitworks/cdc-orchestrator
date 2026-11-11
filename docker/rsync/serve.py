@@ -54,6 +54,14 @@ RSYNC = os.environ.get("RSYNC_BIN", "rsync")
 SSH = os.environ.get("RSYNC_SSH_BIN", "ssh")
 
 TRANSPORTS = ("auto", "direct", "relay")
+# ssh: log in over SSH and run rsync there. daemon: the host runs `rsync --daemon` (rsync://,
+# port 873, modules from rsyncd.conf) — no shell; always relayed; meant for a WireGuard tunnel.
+PROTOCOLS = ("ssh", "daemon")
+DAEMON_PORT = 873
+MODULE_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$")
+# A daemon speaks GNU rsync (3.x): what the client may assume about it.
+DAEMON_FLAVOR = {"path": "rsync://", "version": "rsync daemon", "gnu": True, "openrsync": False,
+                 "major_minor": None, "progress": False, "protect_args": True}
 ACTIVE = ("starting", "running")
 SOURCE_ALIAS = "cdc-rsync-source"
 TARGET_ALIAS = "cdc-rsync-target"
@@ -125,10 +133,75 @@ def _clean_path(raw: Any, where: str) -> str:
     return path
 
 
+def norm_daemon_endpoint(raw: dict[str, Any], role: str) -> dict[str, Any]:
+    """One rsync daemon (rsync://host:port/module/path). The user and password are the daemon's
+    own (rsyncd `auth users` / secrets file), not a system login; both empty = anonymous module."""
+    host = str(raw.get("host") or "").strip()
+    if not host or not HOST_RE.match(host) or host.startswith("-"):
+        raise BadRequest(f"{role}.host is required and must be a hostname or IP")
+    port = str(raw.get("port") or DAEMON_PORT).strip()
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise BadRequest(f"{role}.port must be 1-65535")
+    module = str(raw.get("module") or "").strip().strip("/")
+    if not MODULE_RE.match(module):
+        raise BadRequest(f"{role}.module is required (the [name] in the site's rsyncd.conf: letters, digits, . _ -)")
+    path = str(raw.get("path") or "").strip()
+    if path.startswith("~/") or path == "~":
+        path = path[2:]
+    if len(path) > 4096 or any(c in path for c in "\r\n\0") or path.startswith("-"):
+        raise BadRequest(f"{role}.path (inside the module) contains invalid characters")
+    if any(part == ".." for part in path.split("/")):
+        raise BadRequest(f"{role}.path must stay inside the module (no '..')")
+    user = str(raw.get("username") or "").strip()
+    if user and not USER_RE.match(user):
+        raise BadRequest(f"{role}.username must be letters, digits, . _ -")
+    password = str(raw.get("password") or "")
+    if user and not password:
+        raise BadRequest(f"{role}.password is required with a username (the user's line in the daemon's secrets file)")
+    if password and not user:
+        raise BadRequest(f"{role}.username is required with a password")
+    return {
+        "protocol": "daemon",
+        "name": str(raw.get("name") or host).strip()[:60],
+        "host": host, "port": int(port), "module": module, "path": path.lstrip("/"),
+        "username": user, "password": password, "auth": "password" if user else "none",
+        "private_key": "", "passphrase": "", "host_key_fingerprint": "", "rsync_path": "",
+        "reach_host": "", "reach_port": None,
+    }
+
+
+def is_daemon(e: dict[str, Any]) -> bool:
+    return e.get("protocol") == "daemon"
+
+
+def daemon_url(e: dict[str, Any], *, as_dir: bool = False) -> str:
+    """rsync://[user@]host:port/module/path. A source keeps its trailing-slash meaning; `as_dir`
+    (targets, listings) always ends in /."""
+    user = f"{e['username']}@" if e["username"] else ""
+    path = e["path"]
+    if as_dir:
+        path = path.rstrip("/") + "/" if path else ""
+    return f"rsync://{user}{host_spec(e['host'])}:{e['port']}/{e['module']}/{path}"
+
+
+def daemon_env(e: dict[str, Any]) -> dict[str, str]:
+    """The daemon password goes in RSYNC_PASSWORD (never on the command line)."""
+    env = base_env()
+    env.pop("RSYNC_PASSWORD", None)
+    if e["password"]:
+        env["RSYNC_PASSWORD"] = e["password"]
+    return env
+
+
 def norm_endpoint(raw: Any, role: str) -> dict[str, Any]:
-    """Validate one SSH host (source or target). Secrets stay in memory only."""
+    """Validate one host (source or target): SSH login, or rsync daemon. Secrets stay in memory only."""
     if not isinstance(raw, dict) or not raw:
         raise BadRequest(f"{role} is required")
+    protocol = str(raw.get("protocol") or "ssh").strip().lower()
+    if protocol not in PROTOCOLS:
+        raise BadRequest(f"{role}.protocol must be 'ssh' or 'daemon'")
+    if protocol == "daemon":
+        return norm_daemon_endpoint(raw, role)
     host = str(raw.get("host") or "").strip()
     if not host or not HOST_RE.match(host) or host.startswith("-"):
         raise BadRequest(f"{role}.host is required and must be a hostname or IP")
@@ -160,6 +233,7 @@ def norm_endpoint(raw: Any, role: str) -> dict[str, Any]:
     if reach_port and (not reach_port.isdigit() or not 1 <= int(reach_port) <= 65535):
         raise BadRequest(f"{role}.reach_port must be 1-65535")
     return {
+        "protocol": "ssh",
         "name": str(raw.get("name") or host).strip()[:60],
         "host": host, "port": int(port), "username": user, "auth": auth,
         "password": password if auth == "password" else "",
@@ -176,6 +250,8 @@ def norm_endpoint(raw: Any, role: str) -> dict[str, Any]:
 
 def describe_endpoint(e: dict[str, Any]) -> str:
     """Credential-free description for job status."""
+    if is_daemon(e):
+        return daemon_url(e)
     return f"{e['username']}@{e['host']}:{e['port']}:{e['path']}"
 
 
@@ -229,6 +305,8 @@ def validate_request(body: dict[str, Any]) -> dict[str, Any]:
         raise BadRequest(f"options.transport must be one of {list(TRANSPORTS)}")
     source = norm_endpoint(body.get("source"), "source")
     target = norm_endpoint(body.get("target"), "target")
+    if transport == "direct" and (is_daemon(source) or is_daemon(target)):
+        raise BadRequest("transport=direct needs SSH on both hosts; an rsync daemon endpoint always uses the relay")
     if transport == "direct" and target["auth"] != "key":
         raise BadRequest("transport=direct needs key auth on the target (the key is forwarded through the "
                          "source's SSH session); use auto or relay for password targets")
@@ -346,6 +424,10 @@ def probe_script(path: str, rsync_path: str = "") -> str:
         'd="$p"; while [ ! -e "$d" ]; do n=$(dirname "$d"); [ "$n" = "$d" ] && break; d="$n"; done\n'
         'df -Pk "$d" 2>/dev/null | awk \'NR==2 {print "free_kb=" $4}\'\n'
         'if [ -w "$d" ]; then echo writable=1; else echo writable=0; fi\n'
+        # Only the owner (or root) may set a folder's mtime/mode: a writable-but-foreign
+        # target root (e.g. /opt) makes --archive exit 23 on "failed to set times".
+        'if [ -e "$p" ]; then if [ -O "$p" ]; then echo owner=1; else echo owner=0; fi; fi\n'
+        'echo "uid=$(id -u 2>/dev/null)"\n'
         'if command -v ssh >/dev/null 2>&1; then echo ssh=1; else echo ssh=0; fi\n'
         'echo probe=ok\n'
     )
@@ -360,9 +442,9 @@ def parse_probe(text: str) -> dict[str, Any]:
             out["rsync_candidates"].append({"path": path, **rsync_flavor(version)})
         elif key == "free_kb" and value.strip().isdigit():
             out["free_bytes"] = int(value) * 1024
-        elif key in ("writable", "ssh"):
+        elif key in ("writable", "ssh", "owner"):
             out[key] = value.strip() == "1"
-        elif key in ("os", "release", "arch", "kind", "probe"):
+        elif key in ("os", "release", "arch", "kind", "probe", "uid"):
             out[key] = value.strip()
     out["rsync"] = pick_rsync(out["rsync_candidates"])
     return out
@@ -388,6 +470,55 @@ def rsync_hint(probe: dict[str, Any]) -> str | None:
         return (f"{r['path']} is {'openrsync' if r['openrsync'] else 'an old rsync'}: no live progress, ACLs or "
                 f"xattrs. Install GNU rsync (brew install rsync); it is picked up from {brew} automatically.")
     return None
+
+
+TARGET_ACCESS_HINT = ("Sync into a folder this login owns (for example /home/{user}/…), give the login access on the "
+                      "target (sudo chown -R {user} <folder>, or sudo setfacl -R -m u:{user}:rwx <folder>), or log "
+                      "in as a user that can write there.")
+
+
+def target_access(e: dict[str, Any], probe: dict[str, Any]) -> str | None:
+    """Preflight for the target folder, before rsync touches anything.
+
+    - not writable by the login → StepFailed with a fix (rsync would fail on every file);
+    - writable but owned by someone else → a note: --archive will try to copy the root
+      folder's own mtime/group/mode, which only its owner or root may set (see root_attrs_only)."""
+    if probe.get("uid") == "0":
+        return None
+    user, path, host = e["username"], e["path"], e["host"]
+    if probe.get("writable") is False:
+        if probe.get("kind") == "missing":
+            msg = f"{user} cannot create {path} on {host}: its parent folder is not writable for this login"
+        else:
+            msg = f"{user} cannot write to {path} on {host}"
+        raise StepFailed(msg, TARGET_ACCESS_HINT.format(user=user))
+    if probe.get("kind") == "dir" and probe.get("owner") is False:
+        return (f"{path} on {host} belongs to another user, so {user} cannot change that folder's own "
+                "timestamp, group or mode; files inside are copied normally")
+    return None
+
+
+# rsync names the transfer root `<dest>/.`; subfolders never end in "/.".
+_ROOT_ATTR = re.compile(
+    r'^rsync: (?:\[\w+\] )?(?:failed to set (?:times|permissions) on "(?P<a>[^"]*)"'
+    r'|(?:chgrp|chown|lchown) "(?P<b>[^"]*)" failed)'
+    r": Operation not permitted")
+
+
+def root_attrs_only(log_tail: str) -> bool:
+    """True when every rsync error is an attribute change refused on the transfer root folder
+    (non-owner login): all files transferred, only `<target>/.`'s mtime/group/mode differ."""
+    errors = [ln.strip() for ln in log_tail.splitlines()
+              if ln.startswith("rsync: ") or ln.startswith("rsync error")]
+    real = [ln for ln in errors if not ln.startswith("rsync error")]
+    if not real:
+        return False
+    for ln in real:
+        m = _ROOT_ATTR.match(ln)
+        p = m and (m.group("a") or m.group("b"))
+        if not p or not (p == "." or p.endswith("/.")):
+            return False
+    return True
 
 
 # ── rsync command lines (unit-tested) ────────────────────────────────────────
@@ -592,6 +723,22 @@ PARTIAL_EXITS = (23, 24, 25)
 
 def hint_for(log_tail: str) -> str | None:
     s = log_tail.lower()
+    # rsync daemon (rsync://) answers
+    if "@error: auth failed" in s:
+        return ("The rsync daemon refused the user/password: check the module's `auth users` and the user's line "
+                "in its `secrets file` (user:password, file mode 600).")
+    if "@error: unknown module" in s:
+        return "No such module on the rsync daemon: use a [name] from its rsyncd.conf (rsync rsync://host/ lists them)."
+    if "@error: access denied" in s:
+        return ("The rsync daemon does not allow this address: add the gateway's tunnel IP to the module's "
+                "`hosts allow` (or the address the sidecar connects from).")
+    if "module is read only" in s or "@error: module is read-only" in s:
+        return "The target module is read-only: set `read only = no` for it in rsyncd.conf (and restart rsync)."
+    if "@error: max connections" in s:
+        return "The rsync daemon reached its `max connections`; try again later or raise the limit."
+    if "failed to connect to" in s and ("connection refused" in s or ":873" in s):
+        return ("Nothing answers on the rsync daemon port: start it at the site (systemctl enable --now rsync) and "
+                "check `address`/`port` in rsyncd.conf and the host firewall.")
     if "host key verification failed" in s or "host key mismatch" in s:
         return "SSH host key check failed. If the server was reinstalled, update or clear the pinned fingerprint."
     if any(x in s for x in ("permission denied (publickey", "permission denied, please try again",
@@ -611,19 +758,48 @@ def hint_for(log_tail: str) -> str | None:
         return "A disk is full (the target, or the relay staging volume)."
     if "max-delete" in s:
         return "More files would be deleted than max_delete allows. Preview the run, then raise the limit if expected."
+    # A denied mkdir/open/write blocks files; check it before the cosmetic "set times" warning,
+    # which often appears alongside it and alone would wrongly say the files were written.
     if "permission denied" in s:
+        if "mkdir" in s or "recv_generator" in s:
+            return ("The login cannot create folders in the target path. Sync into a folder the login owns "
+                    "(e.g. mkdir /opt/sync && chown <login> /opt/sync), or run as a user that can write there.")
         return "The login lacks permission on some files; sync as a user that can read the source and write the target."
+    if ("failed to set times on" in s or "failed to set permissions on" in s) and "operation not permitted" in s:
+        return ("The files were written, but the login does not own some target folders, so rsync could not set "
+                "their timestamps or modes. Sync into a folder the login owns, or run as that folder's owner.")
     if "vanished" in s:
         return "Files changed while syncing; run again, or sync from a snapshot."
     return None
 
 
-def first_error(log_tail: str) -> str | None:
+def _is_error_line(low: str) -> bool:
+    return low.startswith("rsync error") or low.startswith("rsync: ") or "permission denied" in low or "ssh:" in low
+
+
+def rsync_errors(log_tail: str, limit: int = 12) -> list[str]:
+    """Every distinct rsync/ssh error line, in log order (the final "rsync error: … (code N)"
+    summary is left out: the exit code already says it)."""
+    out: list[str] = []
     for line in log_tail.splitlines():
-        low = line.lower()
-        if low.startswith("rsync error") or low.startswith("rsync: ") or "permission denied" in low or "ssh:" in low:
-            return line.strip()[:500]
-    return None
+        low = line.strip().lower()
+        if not _is_error_line(low) or low.startswith("rsync error"):
+            continue
+        text = line.strip()[:500]
+        if text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def first_error(log_tail: str) -> str | None:
+    """The most telling error line: a denied write/mkdir (files were skipped) beats warnings."""
+    lines = [l.strip() for l in log_tail.splitlines() if _is_error_line(l.strip().lower())]
+    for line in lines:
+        if "permission denied" in line.lower():
+            return line[:500]
+    return lines[0][:500] if lines else None
 
 
 # ── per-job SSH context ───────────────────────────────────────────────────────
@@ -777,6 +953,55 @@ def connect_endpoint(ctx: SshContext, role: str, e: dict[str, Any]) -> dict[str,
     probe = parse_probe(out.stdout)
     probe.update(latency_ms=int((time.monotonic() - started) * 1000), host_key_fingerprint=fp, host_key_verified=pinned)
     return probe
+
+
+def daemon_error(stderr: str, rc: int) -> str:
+    """The most telling line of an rsync:// failure (@ERROR lines first)."""
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.startswith("@ERROR"):
+            return ln
+    for ln in lines:
+        low = ln.lower()
+        if "failed to connect" in low or "connection refused" in low or "timed out" in low or "unknown host" in low:
+            return ln
+    return lines[0] if lines else f"rsync exit {rc}"
+
+
+def parse_daemon_listing(stdout: str, name: str) -> str:
+    """`rsync --list-only rsync://…/module/path` (no trailing /): the entry for `name` says what it is."""
+    for ln in stdout.splitlines():
+        parts = ln.split()
+        if len(parts) >= 5 and parts[-1].rstrip("/") == (name or "."):
+            return {"d": "dir", "-": "file", "l": "file"}.get(ln[:1], "file")
+    return "dir" if stdout.strip() else "missing"
+
+
+def connect_daemon(e: dict[str, Any], role: str) -> dict[str, Any]:
+    """Connect to the rsync daemon and look at the path inside the module. No shell, no host key."""
+    label = "source" if role == "source" else "target"
+    name = e["path"].rstrip("/").rsplit("/", 1)[-1] if e["path"].strip("/") else "."
+    url = daemon_url({**e, "path": e["path"].rstrip("/")}) if e["path"].strip("/") else daemon_url(e, as_dir=True)
+    argv = [RSYNC, "--list-only", "--no-motd", f"--contimeout={SSH_TIMEOUT}", f"--timeout={SSH_TIMEOUT + 15}", url]
+    started = time.monotonic()
+    try:
+        out = subprocess.run(argv, env=daemon_env(e), capture_output=True, text=True, timeout=2 * SSH_TIMEOUT + 30)
+    except subprocess.TimeoutExpired:
+        raise StepFailed(f"{label}: the rsync daemon did not answer in time",
+                         "Check that rsync --daemon runs at the site and the port is reachable (through the tunnel).") from None
+    latency = int((time.monotonic() - started) * 1000)
+    err = daemon_error(out.stderr, out.returncode)
+    missing = out.returncode == 23 and ("no such file" in out.stderr.lower() or "change_dir" in out.stderr.lower())
+    if out.returncode != 0 and not missing:
+        raise StepFailed(f"{label}: {err}", hint_for(err) or hint_for(out.stderr))
+    kind = "missing" if missing else ("dir" if name == "." else parse_daemon_listing(out.stdout, name))
+    return {"daemon": True, "rsync": dict(DAEMON_FLAVOR), "rsync_candidates": [], "kind": kind,
+            "os": "rsync daemon", "arch": None, "ssh": False, "writable": None,
+            "latency_ms": latency, "host_key_fingerprint": None, "host_key_verified": None}
+
+
+def connect_any(ctx: SshContext, role: str, e: dict[str, Any]) -> dict[str, Any]:
+    return connect_daemon(e, role) if is_daemon(e) else connect_endpoint(ctx, role, e)
 
 
 def check_route(ctx: SshContext, req: dict[str, Any]) -> dict[str, Any]:
@@ -983,6 +1208,8 @@ def decide_transport(ctx: SshContext, job_id: str, req: dict[str, Any], log_fh: 
     want = req["transport"]
     if want == "relay":
         return "relay", "relay chosen in the profile", None
+    if is_daemon(req["source"]) or is_daemon(req["target"]):
+        return "relay", "an rsync daemon endpoint always uses the relay", None
     try:
         set_rt(job_id, phase="route")
         probe = check_route(ctx, req)
@@ -1020,9 +1247,9 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
         with log_path.open("ab") as log_fh:
             src, tgt = req["source"], req["target"]
             log_fh.write(f"--- connect at {utc_now()} ---\n".encode())
-            src_probe = connect_endpoint(ctx, "source", src)
-            fields["host_keys"] = {"source": {"fingerprint": src_probe["host_key_fingerprint"],
-                                              "verified": src_probe["host_key_verified"]}}
+            src_probe = connect_any(ctx, "source", src)
+            fields["host_keys"] = {} if is_daemon(src) else {
+                "source": {"fingerprint": src_probe["host_key_fingerprint"], "verified": src_probe["host_key_verified"]}}
             if src_probe.get("kind") == "missing":
                 raise StepFailed(f"source path {src['path']!r} does not exist on {src['host']}",
                                  "Check the path; relative paths start in the login's home directory.")
@@ -1034,9 +1261,10 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
             transport, reason, tgt_probe = decide_transport(ctx, job_id, req, log_fh)
             if transport == "relay":
                 set_rt(job_id, phase="connect")
-                tgt_probe = connect_endpoint(ctx, "target", tgt)
-                fields["host_keys"]["target"] = {"fingerprint": tgt_probe["host_key_fingerprint"],
-                                                 "verified": tgt_probe["host_key_verified"]}
+                tgt_probe = connect_any(ctx, "target", tgt)
+                if not is_daemon(tgt):
+                    fields["host_keys"]["target"] = {"fingerprint": tgt_probe["host_key_fingerprint"],
+                                                     "verified": tgt_probe["host_key_verified"]}
             else:
                 fp, pinned = getattr(ctx, "target_fp", (None, False))
                 if fp:
@@ -1050,6 +1278,9 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
             set_rt(job_id, transport=transport, transport_reason=reason)
             log_fh.write(f"target: {tgt_probe.get('os')} {tgt_probe.get('arch')}, {tgt_probe['rsync']['path']} "
                          f"({tgt_probe['rsync']['version']})\ntransport: {transport} ({reason})\n".encode())
+            tgt_note = None if is_daemon(tgt) else target_access(tgt, tgt_probe)
+            if tgt_note:
+                log_fh.write(f"note: {tgt_note}\n".encode())
 
             if transport == "direct":
                 check_compat(req, {"source": src_probe["rsync"], "target": tgt_probe["rsync"]})
@@ -1069,13 +1300,18 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
                 if MIN_FREE_MB > 0 and 0 <= free_mb() < MIN_FREE_MB:
                     raise StepFailed(f"relay staging volume has {free_mb()} MB free; need {MIN_FREE_MB} MB",
                                      "Free space on the cdc-rsync volume or raise RSYNC_MIN_FREE_MB.")
-                rsh, env = ctx.rsync_rsh("source", src)
-                env["RSYNC_RSH"] = rsh
                 # --fake-super: staging is written by a non-root user, so owners/modes live in xattrs
                 # there and are restored on the push (a root target login then keeps real owners).
-                pull = [RSYNC, *rsync_flags(req, local, src_probe["rsync"], delete=True, dry_run=False, mirror=True),
-                        "--fake-super", f"--rsync-path={src_probe['rsync']['path']}",
-                        f"{src['username']}@{host_spec(src['host'])}:{src['path']}", f"{staging}/"]
+                pull_flags = rsync_flags(req, local, src_probe["rsync"], delete=True, dry_run=False, mirror=True)
+                if is_daemon(src):
+                    env = daemon_env(src)
+                    pull = [RSYNC, *pull_flags, "--fake-super", "--no-motd", f"--contimeout={SSH_TIMEOUT}",
+                            daemon_url(src), f"{staging}/"]
+                else:
+                    rsh, env = ctx.rsync_rsh("source", src)
+                    env["RSYNC_RSH"] = rsh
+                    pull = [RSYNC, *pull_flags, "--fake-super", f"--rsync-path={src_probe['rsync']['path']}",
+                            f"{src['username']}@{host_spec(src['host'])}:{src['path']}", f"{staging}/"]
                 pull_code, out = _run_step(job_id, "pull", pull, env, log_fh, deadline)
                 exit_code = pull_code
                 fields["stats_pull"] = parse_stats(out)
@@ -1084,14 +1320,25 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
                 # 23/24: some source files were unreadable or vanished. rsync skips deletions after
                 # I/O errors, so staging still holds the last good copy and pushing is safe.
                 if pull_code in (0, 23, 24) and job_id not in _stop_requested:
-                    rsh, env = ctx.rsync_rsh("target", tgt)
-                    env["RSYNC_RSH"] = rsh
-                    push = [RSYNC, *rsync_flags(req, local, tgt_probe["rsync"]), "--fake-super",
-                            target_rsync_path(tgt, tgt_probe["rsync"]["path"]), f"{staging}/", remote_dest(tgt)]
+                    if is_daemon(tgt):
+                        # The daemon creates the last folder of the path itself; parents must exist in the module.
+                        env = daemon_env(tgt)
+                        push = [RSYNC, *rsync_flags(req, local, tgt_probe["rsync"]), "--fake-super", "--no-motd",
+                                f"--contimeout={SSH_TIMEOUT}", f"{staging}/", daemon_url(tgt, as_dir=True)]
+                    else:
+                        rsh, env = ctx.rsync_rsh("target", tgt)
+                        env["RSYNC_RSH"] = rsh
+                        push = [RSYNC, *rsync_flags(req, local, tgt_probe["rsync"]), "--fake-super",
+                                target_rsync_path(tgt, tgt_probe["rsync"]["path"]), f"{staging}/", remote_dest(tgt)]
                     push_code, out = _run_step(job_id, "push", push, env, log_fh, deadline)
                     fields["stats"] = parse_stats(out)
                     exit_code = push_code or pull_code
             status, error = outcome(exit_code, job_id in _stop_requested)
+            if status == "completed_with_errors" and exit_code == 23 and root_attrs_only(tail_log(log_path, 64000)):
+                # Every file copied; only the target root folder's own mtime/group/mode was refused.
+                status, error = "succeeded", None
+                fields["warning"] = (f"Copied. {tgt['path']} on {tgt['host']} belongs to another user, so its own "
+                                     "timestamp/group was left as is.")
             if req["flags"]["dry_run"] and status == "succeeded":
                 fields["dry_run"] = True
     except StepFailed as exc:
@@ -1123,6 +1370,9 @@ def run_job(job_id: str, req: dict[str, Any]) -> None:
             fe = first_error(tail)
             if fe and fe not in error:
                 fields["first_error"] = fe
+            errs = rsync_errors(tail)
+            if errs:
+                fields["errors"] = errs
             hint = hint or hint_for(tail if exit_code else error)
             if hint:
                 fields["hint"] = hint
@@ -1304,10 +1554,31 @@ def _probe_answer(e: dict[str, Any], side: str, probe: dict[str, Any]) -> dict[s
         warnings.append("The path does not exist and its parent is not writable for this login.")
     if side == "target" and probe.get("kind") == "file":
         return {**out, "ok": False, "error": "the target path is a file; it must be a directory"}
+    if side == "target" and probe.get("kind") != "missing":
+        try:
+            note = target_access(e, probe)
+        except StepFailed as exc:
+            return {**out, "ok": False, "error": str(exc), "hint": exc.hint}
+        if note:
+            warnings.append(note[0].upper() + note[1:] + ".")
     if side == "source" and not probe.get("ssh"):
         warnings.append("No ssh client on the source: direct mode is not possible, relay will be used.")
     if warnings:
         out["warning"] = " ".join(warnings)
+    return out
+
+
+def _daemon_answer(e: dict[str, Any], side: str, probe: dict[str, Any]) -> dict[str, Any]:
+    out = {"ok": True, "target": describe_endpoint(e), "side": side, "protocol": "daemon", "os": "rsync daemon",
+           "rsync_version": "rsync daemon", "gnu_rsync": True, "path_kind": probe["kind"],
+           "latency_ms": probe["latency_ms"]}
+    if side == "source" and probe["kind"] == "missing":
+        return {**out, "ok": False, "error": f"path {e['path']!r} does not exist in module {e['module']!r}"}
+    if side == "target" and probe["kind"] == "file":
+        return {**out, "ok": False, "error": "the target path is a file; it must be a directory"}
+    if side == "target":
+        out["warning"] = ("Connected and listed the module. Writing is only checked on the first run: the module "
+                          "needs `read only = no`, and parent folders of the path must exist.")
     return out
 
 
@@ -1322,6 +1593,8 @@ def test_connection(body: dict[str, Any]) -> dict[str, Any]:
     tmp = Path(tempfile.mkdtemp(prefix=".test-", dir=WORK_ROOT))
     ctx = SshContext(tmp, uuid.uuid4().hex[:8])
     try:
+        if is_daemon(e):
+            return _daemon_answer(e, side, connect_daemon(e, side))
         return _probe_answer(e, side, connect_endpoint(ctx, side, e))
     except StepFailed as exc:
         return {"ok": False, "target": describe_endpoint(e), "side": side, "error": str(exc), "hint": exc.hint}
@@ -1336,6 +1609,9 @@ def test_connection(body: dict[str, Any]) -> dict[str, Any]:
 def test_route(body: dict[str, Any]) -> dict[str, Any]:
     """Would a run use direct mode? Logs in to the source and, from there, to the target."""
     req = validate_request({**body, "options": {"transport": "auto"}})
+    if is_daemon(req["source"]) or is_daemon(req["target"]):
+        return {"direct": False, "transport": "relay", "error": "an rsync daemon endpoint always uses the relay",
+                "hint": "Files go source → this server → target; there is no host-to-host copy with rsync://."}
     tmp = Path(tempfile.mkdtemp(prefix=".route-", dir=WORK_ROOT))
     ctx = SshContext(tmp, uuid.uuid4().hex[:8])
     try:
@@ -1361,7 +1637,9 @@ CAPABILITY = {
         "lists": ["excludes"],
         "strings": ["transport"],
     },
-    "endpoint_fields": ["name", "host", "port", "username", "auth (key|password)", "password", "private_key",
+    "protocols": {"ssh": "SSH login; rsync runs on the host", "daemon": "rsync:// (rsync --daemon, port 873); relay only"},
+    "endpoint_fields": ["protocol (ssh|daemon)", "module (daemon)", "name", "host", "port", "username",
+                        "auth (key|password)", "password", "private_key",
                         "passphrase", "path", "host_key_fingerprint (SHA256:...)", "rsync_path",
                         "reach_host / reach_port (target: address the source uses)"],
     "behaviour": {

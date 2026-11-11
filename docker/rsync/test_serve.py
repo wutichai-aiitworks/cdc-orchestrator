@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import shlex
+import shutil
 import subprocess
 import unittest
+from pathlib import Path
 
 import serve
 
@@ -142,6 +144,104 @@ class FlavorTest(unittest.TestCase):
         p = serve.parse_probe(out.stdout)
         self.assertEqual(p["kind"], "missing")
         self.assertEqual(p["probe"], "ok")
+        self.assertNotIn("owner", p)  # only reported for an existing path
+        self.assertTrue(p["uid"].isdigit())
+
+    def test_probe_reports_foreign_owner(self):
+        import os
+        if os.geteuid() == 0:
+            self.skipTest("root owns everything")
+        out = subprocess.run(["sh", "-c", serve.probe_script("/")], capture_output=True, text=True, timeout=10)
+        p = serve.parse_probe(out.stdout)
+        self.assertEqual((p["kind"], p["owner"]), ("dir", False))
+
+
+class TargetAccessTest(unittest.TestCase):
+    """Target /opt/ as non-root: exit 23 'failed to set times on "/opt/."' (profile demo source -> target)."""
+
+    E = {"username": "syncuser", "host": "cdc-rsync-target", "port": 22, "path": "/opt/"}
+
+    def test_root_login_needs_nothing(self):
+        self.assertIsNone(serve.target_access(self.E, {"uid": "0", "kind": "dir", "writable": False, "owner": False}))
+
+    def test_owned_dir_needs_nothing(self):
+        self.assertIsNone(serve.target_access(self.E, {"uid": "1001", "kind": "dir", "writable": True, "owner": True}))
+
+    def test_missing_dir_with_writable_parent_is_fine(self):
+        self.assertIsNone(serve.target_access(self.E, {"uid": "1001", "kind": "missing", "writable": True}))
+
+    def test_writable_foreign_dir_gets_a_note(self):
+        note = serve.target_access(self.E, {"uid": "1001", "kind": "dir", "writable": True, "owner": False})
+        self.assertIn("belongs to another user", note)
+
+    def test_unwritable_dir_fails_before_rsync(self):
+        # the demo target: /opt is root:root 0755, syncuser is uid 1001
+        with self.assertRaises(serve.StepFailed) as cm:
+            serve.target_access(self.E, {"uid": "1001", "kind": "dir", "writable": False, "owner": False})
+        self.assertIn("cannot write to /opt/", str(cm.exception))
+        self.assertIn("chown -R syncuser", cm.exception.hint)
+
+    def test_unwritable_parent_fails_before_rsync(self):
+        with self.assertRaises(serve.StepFailed) as cm:
+            serve.target_access({**self.E, "path": "/opt/app"}, {"uid": "1001", "kind": "missing", "writable": False})
+        self.assertIn("cannot create /opt/app", str(cm.exception))
+
+    def test_old_probe_without_owner_changes_nothing(self):
+        self.assertIsNone(serve.target_access(self.E, {"kind": "dir", "writable": True}))
+
+    # Lines below are verbatim rsync 3.2.7 output (reproduced in the cdc-rsync-target container).
+    SUMMARY = "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1356) [sender=3.2.7]"
+
+    def test_root_attrs_only_accepts_root_folder_attribute_failures(self):
+        for line in ('rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)',
+                     'rsync: [generator] chgrp "/opt/." failed: Operation not permitted (1)',
+                     'rsync: [generator] failed to set permissions on "data/.": Operation not permitted (1)',
+                     'rsync: chown "." failed: Operation not permitted (1)'):
+            self.assertTrue(serve.root_attrs_only(f"--- connect\nsync started\n{line}\n{self.SUMMARY}\n"), line)
+
+    def test_root_attrs_only_rejects_real_file_problems(self):
+        for line in ('rsync: [generator] failed to set times on "/opt/app": Operation not permitted (1)',
+                     'rsync: [receiver] mkstemp "/opt/.a.txt.Xyz" failed: Permission denied (13)',
+                     'rsync: [sender] send_files failed to open "/opt/secret": Permission denied (13)',
+                     'rsync: [generator] chgrp "/opt/." failed: No space left on device (28)'):
+            tail = f'rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)\n{line}\n{self.SUMMARY}'
+            self.assertFalse(serve.root_attrs_only(tail), line)
+        self.assertFalse(serve.root_attrs_only(self.SUMMARY))  # no detail line: don't guess
+        self.assertFalse(serve.root_attrs_only(""))
+
+    def test_hint_for_set_times_is_specific(self):
+        tail = ('rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)\n'
+                "rsync error: some files/attrs were not transferred (code 23)")
+        self.assertIn("does not own some target folders", serve.hint_for(tail))
+        self.assertIn("lacks permission", serve.hint_for('rsync: open "/x" failed: Permission denied (13)'))
+
+    def test_denied_mkdir_beats_set_times_warning(self):
+        # The real log of a run into a root-owned /opt as a normal login.
+        log = (
+            'rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)\n'
+            'rsync: [generator] recv_generator: mkdir "/opt/a2" failed: Permission denied (13)\n'
+            "*** Skipping any contents from this failed directory ***\n"
+            "total size is 4  speedup is 0.03\n"
+            "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1356) [sender=3.2.7]\n"
+        )
+        self.assertIn("cannot create folders", serve.hint_for(log))
+        self.assertIn('mkdir "/opt/a2" failed', serve.first_error(log))
+        self.assertEqual(serve.rsync_errors(log), [
+            'rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)',
+            'rsync: [generator] recv_generator: mkdir "/opt/a2" failed: Permission denied (13)',
+        ])
+        # Only the timestamp warning: the files were written.
+        only_times = 'rsync: [generator] failed to set times on "/opt/.": Operation not permitted (1)\n'
+        self.assertIn("files were written", serve.hint_for(only_times))
+
+    def test_probe_answer_surfaces_problem_on_test_connection(self):
+        base = {"rsync": {**GNU, "path": "/usr/bin/rsync"}, "ssh": True, "uid": "1001", "kind": "dir"}
+        bad = serve._probe_answer(self.E, "target", {**base, "writable": False, "owner": False})
+        self.assertFalse(bad["ok"])
+        self.assertIn("cannot write", bad["error"])
+        warn = serve._probe_answer(self.E, "target", {**base, "writable": True, "owner": False})
+        self.assertTrue(warn["ok"])
+        self.assertIn("belongs to another user", warn["warning"])
 
 
 class CommandTest(unittest.TestCase):
@@ -282,3 +382,119 @@ class OutputTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+DAEMON = {"protocol": "daemon", "host": "10.66.1.1", "module": "data", "path": "www/", "username": "cdc", "password": "s3cret"}
+
+
+class DaemonTest(unittest.TestCase):
+    def test_normalises_daemon_endpoint(self):
+        e = serve.norm_endpoint(DAEMON, "source")
+        self.assertEqual((e["protocol"], e["port"], e["module"], e["path"], e["auth"]), ("daemon", 873, "data", "www/", "password"))
+        anon = serve.norm_endpoint({"protocol": "daemon", "host": "h", "module": "pub"}, "source")
+        self.assertEqual((anon["username"], anon["auth"], anon["path"]), ("", "none", ""))
+
+    def test_daemon_validation(self):
+        for bad in ({"module": ""}, {"module": "a b"}, {"path": "../etc"}, {"password": ""}, {"username": "", "password": "x"},
+                    {"protocol": "ftp"}, {"port": "99999"}):
+            with self.assertRaises(serve.BadRequest, msg=str(bad)):
+                serve.norm_endpoint({**DAEMON, **bad}, "source")
+
+    def test_urls_keep_source_slash_and_targets_are_dirs(self):
+        e = serve.norm_endpoint(DAEMON, "source")
+        self.assertEqual(serve.daemon_url(e), "rsync://cdc@10.66.1.1:873/data/www/")
+        t = serve.norm_endpoint({**DAEMON, "path": "backups/www", "username": "", "password": ""}, "target")
+        self.assertEqual(serve.daemon_url(t, as_dir=True), "rsync://10.66.1.1:873/data/backups/www/")
+        root = serve.norm_endpoint({**DAEMON, "path": ""}, "target")
+        self.assertEqual(serve.daemon_url(root, as_dir=True), "rsync://cdc@10.66.1.1:873/data/")
+        self.assertEqual(serve.describe_endpoint(e), "rsync://cdc@10.66.1.1:873/data/www/")
+        self.assertNotIn("s3cret", serve.describe_endpoint(e))
+
+    def test_password_only_in_env(self):
+        e = serve.norm_endpoint(DAEMON, "source")
+        self.assertEqual(serve.daemon_env(e)["RSYNC_PASSWORD"], "s3cret")
+        self.assertNotIn("RSYNC_PASSWORD", serve.daemon_env({**e, "password": ""}))
+
+    def test_direct_rejected_and_auto_relays(self):
+        with self.assertRaises(serve.BadRequest):
+            serve.validate_request({"source": DAEMON, "target": TGT, "options": {"transport": "direct"}})
+        r = serve.validate_request({"source": DAEMON, "target": TGT, "options": {}})
+        self.assertEqual(serve.decide_transport(None, "x", r, None)[0], "relay")  # no SSH needed to decide
+
+    def test_daemon_errors_get_hints(self):
+        self.assertIn("secrets file", serve.hint_for("@ERROR: auth failed on module data"))
+        self.assertIn("rsyncd.conf", serve.hint_for("@ERROR: Unknown module 'dta'"))
+        self.assertIn("hosts allow", serve.hint_for("@ERROR: access denied to data from unknown (10.66.1.2)"))
+        self.assertIn("read only = no", serve.hint_for("ERROR: module is read only"))
+        self.assertEqual(serve.daemon_error("motd\n@ERROR: auth failed on module data\nrsync error: ...", 5),
+                         "@ERROR: auth failed on module data")
+
+    def test_listing_parser(self):
+        out = "drwxr-xr-x          4,096 2026/11/07 10:00:00 www\n"
+        self.assertEqual(serve.parse_daemon_listing(out, "www"), "dir")
+        self.assertEqual(serve.parse_daemon_listing("-rw-r--r--  12 2026/11/07 10:00:00 a.txt\n", "a.txt"), "file")
+        self.assertEqual(serve.parse_daemon_listing("", "www"), "missing")
+
+
+class DaemonLiveTest(unittest.TestCase):
+    """A real rsync daemon on 127.0.0.1 (skipped when rsync is not GNU rsync)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os, socket, tempfile, time as _t
+        try:
+            ver = subprocess.check_output([serve.RSYNC, "--version"], text=True).splitlines()[0]
+        except Exception:  # noqa: BLE001
+            raise unittest.SkipTest("rsync not installed")
+        if not serve.rsync_flavor(ver)["gnu"]:
+            raise unittest.SkipTest("needs GNU rsync")
+        cls.root = Path(tempfile.mkdtemp())
+        (cls.root / "src" / "www").mkdir(parents=True)
+        (cls.root / "src" / "www" / "index.html").write_text("hello")
+        (cls.root / "dst").mkdir()
+        (cls.root / "secrets").write_text("cdc:s3cret\n")
+        os.chmod(cls.root / "secrets", 0o600)
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); cls.port = s.getsockname()[1]; s.close()
+        (cls.root / "rsyncd.conf").write_text(
+            f"pid file = {cls.root}/pid\nuse chroot = no\n[data]\npath = {cls.root}/src\nread only = yes\n"
+            f"auth users = cdc\nsecrets file = {cls.root}/secrets\nstrict modes = yes\n"
+            f"[drop]\npath = {cls.root}/dst\nread only = no\n")
+        cls.proc = subprocess.Popen([serve.RSYNC, "--daemon", "--no-detach", f"--config={cls.root}/rsyncd.conf",
+                                     f"--port={cls.port}", "--address=127.0.0.1"])
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), 0.2).close(); break
+            except OSError:
+                _t.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate(); cls.proc.wait(5)
+        shutil.rmtree(cls.root, ignore_errors=True)
+
+    def ep(self, **kw):
+        return serve.norm_endpoint({"protocol": "daemon", "host": "127.0.0.1", "port": self.port, **kw}, "source")
+
+    def test_probe_dir_missing_and_auth(self):
+        self.assertEqual(serve.connect_daemon(self.ep(module="data", path="www/", username="cdc", password="s3cret"), "source")["kind"], "dir")
+        self.assertEqual(serve.connect_daemon(self.ep(module="data", path="nope", username="cdc", password="s3cret"), "source")["kind"], "missing")
+        with self.assertRaises(serve.StepFailed) as ctx:
+            serve.connect_daemon(self.ep(module="data", username="cdc", password="wrong"), "source")
+        self.assertIn("auth failed", str(ctx.exception))
+        with self.assertRaises(serve.StepFailed) as ctx:
+            serve.connect_daemon(self.ep(module="nosuch"), "source")
+        self.assertIn("Unknown module", str(ctx.exception))
+        self.assertTrue(serve.test_connection({"side": "target", "endpoint": {"protocol": "daemon", "host": "127.0.0.1",
+                                                                              "port": self.port, "module": "drop"}})["ok"])
+
+    def test_pull_and_push_commands_copy_files(self):
+        src = self.ep(module="data", path="www/", username="cdc", password="s3cret")
+        stage = self.root / "stage"; stage.mkdir(exist_ok=True)
+        r = req()
+        flags = serve.rsync_flags(r, GNU, serve.DAEMON_FLAVOR, delete=True, dry_run=False, mirror=True)
+        subprocess.run([serve.RSYNC, *flags, "--no-motd", serve.daemon_url(src), f"{stage}/"], env=serve.daemon_env(src), check=True, capture_output=True)
+        self.assertEqual((stage / "index.html").read_text(), "hello")
+        tgt = self.ep(module="drop", path="site")
+        subprocess.run([serve.RSYNC, *serve.rsync_flags(r, GNU, serve.DAEMON_FLAVOR), "--no-motd", f"{stage}/",
+                        serve.daemon_url(tgt, as_dir=True)], env=serve.daemon_env(tgt), check=True, capture_output=True)
+        self.assertEqual((self.root / "dst" / "site" / "index.html").read_text(), "hello")

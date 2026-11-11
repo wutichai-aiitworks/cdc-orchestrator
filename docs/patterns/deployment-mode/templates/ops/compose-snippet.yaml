@@ -1,0 +1,13 @@
+# Every service that reads the mode gets the same variable (backend, UI, workers).
+services:
+  app-api:
+    environment:
+      # Production (default, hardened) | Maintenance | Enhanced
+      APP_MODE: ${APP_MODE:-Production}
+      # Empty must mean "default" — the code treats "" as unset (see SKILL.md, "Empty means unset").
+      APP_REQUIRE_AUTH: ${APP_REQUIRE_AUTH:-}
+      APP_REQUIRE_PERSISTENCE: ${APP_REQUIRE_PERSISTENCE:-}
+  app-ui:
+    environment:
+      # Production (no ribbon) | Maintenance (amber ribbon) | Enhanced (violet ribbon)
+      APP_MODE: ${APP_MODE:-Production}

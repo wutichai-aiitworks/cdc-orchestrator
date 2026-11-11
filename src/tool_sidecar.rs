@@ -286,6 +286,7 @@ mod tests {
 
     fn conn(host: &str, password: &str) -> SchemaCompareConn {
         SchemaCompareConn {
+            tunnel_id: None,
             db_type: "redis".into(),
             host: host.into(),
             port: "6379".into(),

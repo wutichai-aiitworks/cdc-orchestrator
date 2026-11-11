@@ -84,8 +84,66 @@ fn check_endpoint_auth(role: &str, e: &RsyncEndpoint) -> Result<(), AppError> {
     }
 }
 
+pub fn is_daemon(e: &RsyncEndpoint) -> bool {
+    e.protocol.trim().eq_ignore_ascii_case("daemon")
+}
+
+/// rsync daemon endpoint: host, module, optional path inside it, optional daemon user + password.
+fn check_daemon_endpoint(role: &str, e: &RsyncEndpoint) -> Result<(), AppError> {
+    let host = e.host.trim();
+    if host.is_empty() || host.starts_with('-') {
+        return endpoint_bad(role, format!("{role}.host is required"));
+    }
+    if !e.port.trim().is_empty() && !matches!(e.port.trim().parse::<u32>(), Ok(1..=65535)) {
+        return endpoint_bad(role, format!("{role}.port must be 1-65535"));
+    }
+    let module = e.module.trim().trim_matches('/');
+    let ok_module = !module.is_empty()
+        && module.len() <= 64
+        && !module.starts_with('-')
+        && module
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !ok_module {
+        return endpoint_bad(
+            role,
+            format!("{role}.module is required: the [name] of a module in the site's rsyncd.conf"),
+        );
+    }
+    let path = e.path.trim();
+    if path.starts_with('-') || path.split('/').any(|p| p == "..") {
+        return endpoint_bad(
+            role,
+            format!("{role}.path must stay inside the module (no leading '-', no '..')"),
+        );
+    }
+    let (user, pass) = (e.username.trim(), &e.password);
+    if !user.is_empty() && pass.is_empty() {
+        return endpoint_bad(
+            role,
+            format!(
+                "{role}.password is required with a daemon user (its line in the secrets file)"
+            ),
+        );
+    }
+    if user.is_empty() && !pass.is_empty() {
+        return endpoint_bad(role, format!("{role}.username is required with a password"));
+    }
+    Ok(())
+}
+
 /// Save-time checks so mistakes show in the editor; the sidecar re-validates on every run.
 pub fn check_endpoint(role: &str, e: &RsyncEndpoint) -> Result<(), AppError> {
+    match e.protocol.trim().to_ascii_lowercase().as_str() {
+        "" | "ssh" => {}
+        "daemon" => return check_daemon_endpoint(role, e),
+        other => {
+            return endpoint_bad(
+                role,
+                format!("{role}.protocol must be 'ssh' or 'daemon', got '{other}'"),
+            )
+        }
+    }
     check_endpoint_identity(role, e)?;
     check_endpoint_auth(role, e)
 }
@@ -103,6 +161,12 @@ pub fn validate_profile(
             "options.transport must be one of {}",
             TRANSPORTS.join(", ")
         )));
+    }
+    if transport == "direct" && (is_daemon(source) || is_daemon(target)) {
+        return Err(AppError::BadRequest(
+            "transport=direct needs SSH on both hosts; an rsync daemon endpoint always uses the relay"
+                .into(),
+        ));
     }
     if transport == "direct" && effective_auth(target) != "key" {
         return Err(AppError::BadRequest(
@@ -248,6 +312,56 @@ mod tests {
             path: "/srv/www/".into(),
             ..Default::default()
         }
+    }
+
+    fn daemon(host: &str) -> RsyncEndpoint {
+        RsyncEndpoint {
+            protocol: "daemon".into(),
+            module: "data".into(),
+            host: host.into(),
+            port: "873".into(),
+            path: "www/".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn daemon_endpoints_are_validated() {
+        assert!(
+            check_endpoint("source", &daemon("10.66.1.1")).is_ok(),
+            "anonymous module, no key needed"
+        );
+        let mut with_user = daemon("10.66.1.1");
+        with_user.username = "cdc".into();
+        assert!(
+            check_endpoint("source", &with_user).is_err(),
+            "user needs a password"
+        );
+        with_user.password = "pw".into();
+        assert!(check_endpoint("source", &with_user).is_ok());
+        for mutate in [
+            (|e: &mut RsyncEndpoint| e.module = "".into()) as fn(&mut RsyncEndpoint),
+            |e| e.module = "a b".into(),
+            |e| e.path = "../etc".into(),
+            |e| e.password = "pw".into(),
+            |e| e.protocol = "ftp".into(),
+        ] {
+            let mut e = daemon("h");
+            mutate(&mut e);
+            assert!(check_endpoint("source", &e).is_err(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn direct_transport_needs_ssh_on_both_sides() {
+        let opts = RsyncOptions {
+            transport: Some("direct".into()),
+            ..Default::default()
+        };
+        assert!(validate_profile(&daemon("a"), &ep("b"), &opts).is_err());
+        assert!(validate_profile(&ep("a"), &daemon("b"), &opts).is_err());
+        let auto = RsyncOptions::default();
+        assert!(validate_profile(&daemon("a"), &ep("b"), &auto).is_ok());
     }
 
     #[test]

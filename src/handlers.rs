@@ -1398,6 +1398,7 @@ pub async fn create_profile_from_case(
     let request = ProfileUpsertRequest {
         name: payload.name,
         description: None,
+        tags: None,
         pattern: Some(pattern),
         stream_platform,
         transform_strategy: Some(transform_strategy),
@@ -1457,6 +1458,9 @@ pub async fn update_profile(
     };
     if let Some(description) = payload.description {
         profile.description = description.trim().to_string();
+    }
+    if let Some(tags) = payload.tags.as_deref() {
+        profile.tags = crate::models::normalize_tags(tags).map_err(AppError::BadRequest)?;
     }
     profile.pattern = payload
         .pattern
@@ -1680,12 +1684,52 @@ fn profile_audit_detail(
     }))
 }
 
+/// Pipelines with a lifecycle action in flight (this instance only; actions are seconds).
+pub type ProfileActionLocks = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>;
+
+/// Holds a pipeline's action slot until dropped.
+///
+/// Lifecycle actions are read-modify-write on the profile: load, talk to Connect for a
+/// few seconds, save. Two overlapping Starts (a double click, a retry on a slow Oracle
+/// column lookup) both created the connectors; the loser got Connect's 409 and wrote its
+/// stale copy of the profile back as `Failed` with no connector names, hiding a pipeline
+/// that was in fact running. One action at a time per pipeline keeps the write honest.
+pub struct ProfileActionGuard {
+    locks: ProfileActionLocks,
+    id: Uuid,
+}
+
+impl ProfileActionGuard {
+    pub fn acquire(locks: &ProfileActionLocks, id: Uuid, action: &str) -> Result<Self, AppError> {
+        let mut held = locks.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(id) {
+            return Err(AppError::Conflict(format!(
+                "another action is already running on this pipeline; wait for it to finish, then retry '{action}'"
+            )));
+        }
+        Ok(Self {
+            locks: locks.clone(),
+            id,
+        })
+    }
+}
+
+impl Drop for ProfileActionGuard {
+    fn drop(&mut self) {
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 pub async fn profile_action(
     State(state): State<AppState>,
     Path((id, action)): Path<(Uuid, String)>,
     Query(params): Query<ProfileActionParams>,
     headers: HeaderMap,
 ) -> Result<Json<ProfileResponse>, AppError> {
+    let _slot = ProfileActionGuard::acquire(&state.profile_action_locks, id, &action)?;
     let mut profile = state
         .profiles
         .get(id)
@@ -1806,6 +1850,72 @@ pub async fn start_initial_load(
 
 /// `POST /cdc/profiles/{id}/split` — move some tables into a new Draft pipeline with the
 /// same source and target (see `split`). Nothing is started or restarted here.
+/// `POST /cdc/profiles/{id}/duplicate` — full copy of a pipeline as a new Draft under a
+/// new name. The original is untouched. Audit: `profile.duplicate` on both pipelines.
+pub async fn duplicate_profile(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<crate::split::DuplicateRequest>,
+) -> Result<(StatusCode, Json<crate::split::DuplicateResponse>), AppError> {
+    let original = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let others: Vec<crate::models::CdcProfile> = state
+        .profiles
+        .list()
+        .await?
+        .into_iter()
+        .filter(|p| p.id != id)
+        .collect();
+    let actor = actor_from_headers(&headers);
+    let mut created = match crate::split::plan_duplicate(&original, &others, &request) {
+        Ok(v) => v,
+        Err(e) => {
+            let event = new_event(
+                &actor,
+                "profile.duplicate",
+                "failure",
+                &detail_json(json!({ "error": e.to_string_message(), "name": request.name })),
+                Some(original.id),
+                Some(original.name.as_str()),
+            );
+            emit(&state, event).await;
+            return Err(e);
+        }
+    };
+    state.profiles.upsert(&created).await?;
+    for (pid, pname, detail) in [
+        (
+            original.id,
+            original.name.clone(),
+            json!({ "role": "original", "new_pipeline": created.name, "new_pipeline_id": created.id }),
+        ),
+        (
+            created.id,
+            created.name.clone(),
+            json!({ "role": "created", "duplicated_from": original.name, "duplicated_from_id": original.id, "tables": created.source.tables }),
+        ),
+    ] {
+        let event = new_event(
+            &actor,
+            "profile.duplicate",
+            "success",
+            &detail_json(detail),
+            Some(pid),
+            Some(pname.as_str()),
+        );
+        emit(&state, event).await;
+    }
+    created.redact_secrets();
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::split::DuplicateResponse { created }),
+    ))
+}
+
 pub async fn split_profile(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -3014,17 +3124,15 @@ fn merge_profile_lake(
 
 /// Keep stored JDBC watermark columns when an incremental profile update omits them
 /// (e.g. draft save from a wizard step that did not re-post source fields).
+///
+/// The incoming `capture_mode` is authoritative: every client (native UI, MCP) posts
+/// it explicitly, so a different mode is a deliberate switch (incremental → sync_once,
+/// logical, trigger) and must be stored as sent. Only an update that *stays*
+/// incremental inherits omitted watermark columns from the stored profile.
 fn merge_incremental_source_fields(existing: &SourceConfig, incoming: &mut SourceConfig) {
     use crate::models::CaptureMode;
-    if incoming.capture_mode != CaptureMode::Incremental
-        && existing.capture_mode != CaptureMode::Incremental
-    {
+    if incoming.capture_mode != CaptureMode::Incremental {
         return;
-    }
-    if existing.capture_mode == CaptureMode::Incremental
-        && incoming.capture_mode != CaptureMode::Incremental
-    {
-        incoming.capture_mode = CaptureMode::Incremental;
     }
     let inc_empty = incoming
         .incrementing_column
@@ -3062,6 +3170,9 @@ fn merge_incremental_source_fields(existing: &SourceConfig, incoming: &mut Sourc
 fn validate_profile_payload(payload: &ProfileUpsertRequest, strict: bool) -> Result<(), AppError> {
     if strict && payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("profile name is required".to_string()));
+    }
+    if let Some(tags) = payload.tags.as_deref() {
+        crate::models::normalize_tags(tags).map_err(AppError::BadRequest)?;
     }
     if !is_supported_database_type(&payload.source.source_type) {
         return Err(AppError::BadRequest(format!(
@@ -3138,6 +3249,7 @@ fn upsert_from_profile(profile: &crate::models::CdcProfile) -> ProfileUpsertRequ
     ProfileUpsertRequest {
         name: profile.name.clone(),
         description: Some(profile.description.clone()),
+        tags: Some(profile.tags.clone()),
         pattern: Some(profile.pattern.clone()),
         stream_platform: profile.stream_platform,
         transform_strategy: Some(profile.transform_strategy.clone()),
@@ -3185,6 +3297,13 @@ fn build_profile(
             l.name = format!("{pipeline_name}-lake");
         }
     }
+    let tags = payload
+        .tags
+        .as_deref()
+        .map(crate::models::normalize_tags)
+        .transpose()
+        .map_err(AppError::BadRequest)?
+        .unwrap_or_default();
     Ok(crate::models::CdcProfile {
         id: id.unwrap_or_else(Uuid::new_v4),
         name: pipeline_name,
@@ -3210,6 +3329,7 @@ fn build_profile(
         }],
         created_at: now,
         updated_at: now,
+        tags,
         connector_name: None,
         sink_connector_name: None,
     })
@@ -3360,6 +3480,28 @@ fn is_supported_database_type(value: &str) -> bool {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     #[test]
+    fn profile_action_guard_is_exclusive_per_pipeline_and_released_on_drop() {
+        use super::{ProfileActionGuard, ProfileActionLocks};
+        let locks = ProfileActionLocks::default();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let first = ProfileActionGuard::acquire(&locks, a, "start").unwrap();
+        // Same pipeline: refused with a 409-class error naming the retried action.
+        let err = match ProfileActionGuard::acquire(&locks, a, "resync") {
+            Ok(_) => panic!("second action on the same pipeline must be refused"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, crate::error::AppError::Conflict(_)));
+        assert!(err.to_string_message().contains("retry 'resync'"));
+        // Another pipeline is independent.
+        let other = ProfileActionGuard::acquire(&locks, b, "start").unwrap();
+        drop(first);
+        // Released: the slot can be taken again.
+        ProfileActionGuard::acquire(&locks, a, "start").unwrap();
+        drop(other);
+    }
+
+    #[test]
     fn target_ddl_guard_accepts_generated_create_statements() {
         for ok in [
             r#"CREATE SCHEMA IF NOT EXISTS "pandora""#,
@@ -3400,6 +3542,7 @@ mod tests {
         ProfileUpsertRequest {
             name: String::new(),
             description: None,
+            tags: None,
             pattern: Some(ProfilePattern::SourceToTarget),
             stream_platform: None,
             transform_strategy: Some(TransformStrategy::None),
@@ -3501,6 +3644,43 @@ mod tests {
         merge_incremental_source_fields(&existing, &mut incoming);
         assert_eq!(incoming.upsert_key_columns, existing.upsert_key_columns);
         assert_eq!(incoming.timestamp_column.as_deref(), Some("UPDATE_DATE"));
+    }
+
+    /// Regression: a profile saved as incremental, then edited to One-time sync,
+    /// came back as incremental because the merge forced the stored mode onto the
+    /// update. The client's explicit mode must win, and no watermark columns may
+    /// leak into the non-incremental profile.
+    #[test]
+    fn merge_incremental_honours_explicit_switch_to_other_mode() {
+        use crate::models::{CaptureMode, SchemaSelectionMode, SourceConfig, TableSelectionMode};
+        let existing = SourceConfig {
+            source_type: "oracle".into(),
+            connection: HashMap::new(),
+            capture_mode: CaptureMode::Incremental,
+            schema_mode: SchemaSelectionMode::SpecificSchemas,
+            table_mode: TableSelectionMode::SpecificTables,
+            schemas: vec![],
+            tables: vec!["PANDORA.PM_PRODUCT".into()],
+            changelog_retention_hours: None,
+            timestamp_column: Some("UPDATE_DATE".into()),
+            incrementing_column: None,
+            upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
+            table_poll: vec![],
+        };
+        for mode in [
+            CaptureMode::SyncOnce,
+            CaptureMode::Logical,
+            CaptureMode::Trigger,
+        ] {
+            let mut incoming = existing.clone();
+            incoming.capture_mode = mode.clone();
+            incoming.timestamp_column = None;
+            incoming.upsert_key_columns = vec![];
+            merge_incremental_source_fields(&existing, &mut incoming);
+            assert_eq!(incoming.capture_mode, mode);
+            assert_eq!(incoming.timestamp_column, None);
+            assert!(incoming.upsert_key_columns.is_empty());
+        }
     }
 }
 

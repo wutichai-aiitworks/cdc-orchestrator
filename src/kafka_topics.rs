@@ -169,6 +169,46 @@ pub async fn create_topic(
     }))
 }
 
+/// Create `name` with the settings `reconcile::apply_topic_creation_defaults` gives the
+/// connectors (1 partition, RF 1, delete, 7-day retention). An existing topic is fine.
+pub(crate) async fn ensure_topic(state: &AppState, name: &str) -> Result<(), AppError> {
+    let name = validate_topic_name(name)?;
+    reject_internal(&name)?;
+    let args: Vec<String> = [
+        "topic",
+        "create",
+        name.as_str(),
+        "-p",
+        "1",
+        "-r",
+        "1",
+        "-c",
+        "cleanup.policy=delete",
+        "-c",
+        "retention.ms=604800000",
+        "-c",
+        "segment.bytes=134217728",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    match rpk_owned(state, &args).await {
+        Ok(out) if out.to_ascii_uppercase().contains("TOPIC_ALREADY_EXISTS") => Ok(()),
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.to_string()
+                .to_ascii_uppercase()
+                .contains("ALREADY_EXISTS")
+                || e.to_string()
+                    .to_ascii_lowercase()
+                    .contains("already exists") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn delete_topic(
     State(state): State<AppState>,
     headers: HeaderMap,

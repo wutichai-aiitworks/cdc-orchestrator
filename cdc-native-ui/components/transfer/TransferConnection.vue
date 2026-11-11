@@ -8,7 +8,17 @@ import { formatApiError } from "~/utils/apiError"
 import { loginKeyOf, relativeTime } from "~/utils/transferView"
 import type { ConnCheck } from "~/utils/transferTools/types"
 
-export type ConnValue = { type: string; host: string; port: string; database: string; username: string; password: string; schema?: string }
+export type ConnValue = {
+  type: string
+  host: string
+  port: string
+  database: string
+  username: string
+  password: string
+  schema?: string
+  /** WireGuard tunnel to the site (ADR 0010); host/port are as seen from the site. */
+  tunnel_id?: string | null
+}
 
 const conn = defineModel<ConnValue>({ required: true })
 const result = defineModel<ConnCheck | null>("result", { default: null })
@@ -71,7 +81,8 @@ const needsPasswordAgain = computed(() => props.savedLogin !== undefined && logi
 // A check describes the settings it ran with; editing invalidates it. (A string key: an array
 // getter is a new value on every reload and would always fire.) Saving swaps a typed password
 // for ******** — the same password, so that does not invalidate.
-watch(() => `${loginKey.value}|${conn.value.database}|${props.watchKey}`, () => (result.value = null))
+watch(() => `${loginKey.value}|${conn.value.database}|${props.watchKey}|${conn.value.tunnel_id || ""}`, () => (result.value = null))
+const { tunnelName } = useWireguard()
 watch(
   () => conn.value.password,
   (pw) => {
@@ -118,6 +129,9 @@ const portText = computed(() => conn.value.port || props.defaultPort)
             <template v-if="summaryExtra">{{ (database && conn.database) || conn.username ? ", " : "" }}{{ summaryExtra }}</template>
           </div>
         </template>
+        <div v-if="conn.tunnel_id" class="mt-1 inline-flex items-center gap-1 rounded-md bg-brand-500/10 px-1.5 py-0.5 text-[11px] font-medium text-primary">
+          via WireGuard: {{ tunnelName(conn.tunnel_id) || "tunnel" }}
+        </div>
         <div v-if="needsPasswordAgain" class="mt-1 flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
           <AlertTriangle class="h-3.5 w-3.5" :stroke-width="2" /> Login changed, enter the password again
         </div>
@@ -139,6 +153,7 @@ const portText = computed(() => conn.value.port || props.defaultPort)
         <span v-if="file.help" class="mt-1 block text-xs text-muted-foreground">{{ file.help }}</span>
       </label>
       <template v-else>
+        <div class="sm:col-span-6"><TransferTunnelSelect v-model="conn.tunnel_id" /></div>
         <label class="sm:col-span-4">
           <span class="auth-label !mb-1.5">Host</span>
           <input v-model.trim="conn.host" class="auth-input" :placeholder="hostPlaceholder" autocomplete="off" spellcheck="false" />

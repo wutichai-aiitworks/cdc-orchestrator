@@ -735,29 +735,40 @@ async fn connector_exists(state: &AppState, name: &str) -> Result<bool, AppError
     Ok(res.status().is_success())
 }
 
+/// Create-or-update a connector with `PUT /connectors/{name}/config`.
+///
+/// Kafka Connect treats that PUT as an upsert (201 on create, 200 on update), so there is
+/// no exists-probe followed by `POST /connectors` — a window in which a second Start saw
+/// "no connector", posted too, and failed with 409 "Connector … already exists".
 async fn upsert_connector(
     state: &AppState,
     name: &str,
     config: &HashMap<String, String>,
 ) -> Result<(), AppError> {
-    if connector_exists(state, name).await? {
-        connect_request(
-            state,
-            Method::PUT,
-            &format!("/connectors/{}/config", urlencoding::encode(name)),
-            Some(serde_json::to_value(config).unwrap()),
-        )
-        .await?;
-    } else {
-        connect_request(
-            state,
-            Method::POST,
-            "/connectors",
-            Some(json!({ "name": name, "config": config })),
-        )
-        .await?;
-    }
+    connect_request(
+        state,
+        Method::PUT,
+        &format!("/connectors/{}/config", urlencoding::encode(name)),
+        Some(serde_json::to_value(config).unwrap()),
+    )
+    .await?;
     Ok(())
+}
+
+/// Pre-create the capture topics a Start is about to produce into.
+///
+/// Topics normally appear when the source writes its first record. Until then the
+/// `topics.regex` sink has nothing to subscribe to and the Tables panel reports
+/// "topic not found", which reads like a failure on a pipeline that started seconds
+/// ago. Creating them up front (same settings as `topic.creation.default.*`) makes the
+/// sink attach immediately and the panel show 0 messages instead. Best effort: the
+/// connector's own topic creation still covers anything this misses.
+async fn ensure_capture_topics(state: &AppState, profile: &CdcProfile) {
+    for topic in crate::profile_table_status::capture_topics(profile) {
+        if let Err(e) = crate::kafka_topics::ensure_topic(state, &topic).await {
+            tracing::warn!(topic = %topic, error = %e, "could not pre-create capture topic");
+        }
+    }
 }
 
 async fn pause_connector(state: &AppState, name: &str) -> Result<(), AppError> {
@@ -981,6 +992,7 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
         ensure_running(state, source_name).await;
     }
     profile.connector_name = Some(name.clone());
+    ensure_capture_topics(state, profile).await;
 
     // Trigger capture lands in hyper_cdc.inbox on the Postgres target; install the
     // inbox + apply trigger before the sink starts so changes reach the real tables.
@@ -1558,13 +1570,11 @@ pub async fn reconcile_resync(
     row_limit: Option<u64>,
 ) -> Result<(), AppError> {
     let source_name = connector_name_for(profile);
-    if !connector_exists(state, &source_name).await? {
-        return Err(AppError::BadRequest(format!(
-            "connector '{source_name}' does not exist yet — start the pipeline before resyncing"
-        )));
-    }
     require_row_limit_for_profile(profile, row_limit)?;
     guard_clear_target_for_rolling_window(profile, clear_target)?;
+    if !connector_exists(state, &source_name).await? {
+        return resync_fresh_start(state, profile, clear_target, row_limit).await;
+    }
     if table_snapshot_resync_path(profile, row_limit) {
         let (cleared, copied) =
             run_trigger_table_snapshot(state, profile, clear_target, row_limit, true).await?;
@@ -1621,6 +1631,57 @@ pub async fn reconcile_resync(
         level: "info".to_string(),
         event: "profile_resynced".to_string(),
         detail: resync_history_detail(None, &cleared),
+    });
+    Ok(())
+}
+
+/// Resync of a pipeline whose connectors do not exist: never started, or removed by a
+/// test initial sync (or a Stop configured to delete).
+///
+/// There are no offsets to reset — brand-new connectors already read every row on their
+/// first poll / snapshot — so this is "clear the target if asked, then Start". Refusing
+/// with "start the pipeline before resyncing" used to leave a fresh pipeline with no
+/// working button: Start was the only way forward and a resync from the UI just failed.
+async fn resync_fresh_start(
+    state: &AppState,
+    profile: &mut CdcProfile,
+    clear_target: bool,
+    row_limit: Option<u64>,
+) -> Result<(), AppError> {
+    let cleared = if clear_target {
+        truncate_target_tables(profile).await?
+    } else {
+        Vec::new()
+    };
+    reconcile_start(state, profile).await?;
+    // Trigger capture and capped runs copy the live tables directly, as a normal resync.
+    let copied = if table_snapshot_resync_path(profile, row_limit) {
+        let (_, copied) =
+            run_trigger_table_snapshot(state, profile, false, row_limit, true).await?;
+        Some(copied)
+    } else {
+        None
+    };
+    profile.status = ProfileStatus::Running;
+    profile.updated_at = Utc::now();
+    profile.last_error = None;
+    let detail = match copied.as_deref() {
+        Some(copied) => resync_history_detail(Some(copied), &cleared),
+        None if cleared.is_empty() => {
+            "Pipeline had not started yet: connectors created, full read from the source running"
+                .to_string()
+        }
+        None => format!(
+            "Cleared {} target table(s) ({}); pipeline had not started yet: connectors created, full read from the source running",
+            cleared.len(),
+            cleared.join(", ")
+        ),
+    };
+    profile.push_history(HistoryItem {
+        timestamp: Utc::now(),
+        level: "info".to_string(),
+        event: "profile_resynced".to_string(),
+        detail,
     });
     Ok(())
 }
@@ -1801,6 +1862,7 @@ mod tests {
             history: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            tags: vec![],
             connector_name: None,
             sink_connector_name: None,
         }

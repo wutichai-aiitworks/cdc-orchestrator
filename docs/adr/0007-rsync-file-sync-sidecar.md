@@ -89,6 +89,7 @@ older macOS ships rsync 2.6.9, and non-interactive SSH sessions do not have Home
   Leaves a long-lived credential on a host the orchestrator does not control.
 - **Always relay.** Simple, but doubles traffic and needs staging disk for every profile.
 - **rsync daemon (`rsync://`) on targets.** Another service and port per host, and its auth is weaker
-  than SSH.
+  than SSH. *Revisited in ADR 0012:* offered as an optional endpoint protocol, meant for WireGuard
+  tunnels (which supply the encryption); SSH stays the default.
 - **paramiko/SFTP instead of rsync.** No delta transfer and no rsync semantics (permissions, links,
   deletes, excludes).

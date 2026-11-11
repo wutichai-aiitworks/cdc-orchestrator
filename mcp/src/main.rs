@@ -136,7 +136,9 @@ impl Config {
                 .eq_ignore_ascii_case("true"),
             rate_limit_rpm: env_or("MCP_RATE_LIMIT_RPM", "300").parse().unwrap_or(300),
             session_ttl: Duration::from_secs(
-                env_or("MCP_SESSION_TTL_SECS", "86400").parse().unwrap_or(86_400),
+                env_or("MCP_SESSION_TTL_SECS", "86400")
+                    .parse()
+                    .unwrap_or(86_400),
             ),
             max_sessions: env_or("MCP_MAX_SESSIONS", "1000").parse().unwrap_or(1000),
         })
@@ -157,24 +159,39 @@ fn load_clients(keys: Option<&str>, legacy: Option<&str>) -> Result<Vec<ClientKe
         let mut parts = entry.splitn(3, ':');
         let (Some(name), Some(scope), Some(token)) = (parts.next(), parts.next(), parts.next())
         else {
-            bail!("MCP_CLIENT_KEYS entry must be name:scope:token (got an entry with {} part(s))", entry.split(':').count());
+            bail!(
+                "MCP_CLIENT_KEYS entry must be name:scope:token (got an entry with {} part(s))",
+                entry.split(':').count()
+            );
         };
         let name = name.trim();
         if name.is_empty()
             || name.len() > 64
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         {
             bail!("MCP_CLIENT_KEYS client name `{name}`: use 1-64 of [A-Za-z0-9-_.]");
         }
         let scope = match scope.trim().to_ascii_lowercase().as_str() {
             "read" => Scope::Read,
             "write" => Scope::Write,
-            other => bail!("MCP_CLIENT_KEYS client `{name}`: scope must be read or write, got `{other}`"),
+            other => {
+                bail!("MCP_CLIENT_KEYS client `{name}`: scope must be read or write, got `{other}`")
+            }
         };
-        clients.push(ClientKey { name: name.to_string(), scope, token: token.trim().to_string() });
+        clients.push(ClientKey {
+            name: name.to_string(),
+            scope,
+            token: token.trim().to_string(),
+        });
     }
     if let Some(tok) = legacy.map(str::trim).filter(|t| !t.is_empty()) {
-        clients.push(ClientKey { name: "default".into(), scope: Scope::Write, token: tok.to_string() });
+        clients.push(ClientKey {
+            name: "default".into(),
+            scope: Scope::Write,
+            token: tok.to_string(),
+        });
     }
     if clients.is_empty() {
         bail!("no MCP client keys: set MCP_CLIENT_KEYS (name:scope:token,...) or MCP_BEARER_TOKEN");
@@ -185,7 +202,11 @@ fn load_clients(keys: Option<&str>, legacy: Option<&str>) -> Result<Vec<ClientKe
                 bail!("duplicate MCP client name `{}`", a.name);
             }
             if a.token == b.token {
-                bail!("MCP clients `{}` and `{}` share a key; give each client its own", a.name, b.name);
+                bail!(
+                    "MCP clients `{}` and `{}` share a key; give each client its own",
+                    a.name,
+                    b.name
+                );
             }
         }
     }
@@ -210,7 +231,11 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new(limit: u32) -> Self {
-        Self { window: Duration::from_secs(60), limit, buckets: HashMap::new() }
+        Self {
+            window: Duration::from_secs(60),
+            limit,
+            buckets: HashMap::new(),
+        }
     }
 
     fn check(&mut self, key: &str) -> Result<(), Duration> {
@@ -240,19 +265,28 @@ struct Sessions {
 
 impl Sessions {
     fn new(ttl: Duration, max: usize) -> Self {
-        Self { ttl, max: max.max(1), by_id: HashMap::new() }
+        Self {
+            ttl,
+            max: max.max(1),
+            by_id: HashMap::new(),
+        }
     }
 
     fn prune(&mut self, now: Instant) {
         let ttl = self.ttl;
-        self.by_id.retain(|_, (_, seen)| now.duration_since(*seen) < ttl);
+        self.by_id
+            .retain(|_, (_, seen)| now.duration_since(*seen) < ttl);
     }
 
     fn create(&mut self, client: &str) -> String {
         let now = Instant::now();
         self.prune(now);
         while self.by_id.len() >= self.max {
-            let oldest = self.by_id.iter().min_by_key(|(_, (_, seen))| *seen).map(|(k, _)| k.clone());
+            let oldest = self
+                .by_id
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(k, _)| k.clone());
             match oldest {
                 Some(k) => self.by_id.remove(&k),
                 None => break,
@@ -276,7 +310,11 @@ impl Sessions {
     }
 
     fn remove(&mut self, sid: &str, client: &str) -> bool {
-        if self.by_id.get(sid).is_some_and(|(owner, _)| owner == client) {
+        if self
+            .by_id
+            .get(sid)
+            .is_some_and(|(owner, _)| owner == client)
+        {
             self.by_id.remove(sid);
             true
         } else {
@@ -299,7 +337,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = match &self {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, json!({"error":"unauthorized"})),
-            ApiError::Message(m) => (StatusCode::BAD_REQUEST, json!({"error": redact::redact_text(m)})),
+            ApiError::Message(m) => (
+                StatusCode::BAD_REQUEST,
+                json!({"error": redact::redact_text(m)}),
+            ),
             ApiError::RateLimited(secs) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 json!({"error":"rate_limit_exceeded","retry_after_seconds":secs}),
@@ -340,7 +381,12 @@ struct RpcResponse {
 
 impl RpcResponse {
     fn ok(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     fn err(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
         Self {
@@ -404,7 +450,10 @@ async fn main() -> Result<()> {
 fn router(state: AppState) -> Router {
     let cors = build_cors(&state.cfg.cors_origins);
     Router::new()
-        .route("/healthz", get(|| async { Json(json!({"ok":true,"service":"mcp-cdc"})) }))
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({"ok":true,"service":"mcp-cdc"})) }),
+        )
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .with_state(state)
         .layer(cors)
@@ -432,7 +481,10 @@ fn build_cors(origins: &[String]) -> CorsLayer {
     if origins.iter().any(|o| o == "*") {
         return CorsLayer::permissive();
     }
-    let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| HeaderValue::from_str(o).ok()).collect();
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
     base.allow_origin(AllowOrigin::list(parsed))
 }
 
@@ -451,7 +503,10 @@ fn authenticate(headers: &HeaderMap, clients: &[ClientKey]) -> Option<ClientCtx>
     let mut found = None;
     for c in clients {
         if bool::from(tok.as_bytes().ct_eq(c.token.as_bytes())) {
-            found = Some(ClientCtx { name: c.name.clone(), scope: c.scope });
+            found = Some(ClientCtx {
+                name: c.name.clone(),
+                scope: c.scope,
+            });
         }
     }
     found
@@ -463,19 +518,34 @@ fn session_header(headers: &HeaderMap) -> Option<&str> {
 
 /// No server-initiated stream is offered; the spec allows 405 for GET.
 async fn mcp_get() -> Response {
-    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST, DELETE")]).into_response()
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST, DELETE")],
+    )
+        .into_response()
 }
 
-async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+async fn mcp_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
     let client = authenticate(&headers, &state.cfg.clients).ok_or(ApiError::Unauthorized)?;
     let Some(sid) = session_header(&headers) else {
         return Ok(StatusCode::BAD_REQUEST);
     };
     let removed = state.sessions.lock().unwrap().remove(sid, &client.name);
-    Ok(if removed { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND })
+    Ok(if removed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
 }
 
-async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+async fn mcp_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
     let client = authenticate(&headers, &state.cfg.clients).ok_or(ApiError::Unauthorized)?;
     if state.cfg.rate_limit_enabled {
         // Keyed by client, not IP: behind a proxy every caller shares one address.
@@ -497,7 +567,8 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     if req.method != "initialize" {
         if let Some(sid) = session_header(&headers) {
             if !state.sessions.lock().unwrap().touch(sid, &client.name) {
-                let resp = RpcResponse::err(req.id, -32001, "session not found; send initialize again");
+                let resp =
+                    RpcResponse::err(req.id, -32001, "session not found; send initialize again");
                 return Ok((StatusCode::NOT_FOUND, Json(resp)).into_response());
             }
         }
@@ -508,22 +579,40 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         return Ok(StatusCode::ACCEPTED.into_response());
     }
 
-    let (resp, new_sid) = CLIENT.scope(client.clone(), handle_rpc(&state, &client, req)).await;
+    let (resp, new_sid) = CLIENT
+        .scope(client.clone(), handle_rpc(&state, &client, req))
+        .await;
     let mut response = Json(resp).into_response();
     if let Some(sid) = new_sid.and_then(|s| HeaderValue::from_str(&s).ok()) {
-        response.headers_mut().insert(HeaderName::from_static("mcp-session-id"), sid);
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("mcp-session-id"), sid);
     }
     Ok(response)
 }
 
 fn negotiate_version(params: &Value) -> &'static str {
-    let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-    PROTOCOL_VERSIONS.iter().copied().find(|v| *v == asked).unwrap_or(PROTOCOL_VERSIONS[0])
+    let asked = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|v| *v == asked)
+        .unwrap_or(PROTOCOL_VERSIONS[0])
 }
 
-async fn handle_rpc(state: &AppState, client: &ClientCtx, req: RpcRequest) -> (RpcResponse, Option<String>) {
+async fn handle_rpc(
+    state: &AppState,
+    client: &ClientCtx,
+    req: RpcRequest,
+) -> (RpcResponse, Option<String>) {
     if req.jsonrpc != "2.0" {
-        return (RpcResponse::err(req.id, -32600, "invalid jsonrpc version"), None);
+        return (
+            RpcResponse::err(req.id, -32600, "invalid jsonrpc version"),
+            None,
+        );
     }
     let id = req.id;
     match req.method.as_str() {
@@ -545,14 +634,25 @@ async fn handle_rpc(state: &AppState, client: &ClientCtx, req: RpcRequest) -> (R
             (RpcResponse::ok(id, result), Some(sid))
         }
         "ping" => (RpcResponse::ok(id, json!({})), None),
-        "tools/list" => (RpcResponse::ok(id, json!({ "tools": tools::definitions() })), None),
+        "tools/list" => (
+            RpcResponse::ok(id, json!({ "tools": tools::definitions() })),
+            None,
+        ),
         "tools/call" => {
             let call: ToolCall = match serde_json::from_value(req.params) {
                 Ok(c) => c,
-                Err(e) => return (RpcResponse::err(id, -32602, format!("invalid params: {e}")), None),
+                Err(e) => {
+                    return (
+                        RpcResponse::err(id, -32602, format!("invalid params: {e}")),
+                        None,
+                    )
+                }
             };
             if !tools::definitions().iter().any(|d| d.name == call.name) {
-                return (RpcResponse::err(id, -32602, format!("unknown tool: {}", call.name)), None);
+                return (
+                    RpcResponse::err(id, -32602, format!("unknown tool: {}", call.name)),
+                    None,
+                );
             }
             let name = call.name.clone();
             // Tool failures are results with isError so the model can read them and retry;
@@ -570,13 +670,23 @@ async fn handle_rpc(state: &AppState, client: &ClientCtx, req: RpcRequest) -> (R
             (RpcResponse::ok(id, result), None)
         }
         "resources/list" => (RpcResponse::ok(id, json!({ "resources": [] })), None),
-        "prompts/list" => (RpcResponse::ok(id, json!({ "prompts": tools::prompts() })), None),
+        "prompts/list" => (
+            RpcResponse::ok(id, json!({ "prompts": tools::prompts() })),
+            None,
+        ),
         "prompts/get" => {
             let name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
-            let arguments = req.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let arguments = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             match tools::prompt_messages(name, &arguments) {
                 Ok(messages) => (
-                    RpcResponse::ok(id, json!({"description": tools::prompt_description(name), "messages": messages})),
+                    RpcResponse::ok(
+                        id,
+                        json!({"description": tools::prompt_description(name), "messages": messages}),
+                    ),
                     None,
                 ),
                 Err(e) => (RpcResponse::err(id, -32602, e.to_string()), None),
@@ -611,12 +721,17 @@ pub(crate) fn td(
 
 /// Writes need both the global switch and a write-scoped client key.
 pub(crate) fn can_write(state: &AppState) -> bool {
-    state.cfg.allow_write && CLIENT.try_with(|c| c.scope == Scope::Write).unwrap_or(false)
+    state.cfg.allow_write
+        && CLIENT
+            .try_with(|c| c.scope == Scope::Write)
+            .unwrap_or(false)
 }
 
 pub(crate) fn guard_write(state: &AppState) -> Result<(), ApiError> {
     if !state.cfg.allow_write {
-        return Err(ApiError::Message("write tools disabled; set ALLOW_WRITE_TOOLS=true".into()));
+        return Err(ApiError::Message(
+            "write tools disabled; set ALLOW_WRITE_TOOLS=true".into(),
+        ));
     }
     match CLIENT.try_with(|c| c.clone()) {
         Ok(c) if c.scope == Scope::Write => Ok(()),
@@ -638,7 +753,8 @@ pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ApiErro
 /// Orchestrator calls that legitimately run longer than the shared 60 s client timeout.
 fn orch_timeout(method: &Method, path: &str) -> Option<Duration> {
     let slow = path.starts_with("/cdc/engine/")
-        || (*method == Method::POST && (path.ends_with("/run") || path.ends_with("/test-connection")));
+        || (*method == Method::POST
+            && (path.ends_with("/run") || path.ends_with("/test-connection")));
     slow.then(|| Duration::from_secs(300))
 }
 
@@ -709,8 +825,16 @@ mod tests {
         let cfg = Arc::new(Config {
             bind_addr: "127.0.0.1:0".into(),
             clients: vec![
-                ClientKey { name: "ops".into(), scope: Scope::Write, token: KEY_W.into() },
-                ClientKey { name: "bi".into(), scope: Scope::Read, token: KEY_R.into() },
+                ClientKey {
+                    name: "ops".into(),
+                    scope: Scope::Write,
+                    token: KEY_W.into(),
+                },
+                ClientKey {
+                    name: "bi".into(),
+                    scope: Scope::Read,
+                    token: KEY_R.into(),
+                },
             ],
             allow_write,
             // Unroutable: any tool that skips guard_write fails with a connection error instead.
@@ -735,23 +859,39 @@ mod tests {
 
     fn auth(key: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, format!("Bearer {key}").parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        );
         h
     }
 
-    async fn post(st: &AppState, headers: HeaderMap, body: Value) -> (StatusCode, HeaderMap, Value) {
+    async fn post(
+        st: &AppState,
+        headers: HeaderMap,
+        body: Value,
+    ) -> (StatusCode, HeaderMap, Value) {
         let res = match mcp_post(State(st.clone()), headers, Bytes::from(body.to_string())).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
         let status = res.status();
         let headers = res.headers().clone();
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
-        (status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     fn ctx(scope: Scope) -> ClientCtx {
-        ClientCtx { name: "t".into(), scope }
+        ClientCtx {
+            name: "t".into(),
+            scope,
+        }
     }
 
     /// Superset of argument names used across tools so arg parsing never masks the guard.
@@ -857,51 +997,92 @@ mod tests {
     fn weak_secrets_are_detected() {
         assert!(is_weak_secret(""));
         assert!(is_weak_secret("short"));
-        assert!(is_weak_secret("change-me-mcp-cdc-token-min24chars"), "compose placeholder is >= 24 chars");
+        assert!(
+            is_weak_secret("change-me-mcp-cdc-token-min24chars"),
+            "compose placeholder is >= 24 chars"
+        );
         assert!(is_weak_secret("CHANGEME-but-padded-to-be-long-enough"));
         assert!(!is_weak_secret("a-perfectly-long-random-token-123456"));
     }
 
     #[test]
     fn client_keys_parse_scopes_and_legacy_token() {
-        let c = load_clients(Some("ops:write:aaa, bi:READ:b:c:d\nci:read:zzz"), Some("legacy")).unwrap();
-        let got: Vec<_> = c.iter().map(|k| (k.name.as_str(), k.scope, k.token.as_str())).collect();
-        assert_eq!(got, vec![
-            ("ops", Scope::Write, "aaa"),
-            ("bi", Scope::Read, "b:c:d"),
-            ("ci", Scope::Read, "zzz"),
-            ("default", Scope::Write, "legacy"),
-        ]);
+        let c = load_clients(
+            Some("ops:write:aaa, bi:READ:b:c:d\nci:read:zzz"),
+            Some("legacy"),
+        )
+        .unwrap();
+        let got: Vec<_> = c
+            .iter()
+            .map(|k| (k.name.as_str(), k.scope, k.token.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ops", Scope::Write, "aaa"),
+                ("bi", Scope::Read, "b:c:d"),
+                ("ci", Scope::Read, "zzz"),
+                ("default", Scope::Write, "legacy"),
+            ]
+        );
         assert!(load_clients(None, None).is_err(), "no keys at all");
-        assert!(load_clients(Some("ops:admin:x"), None).is_err(), "bad scope");
+        assert!(
+            load_clients(Some("ops:admin:x"), None).is_err(),
+            "bad scope"
+        );
         assert!(load_clients(Some("ops:x"), None).is_err(), "missing token");
         assert!(load_clients(Some("a b:read:x"), None).is_err(), "bad name");
-        assert!(load_clients(Some("a:read:x,a:write:y"), None).is_err(), "duplicate name");
-        assert!(load_clients(Some("a:read:x,b:write:x"), None).is_err(), "shared key");
+        assert!(
+            load_clients(Some("a:read:x,a:write:y"), None).is_err(),
+            "duplicate name"
+        );
+        assert!(
+            load_clients(Some("a:read:x,b:write:x"), None).is_err(),
+            "shared key"
+        );
     }
 
     #[test]
     fn authenticate_matches_exact_key_and_returns_scope() {
         let st = state(true);
-        assert_eq!(authenticate(&auth(KEY_W), &st.cfg.clients).unwrap().scope, Scope::Write);
+        assert_eq!(
+            authenticate(&auth(KEY_W), &st.cfg.clients).unwrap().scope,
+            Scope::Write
+        );
         let r = authenticate(&auth(KEY_R), &st.cfg.clients).unwrap();
         assert_eq!((r.name.as_str(), r.scope), ("bi", Scope::Read));
-        assert!(authenticate(&auth("reader-key-that-is-long-enough-000"), &st.cfg.clients).is_none());
+        assert!(
+            authenticate(&auth("reader-key-that-is-long-enough-000"), &st.cfg.clients).is_none()
+        );
         assert!(authenticate(&HeaderMap::new(), &st.cfg.clients).is_none());
         let mut basic = HeaderMap::new();
-        basic.insert(header::AUTHORIZATION, format!("Basic {KEY_W}").parse().unwrap());
+        basic.insert(
+            header::AUTHORIZATION,
+            format!("Basic {KEY_W}").parse().unwrap(),
+        );
         assert!(authenticate(&basic, &st.cfg.clients).is_none());
     }
 
     #[tokio::test]
     async fn read_scope_cannot_write_even_when_writes_enabled() {
         let st = state(true);
-        let r = CLIENT.scope(ctx(Scope::Read), async { guard_write(&st) }).await;
+        let r = CLIENT
+            .scope(ctx(Scope::Read), async { guard_write(&st) })
+            .await;
         assert!(matches!(r, Err(ApiError::Message(m)) if m.contains("read scope")));
-        assert!(CLIENT.scope(ctx(Scope::Write), async { guard_write(&st) }).await.is_ok());
+        assert!(CLIENT
+            .scope(ctx(Scope::Write), async { guard_write(&st) })
+            .await
+            .is_ok());
         assert!(guard_write(&st).is_err(), "no client in scope");
         let off = state(false);
-        assert!(CLIENT.scope(ctx(Scope::Write), async { guard_write(&off) }).await.is_err(), "global switch wins");
+        assert!(
+            CLIENT
+                .scope(ctx(Scope::Write), async { guard_write(&off) })
+                .await
+                .is_err(),
+            "global switch wins"
+        );
     }
 
     #[test]
@@ -932,8 +1113,14 @@ mod tests {
 
     #[test]
     fn version_negotiation_and_slow_paths() {
-        assert_eq!(negotiate_version(&json!({"protocolVersion":"2025-03-26"})), "2025-03-26");
-        assert_eq!(negotiate_version(&json!({"protocolVersion":"1999-01-01"})), PROTOCOL_VERSIONS[0]);
+        assert_eq!(
+            negotiate_version(&json!({"protocolVersion":"2025-03-26"})),
+            "2025-03-26"
+        );
+        assert_eq!(
+            negotiate_version(&json!({"protocolVersion":"1999-01-01"})),
+            PROTOCOL_VERSIONS[0]
+        );
         assert_eq!(negotiate_version(&json!({})), PROTOCOL_VERSIONS[0]);
         assert!(orch_timeout(&Method::POST, "/cdc/engine/up").is_some());
         assert!(orch_timeout(&Method::POST, "/cdc/pgcopy/profiles/x/run").is_some());
@@ -947,51 +1134,113 @@ mod tests {
         let (status, _, body) = post(&st, auth(KEY_W), json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cdc_copy_run","arguments":{"tool":"pgcopy","id":"x"}}})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], true);
-        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("write tools disabled"));
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("write tools disabled"));
         // Unknown tool and bad params: JSON-RPC -32602.
-        let (status, _, body) = post(&st, auth(KEY_W), json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope"}})).await;
+        let (status, _, body) = post(
+            &st,
+            auth(KEY_W),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope"}}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["error"]["code"], -32602);
-        let (_, _, body) = post(&st, auth(KEY_W), json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"arguments":{}}})).await;
+        let (_, _, body) = post(
+            &st,
+            auth(KEY_W),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"arguments":{}}}),
+        )
+        .await;
         assert_eq!(body["error"]["code"], -32602);
         // Parse error: -32700 with HTTP 400.
-        let res = mcp_post(State(st.clone()), auth(KEY_W), Bytes::from_static(b"{not json")).await.unwrap();
+        let res = mcp_post(
+            State(st.clone()),
+            auth(KEY_W),
+            Bytes::from_static(b"{not json"),
+        )
+        .await
+        .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn http_auth_sessions_and_methods() {
         let st = state(false);
-        let (status, headers, _) = post(&st, HeaderMap::new(), json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await;
+        let (status, headers, _) = post(
+            &st,
+            HeaderMap::new(),
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(headers.contains_key(header::WWW_AUTHENTICATE));
 
         let (status, headers, body) = post(&st, auth(KEY_W), json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
-        let sid = headers.get("mcp-session-id").unwrap().to_str().unwrap().to_string();
+        let sid = headers
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let mut with_sid = auth(KEY_W);
         with_sid.insert("mcp-session-id", sid.parse().unwrap());
-        let (status, _, _) = post(&st, with_sid.clone(), json!({"jsonrpc":"2.0","id":2,"method":"ping"})).await;
+        let (status, _, _) = post(
+            &st,
+            with_sid.clone(),
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
 
         // Same session id, other client: 404.
         let mut stolen = auth(KEY_R);
         stolen.insert("mcp-session-id", sid.parse().unwrap());
-        let (status, _, _) = post(&st, stolen.clone(), json!({"jsonrpc":"2.0","id":3,"method":"ping"})).await;
+        let (status, _, _) = post(
+            &st,
+            stolen.clone(),
+            json!({"jsonrpc":"2.0","id":3,"method":"ping"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Notification: 202, no body.
-        let (status, _, _) = post(&st, with_sid.clone(), json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
+        let (status, _, _) = post(
+            &st,
+            with_sid.clone(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
         // DELETE needs auth and only removes the caller's own session.
-        let unauth = mcp_delete(State(st.clone()), { let mut h = HeaderMap::new(); h.insert("mcp-session-id", sid.parse().unwrap()); h }).await;
+        let unauth = mcp_delete(State(st.clone()), {
+            let mut h = HeaderMap::new();
+            h.insert("mcp-session-id", sid.parse().unwrap());
+            h
+        })
+        .await;
         assert!(matches!(unauth, Err(ApiError::Unauthorized)));
-        assert_eq!(mcp_delete(State(st.clone()), stolen).await.unwrap(), StatusCode::NOT_FOUND);
-        assert_eq!(mcp_delete(State(st.clone()), with_sid.clone()).await.unwrap(), StatusCode::NO_CONTENT);
-        let (status, _, _) = post(&st, with_sid, json!({"jsonrpc":"2.0","id":4,"method":"ping"})).await;
+        assert_eq!(
+            mcp_delete(State(st.clone()), stolen).await.unwrap(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            mcp_delete(State(st.clone()), with_sid.clone())
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let (status, _, _) = post(
+            &st,
+            with_sid,
+            json!({"jsonrpc":"2.0","id":4,"method":"ping"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "deleted session");
 
         assert_eq!(mcp_get().await.status(), StatusCode::METHOD_NOT_ALLOWED);

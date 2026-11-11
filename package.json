@@ -12,7 +12,7 @@
     "check:openapi": "node scripts/check-openapi-routes.mjs",
     "check:ui-parity": "scripts/check-native-ui-parity.sh",
     "test:sidecars": "for d in sidecar_common pgdump rsync pgcopydb pgloader mongocopy redisshake; do (cd docker/$d && python3 -m unittest -q) || exit 1; done",
-    "check": "npm run check:openapi && npm run check:ui-parity && npm run test:unit && npm run test:rust && npm run test:sidecars",
+    "check": "npm run check:openapi && npm run test:unit && npm run test:rust && npm run test:sidecars",
     "test:all": "npm run check && npm run test:api",
     "test:unit": "node --no-warnings=MODULE_TYPELESS_PACKAGE_JSON --test --import ./tests/unit/register-ts.mjs tests/unit/*.test.ts"
   },

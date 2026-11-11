@@ -1149,6 +1149,10 @@ pub struct CdcProfile {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Free-form labels for grouping and filtering pipelines in the UI (e.g. `crm`,
+    /// `master-data`). Normalised on save by [`normalize_tags`]. Duplicate copies them.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub pattern: ProfilePattern,
     pub stream_platform: Option<StreamPlatform>,
     pub transform_strategy: TransformStrategy,
@@ -1177,6 +1181,41 @@ pub struct CdcProfile {
     /// Kafka Connect JDBC or lake sink connector name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_connector_name: Option<String>,
+}
+
+/// Upper bound on tags per pipeline.
+pub const MAX_PROFILE_TAGS: usize = 20;
+/// Upper bound on one tag's length in characters.
+pub const MAX_PROFILE_TAG_LEN: usize = 40;
+
+/// Trim, collapse inner whitespace and de-duplicate tags case-insensitively, keeping the
+/// first spelling and the given order. Empty entries are dropped. Errors name the limit
+/// that was exceeded so the UI can show it as-is.
+pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_PROFILE_TAG_LEN {
+            return Err(format!(
+                "tag '{}…' is longer than {MAX_PROFILE_TAG_LEN} characters",
+                tag.chars().take(12).collect::<String>()
+            ));
+        }
+        if out.iter().any(|t| t.eq_ignore_ascii_case(&tag)) {
+            continue;
+        }
+        out.push(tag);
+    }
+    if out.len() > MAX_PROFILE_TAGS {
+        return Err(format!(
+            "a pipeline can have at most {MAX_PROFILE_TAGS} tags ({} given)",
+            out.len()
+        ));
+    }
+    Ok(out)
 }
 
 /// Upper bound on retained history entries per profile.
@@ -1396,6 +1435,25 @@ mod tests {
         let unnamed = GovernanceConfig::default();
         assert_eq!(unnamed.identity("Payments CDC"), "Payments CDC");
     }
+
+    #[test]
+    fn normalize_tags_trims_dedupes_case_insensitively_and_enforces_limits() {
+        let tags = vec![
+            "  CRM ".to_string(),
+            "crm".to_string(),
+            "master  data".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(normalize_tags(&tags).unwrap(), vec!["CRM", "master data"]);
+
+        let long = vec!["x".repeat(MAX_PROFILE_TAG_LEN + 1)];
+        assert!(normalize_tags(&long).unwrap_err().contains("longer than"));
+
+        let many: Vec<String> = (0..=MAX_PROFILE_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(normalize_tags(&many).unwrap_err().contains("at most"));
+        assert_eq!(normalize_tags(&[]).unwrap(), Vec::<String>::new());
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1547,6 +1605,9 @@ pub struct ProfileUpsertRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// `None` keeps the saved tags on update; `Some(vec![])` clears them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub autostart: Option<bool>,
     pub pattern: Option<ProfilePattern>,

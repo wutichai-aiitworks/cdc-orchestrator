@@ -33,8 +33,30 @@ const api = useRsync()
 const toast = useToast()
 const num = (v: unknown) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? null : Number(v))
 
-const cleanEnd = (e: Endpoint) => ({
+// rsync daemon (rsync://): host, port, module, path inside it, optional daemon user + password.
+const cleanDaemon = (e: Endpoint) => ({
   ...e,
+  protocol: "daemon" as const,
+  module: (e.module || "").trim().replace(/^\/+|\/+$/g, ""),
+  name: e.name.trim() || e.host.trim(),
+  host: e.host.trim(),
+  port: e.port.trim() || "873",
+  username: e.username.trim(),
+  path: e.path.trim(),
+  auth: "password" as const,
+  password: e.username.trim() ? e.password : "",
+  private_key: "",
+  passphrase: "",
+  host_key_fingerprint: "",
+  rsync_path: "",
+  reach_host: "",
+  reach_port: "",
+})
+
+const cleanEnd = (e: Endpoint) => e.protocol === "daemon" ? cleanDaemon(e) : ({
+  ...e,
+  protocol: "ssh" as const,
+  module: "",
   name: e.name.trim() || e.host.trim(),
   host: e.host.trim(),
   port: e.port.trim() || "22",

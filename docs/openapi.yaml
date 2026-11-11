@@ -1073,6 +1073,24 @@ paths:
       responses:
         "200":
           description: EXPLAIN result
+  /cdc/schedule:
+    get:
+      summary: Schedule overview — interval and next run per pipeline
+      operationId: getSchedule
+      tags: [Profiles]
+      description: >-
+        One entry per pipeline with what drives it (poll / stream / once / idle), the poll
+        interval Kafka Connect runs on, the orchestrator poll-audit clock's last tick and
+        next tick, and the next scheduled full refresh. Sorted soonest next run first.
+        Poll pipelines are only timed while running; next_tick_at appears after the first
+        audit sweep (poll_audit_check_secs).
+      responses:
+        "200":
+          description: Schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScheduleResponse"
   /cdc/profiles:
     get:
       summary: List CDC profiles
@@ -1519,6 +1537,48 @@ paths:
                   original_restart_required: { type: boolean }
         "400":
           description: Invalid split (see `error`; may include `diagnosis`)
+        "404":
+          description: Pipeline not found
+  /cdc/profiles/{id}/duplicate:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: Copy a pipeline as a new Draft under a new name (original untouched)
+      description: |
+        Full copy of the pipeline — source and target connections (secrets included), capture
+        mode, schedule, every table, mapping and per-table poll rule — saved as a **Draft**,
+        never started. The copy gets its own id, connector/sink names and Kafka topic prefix
+        derived from the new name; a slot pinned in `source.connection.slot` is dropped. Unlike
+        `split`, the original is not modified and any capture mode or pattern is allowed: use
+        the copy as a template and edit tables, target and keys before starting it. Rejected
+        for an empty name or a name whose connector / topic prefix is already used.
+        Audit: `profile.duplicate` on both pipelines.
+      operationId: duplicateProfile
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: Name of the new pipeline }
+                description: { type: string, description: "Defaults to \"Duplicated from '<original>'.\"" }
+      responses:
+        "201":
+          description: New Draft pipeline created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: object, additionalProperties: true, description: New Draft pipeline (secrets redacted) }
+        "400":
+          description: Empty name, or name collides with an existing pipeline / connector / topic prefix
         "404":
           description: Pipeline not found
   /cdc/profiles/{id}/initial-load:
@@ -3255,6 +3315,15 @@ components:
       properties:
         name: { type: string, minLength: 1 }
         description: { type: string }
+        tags:
+          type: array
+          maxItems: 20
+          items: { type: string, maxLength: 40 }
+          description: >-
+            Free-form labels for grouping and filtering pipelines (e.g. crm, master-data).
+            Trimmed and de-duplicated case-insensitively on save. Omit on update to keep the
+            saved tags; send [] to clear them. Duplicate copies the original's tags. Returned
+            on every profile as `tags`.
         pattern:
           type: string
           enum: [source_to_stream, source_to_target, source_to_lake, source_to_olake]
@@ -3317,6 +3386,67 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/TableMapping"
+    ScheduleEntry:
+      type: object
+      required: [profile_id, name, tags, status, enabled, pattern, capture_mode, delivery_mode, kind]
+      properties:
+        profile_id: { type: string, format: uuid }
+        name: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        status: { type: string }
+        enabled: { type: boolean }
+        pattern: { type: string }
+        capture_mode: { type: string, enum: [logical, trigger, sync_once, incremental] }
+        delivery_mode: { type: string, enum: [realtime, micro_batch] }
+        kind:
+          type: string
+          enum: [poll, stream, once, idle]
+          description: >-
+            poll = interval-driven JDBC poll (incremental / trigger); stream = continuous
+            log capture; once = one-time snapshot; idle = not running, nothing scheduled.
+        interval_ms:
+          type: integer
+          nullable: true
+          description: Poll interval the connector runs on. Present for poll pipelines even while idle.
+        interval_source:
+          type: string
+          nullable: true
+          enum: [micro_batch, default]
+        last_tick_at: { type: string, format: date-time, nullable: true }
+        next_tick_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: last_tick_at + interval_ms. Aligned to the connector interval, not its exact poll instant.
+        full_refresh_minutes: { type: integer, nullable: true }
+        last_full_refresh_at: { type: string, format: date-time, nullable: true }
+        next_full_refresh_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Equal to the response timestamp when a running pipeline has never refreshed (next sweep runs it).
+        next_run_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Soonest of next_tick_at and next_full_refresh_at.
+        source_offsets:
+          type: string
+          nullable: true
+          description: Last source offsets the poll audit read from Kafka Connect.
+    ScheduleResponse:
+      type: object
+      required: [timestamp, poll_audit_check_secs, refresh_sweep_secs, entries]
+      properties:
+        timestamp: { type: string, format: date-time }
+        poll_audit_check_secs: { type: integer }
+        refresh_sweep_secs: { type: integer }
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScheduleEntry"
     ProfileResponse:
       type: object
       required: [profile, timestamp]

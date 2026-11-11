@@ -109,6 +109,8 @@ export type GovernanceConfig = {
 export type ProfilePayload = {
   name: string
   description?: string
+  /** Grouping labels; omit on update to keep the saved ones, [] clears them. */
+  tags?: string[]
   pattern: PipelinePattern
   stream_platform?: "kafka" | "redpanda" | null
   transform_strategy: "none" | "predefined" | "custom"
@@ -173,6 +175,41 @@ export type SplitProfileResult = {
   original_restart_required: boolean
 }
 
+export type ScheduleKind = "poll" | "stream" | "once" | "idle"
+
+/** One row of GET /cdc/schedule (see docs/openapi.yaml ScheduleEntry). */
+export type ScheduleEntry = {
+  profile_id: string
+  name: string
+  tags: string[]
+  status: string
+  enabled: boolean
+  pattern: PipelinePattern
+  capture_mode: "logical" | "trigger" | "sync_once" | "incremental"
+  delivery_mode: "realtime" | "micro_batch"
+  kind: ScheduleKind
+  interval_ms?: number | null
+  interval_source?: "micro_batch" | "default" | null
+  last_tick_at?: string | null
+  next_tick_at?: string | null
+  full_refresh_minutes?: number | null
+  last_full_refresh_at?: string | null
+  next_full_refresh_at?: string | null
+  next_run_at?: string | null
+  source_offsets?: string | null
+}
+
+export type ScheduleResponse = {
+  timestamp: string
+  poll_audit_check_secs: number
+  refresh_sweep_secs: number
+  entries: ScheduleEntry[]
+}
+
+export type DuplicateProfileResult = {
+  created: CdcProfile
+}
+
 export type InitialLoadStatus = {
   profile_id: string
   state: "running" | "succeeded" | "failed" | "cancelled"
@@ -222,6 +259,7 @@ export type ProfileDlqStatus = {
 }
 
 export const useProfilesM3 = () => {
+  const fetchSchedule = () => $fetch<ScheduleResponse>("/api/cdc/schedule")
   const fetchProfiles = async () => {
     const response = await $fetch<{ profiles: CdcProfile[] }>("/api/cdc/profiles")
     return response.profiles || []
@@ -374,8 +412,14 @@ export const useProfilesM3 = () => {
   const splitProfile = (id: string, body: { name: string; description?: string; tables: string[] }) =>
     $fetch<SplitProfileResult>(`/api/cdc/profiles/${encodeURIComponent(id)}/split`, { method: "POST", body })
 
+  /** Full copy of a pipeline as a new Draft under a new name (original untouched). */
+  const duplicateProfile = (id: string, body: { name: string; description?: string }) =>
+    $fetch<DuplicateProfileResult>(`/api/cdc/profiles/${encodeURIComponent(id)}/duplicate`, { method: "POST", body })
+
   return {
+    fetchSchedule,
     splitProfile,
+    duplicateProfile,
     startInitialLoad,
     getInitialLoad,
     cancelInitialLoad,

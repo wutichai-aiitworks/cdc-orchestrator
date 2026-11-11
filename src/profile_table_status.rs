@@ -348,6 +348,47 @@ fn capture_topic(profile: &CdcProfile, prefix: &str, schema: &str, table: &str) 
     }
 }
 
+/// Every capture topic this pipeline's source writes, in table order.
+///
+/// JDBC capture (trigger / incremental) always writes `{prefix}.{TABLE}`. Debezium's
+/// shape depends on the connector, so only the dialects whose topics are
+/// `{prefix}.{schema}.{table}` are listed (Postgres, MySQL/MariaDB); other sources
+/// return nothing and keep relying on the connector's own topic creation.
+pub(crate) fn capture_topics(profile: &CdcProfile) -> Vec<String> {
+    use crate::models::CaptureMode;
+    let jdbc = matches!(
+        profile.source.capture_mode,
+        CaptureMode::Trigger | CaptureMode::Incremental
+    );
+    let two_part_debezium = matches!(
+        profile
+            .source
+            .source_type
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "postgres" | "postgresql" | "mysql" | "mariadb"
+    );
+    if !jdbc && !two_part_debezium {
+        return Vec::new();
+    }
+    let prefix = topic_prefix_for(profile);
+    let mut seen = std::collections::HashSet::new();
+    table_entries_raw(profile)
+        .into_iter()
+        .filter(|e| !e.source_table.trim().is_empty())
+        .map(|e| {
+            capture_topic(
+                profile,
+                &prefix,
+                e.source_schema.trim(),
+                e.source_table.trim(),
+            )
+        })
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
 #[derive(Clone)]
 struct TableEntry {
     source_schema: String,
@@ -963,6 +1004,52 @@ mod tests {
         assert_eq!(lags.get("t.a"), Some(&7));
         assert_eq!(lags.get("t.b"), Some(&19));
         assert!(parse_group_lag("GROUP g\nSTATE        Dead\n").is_none());
+    }
+
+    #[test]
+    fn capture_topics_follow_capture_mode_and_dedupe() {
+        let mut p = crate::postgres_trigger_cdc::tests::profile();
+        p.name = "Shop Sync".into();
+        p.source.source_type = "oracle".into();
+        p.source.capture_mode = crate::models::CaptureMode::Incremental;
+        p.source.tables = vec!["CRM_STG.PAT_CARBRAND".into(), "CRM_STG.PAT_CARMODEL".into()];
+        p.flow.mappings = vec![
+            TableMapping {
+                source_schema: "CRM_STG".into(),
+                source_table: "PAT_CARBRAND".into(),
+                target_schema: "pandora".into(),
+                target_table: "pat_carbrand".into(),
+                identical: false,
+                columns: vec![],
+                pk_columns: vec![],
+            },
+            TableMapping {
+                source_schema: "CRM_STG".into(),
+                source_table: "PAT_CARMODEL".into(),
+                target_schema: "pandora".into(),
+                target_table: "pat_carmodel".into(),
+                identical: false,
+                columns: vec![],
+                pk_columns: vec![],
+            },
+        ];
+        // JDBC capture: `{prefix}.{TABLE}` — exactly what the sink's `topics.regex` matches.
+        assert_eq!(
+            capture_topics(&p),
+            vec!["shop_sync.PAT_CARBRAND", "shop_sync.PAT_CARMODEL"]
+        );
+        // Oracle has no Debezium connector here: logical capture pre-creates nothing.
+        p.source.capture_mode = crate::models::CaptureMode::Logical;
+        assert!(capture_topics(&p).is_empty());
+        // Postgres Debezium: `{prefix}.{schema}.{table}`.
+        p.source.source_type = "postgres".into();
+        assert_eq!(
+            capture_topics(&p),
+            vec![
+                "shop_sync.CRM_STG.PAT_CARBRAND",
+                "shop_sync.CRM_STG.PAT_CARMODEL"
+            ]
+        );
     }
 
     #[test]

@@ -483,6 +483,7 @@ mod tests {
             },
             status: ProfileStatus::Stopped,
             enabled: true,
+            tags: vec![],
             connector_name: None,
             sink_connector_name: None,
             last_error: None,

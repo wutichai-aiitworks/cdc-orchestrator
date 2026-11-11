@@ -794,6 +794,7 @@ mod tests {
             history: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            tags: vec![],
             connector_name: None,
             sink_connector_name: None,
         }
@@ -969,6 +970,7 @@ mod tests {
         ProfileUpsertRequest {
             name: p.name.clone(),
             description: None,
+            tags: None,
             autostart: None,
             pattern: Some(p.pattern.clone()),
             stream_platform: None,
@@ -980,6 +982,46 @@ mod tests {
             sink_error_policy: None,
             flow: p.flow.clone(),
         }
+    }
+
+    /// Regression: an Oracle → Postgres incremental pipeline mapped
+    /// `CRM_STG.PAT_CARMODEL` → `pandora.pat_carmodel`. The sink predicate was built in
+    /// the Debezium shape (`.*CRM_STG\.PAT_CARMODEL$`), which never matches the JDBC
+    /// topic `crm_stg_master___carmodel.PAT_CARMODEL`, so the rename was skipped and
+    /// the sink auto-created `"PAT_CARMODEL"`. The predicate must follow the mapping.
+    #[test]
+    fn incremental_sink_predicate_matches_jdbc_topic_for_remapped_table() {
+        use crate::models::TableMapping;
+        let mut p = oracle_profile();
+        p.source.tables = vec!["CRM_STG.PAT_CARMODEL".into()];
+        p.source.schemas = vec!["CRM_STG".into()];
+        p.source.timestamp_column = None;
+        p.source.upsert_key_columns = vec!["CAR_MODEL_ID".into()];
+        p.source.table_poll = vec![full_copy("CRM_STG.PAT_CARMODEL")];
+        p.flow.mappings = vec![TableMapping {
+            source_schema: "CRM_STG".into(),
+            source_table: "PAT_CARMODEL".into(),
+            target_schema: "pandora".into(),
+            target_table: "pat_carmodel".into(),
+            identical: false,
+            columns: vec![],
+            pk_columns: vec![],
+        }];
+        let sink = build_incremental_sink_config(&p, "http://cdc-message:8081").unwrap();
+        assert_eq!(sink.get("transforms").unwrap(), "map0,route");
+        assert_eq!(
+            sink.get("transforms.map0.replacement").unwrap(),
+            "pat_carmodel"
+        );
+
+        let pattern = regex::Regex::new(sink.get("predicates.p0.pattern").unwrap()).unwrap();
+        // Per-table query-mode connector: topic.prefix is the exact topic.
+        assert!(pattern.is_match("crm_stg_master___carmodel.PAT_CARMODEL"));
+        // Table-mode watermark connector: `{prefix}.` + table name.
+        assert!(pattern.is_match("draft___oracle.PAT_CARMODEL"));
+        // Must not grab a sibling table or a longer suffix.
+        assert!(!pattern.is_match("crm_stg_master___carmodel.PM_PROBRAND"));
+        assert!(!pattern.is_match("crm_stg_master___carmodel.PAT_CARMODEL_HIST"));
     }
 
     #[test]

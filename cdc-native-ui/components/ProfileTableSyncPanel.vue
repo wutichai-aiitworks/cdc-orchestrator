@@ -116,7 +116,7 @@ const topicMissing = (row: TableSyncStatusRow) => row.kafka_error === MISSING_TO
  */
 const missingTopicNote = (row: TableSyncStatusRow) => {
   if (pipelineIdle.value) {
-    return "Created on first Start — test initial sync copies rows directly and does not use Kafka."
+    return "Created when the pipeline first runs (Start or Resync). A test initial sync copies rows directly and does not use Kafka."
   }
   const mode = String(data.value?.capture_mode || "").toLowerCase()
   if (row.phase === "complete") {

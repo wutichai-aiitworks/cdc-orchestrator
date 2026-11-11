@@ -895,6 +895,7 @@ pub(crate) mod tests {
             history: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            tags: vec![],
             connector_name: None,
             sink_connector_name: None,
         }

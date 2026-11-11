@@ -81,6 +81,7 @@ mod tests {
         password: &str,
     ) -> SchemaCompareConn {
         SchemaCompareConn {
+            tunnel_id: None,
             db_type: db_type.into(),
             host: host.into(),
             port: port.into(),

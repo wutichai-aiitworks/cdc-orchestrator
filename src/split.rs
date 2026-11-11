@@ -11,6 +11,11 @@
 //! connectors keep the old table list until it is restarted — on purpose: while both
 //! pipelines carry a table they upsert the same rows by key, so starting the new
 //! pipeline first and restarting the original second loses nothing.
+//!
+//! [`plan_duplicate`] is the non-destructive sibling: a full copy of a pipeline (all
+//! tables, mappings, poll rules, secrets) saved as a Draft under a new name, with the
+//! same fresh identity rules. The original is untouched. Use it as a template for the
+//! next pipeline on the same source/target; edit tables and target before starting.
 
 use std::collections::HashSet;
 
@@ -30,6 +35,19 @@ pub struct SplitRequest {
     pub description: Option<String>,
     /// `schema.table` source names to move (as listed in `source.tables`).
     pub tables: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DuplicateRequest {
+    /// Name of the new pipeline.
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DuplicateResponse {
+    pub created: CdcProfile,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,17 +134,17 @@ fn ensure_split_allowed(original: &CdcProfile, name: &str) -> Result<(), AppErro
     Ok(())
 }
 
-/// Build the new pipeline and the trimmed original. Pure: the caller persists both.
-pub fn plan_split(
+/// Copy `original` under `name` with a brand-new identity: new id, Draft, never
+/// autostarted, no connector names yet (they derive from the new name), no pinned
+/// replication slot (it would be shared with the original), empty history.
+/// Rejects a name that collides with any pipeline's name, connector names or Kafka
+/// topic prefix. Tables, mappings and poll rules are left for the caller to shape.
+fn fresh_copy(
     original: &CdcProfile,
     others: &[CdcProfile],
-    req: &SplitRequest,
-) -> Result<(CdcProfile, CdcProfile, Vec<String>), AppError> {
-    let name = req.name.trim();
-    ensure_split_allowed(original, name)?;
-    let (_wanted, moved, kept) = split_table_lists(original, req)?;
-
-    // New identity must not collide with any pipeline (names, connectors, topics).
+    name: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<CdcProfile, AppError> {
     let mut created = original.clone();
     created.name = name.to_string();
     created.connector_name = None;
@@ -154,16 +172,7 @@ pub fn plan_split(
             )));
         }
     }
-
-    let now = Utc::now();
-    let moved_set: HashSet<String> = moved.iter().map(|t| norm(t)).collect();
-
     created.id = Uuid::new_v4();
-    created.description = req
-        .description
-        .clone()
-        .filter(|d| !d.trim().is_empty())
-        .unwrap_or_else(|| format!("Split from '{}'.", original.name));
     created.status = ProfileStatus::Draft;
     created.enabled = true;
     created.autostart = false;
@@ -171,9 +180,66 @@ pub fn plan_split(
     created.created_at = now;
     created.updated_at = now;
     created.history = Vec::new();
-    created.source.tables = moved.clone();
     // A pinned slot would be shared with the original: let it derive from the new name.
     created.source.connection.remove("slot");
+    Ok(created)
+}
+
+/// Full copy of a pipeline as a new Draft. Pure: the caller persists it. Unlike
+/// [`plan_split`] the original is not modified and every capture mode / pattern is
+/// allowed — nothing starts, so there is no second consumer of a trigger changelog or
+/// replication slot until the user edits and starts the copy.
+pub fn plan_duplicate(
+    original: &CdcProfile,
+    others: &[CdcProfile],
+    req: &DuplicateRequest,
+) -> Result<CdcProfile, AppError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("name the new pipeline".into()));
+    }
+    let now = Utc::now();
+    let mut created = fresh_copy(original, others, name, now)?;
+    created.description = req
+        .description
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| format!("Duplicated from '{}'.", original.name));
+    if created.governance.dataset.trim().is_empty() || created.governance.dataset == original.name {
+        created.governance.dataset = created.name.clone();
+    }
+    let tables = created.source.tables.len();
+    created.push_history(HistoryItem {
+        timestamp: now,
+        level: "info".into(),
+        event: "profile_created".into(),
+        detail: format!(
+            "Duplicated from '{}' ({} table(s)); review tables, target and keys before starting",
+            original.name, tables
+        ),
+    });
+    Ok(created)
+}
+
+/// Build the new pipeline and the trimmed original. Pure: the caller persists both.
+pub fn plan_split(
+    original: &CdcProfile,
+    others: &[CdcProfile],
+    req: &SplitRequest,
+) -> Result<(CdcProfile, CdcProfile, Vec<String>), AppError> {
+    let name = req.name.trim();
+    ensure_split_allowed(original, name)?;
+    let (_wanted, moved, kept) = split_table_lists(original, req)?;
+
+    let now = Utc::now();
+    let mut created = fresh_copy(original, others, name, now)?;
+    let moved_set: HashSet<String> = moved.iter().map(|t| norm(t)).collect();
+    created.description = req
+        .description
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| format!("Split from '{}'.", original.name));
+    created.source.tables = moved.clone();
     created
         .source
         .table_poll
@@ -339,5 +405,61 @@ mod tests {
         let mut trig = profile();
         trig.source.capture_mode = CaptureMode::Trigger;
         assert!(plan_split(&trig, &[], &req("X", &["public.groups"])).is_err());
+    }
+
+    fn dup(name: &str) -> DuplicateRequest {
+        DuplicateRequest {
+            name: name.into(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_copies_everything_with_a_fresh_identity() {
+        let orig = profile();
+        let new = plan_duplicate(&orig, &[], &dup("CollabX Sync copy")).unwrap();
+        assert_ne!(new.id, orig.id);
+        assert_eq!(new.name, "CollabX Sync copy");
+        assert_eq!(new.status, ProfileStatus::Draft);
+        assert!(!new.autostart);
+        assert!(new.connector_name.is_none() && new.sink_connector_name.is_none());
+        assert_eq!(connector_name_for(&new), "cdc-collabx-sync-copy");
+        assert_eq!(topic_prefix_for(&new), "collabx_sync_copy");
+        // Nothing trimmed: same tables, mappings, source/target connections (secrets included).
+        assert_eq!(new.source.tables, orig.source.tables);
+        assert_eq!(new.flow.mappings.len(), orig.flow.mappings.len());
+        assert_eq!(
+            new.source.connection.get("host"),
+            orig.source.connection.get("host")
+        );
+        assert_eq!(
+            new.source.connection.get("password"),
+            orig.source.connection.get("password")
+        );
+        assert!(
+            !new.source.connection.contains_key("slot"),
+            "slot must not be shared"
+        );
+        assert_eq!(new.description, "Duplicated from 'CollabX Sync'.");
+        assert_eq!(new.history.len(), 1);
+        assert_eq!(new.history[0].event, "profile_created");
+    }
+
+    #[test]
+    fn duplicate_allows_trigger_and_rejects_identity_collisions() {
+        let mut trig = profile();
+        trig.source.capture_mode = CaptureMode::Trigger;
+        assert!(plan_duplicate(&trig, &[], &dup("Trigger copy")).is_ok());
+
+        let orig = profile();
+        let err = |r: DuplicateRequest, others: &[CdcProfile]| {
+            plan_duplicate(&orig, others, &r).unwrap_err().to_string()
+        };
+        assert!(err(dup("  "), &[]).contains("name"));
+        assert!(err(dup("collabx sync"), &[]).contains("already exists"));
+        let mut other = profile();
+        other.name = "CollabX-Sync-Copy".into();
+        other.connector_name = None;
+        assert!(err(dup("CollabX Sync Copy"), &[other]).contains("already used"));
     }
 }

@@ -6,28 +6,72 @@
 use axum::http::Method;
 use serde_json::{json, Map, Value};
 
-use crate::{arg_str, guard_write, orch, td, urlencoding_simple, ApiError, AppState, ToolCall, ToolDef};
+use crate::{
+    arg_str, guard_write, orch, td, urlencoding_simple, ApiError, AppState, ToolCall, ToolDef,
+};
 
-const TOOLS: [&str; 6] = ["pgcopy", "pgdump", "pgloader", "mongocopy", "redisshake", "rsync"];
+const TOOLS: [&str; 6] = [
+    "pgcopy",
+    "pgdump",
+    "pgloader",
+    "mongocopy",
+    "redisshake",
+    "rsync",
+];
 /// Placeholder that makes the orchestrator keep a saved password (same login only).
 const REDACTED: &str = crate::redact::MASK;
 
 /// Keys of `PgCopyCloneOptions` (orchestrator `src/models.rs`). The orchestrator silently drops
 /// unknown keys, so a typo would widen or change a clone without any error — reject it here.
 const PGCOPY_OPTION_KEYS: &[&str] = &[
-    "table_jobs", "index_jobs", "restore_jobs", "large_objects_jobs",
-    "split_tables_larger_than", "split_max_parts", "drop_if_exists", "roles",
-    "no_role_passwords", "no_owner", "no_acl", "no_comments", "no_tablespaces",
-    "skip_large_objects", "skip_extensions", "skip_ext_comments", "skip_collations",
-    "skip_vacuum", "skip_analyze", "skip_db_properties", "skip_split_by_ctid", "fail_fast",
-    "restart", "resume", "not_consistent", "follow", "create_slot",
-    "wal2json_numeric_as_string", "use_copy_binary", "all_databases", "estimate_table_sizes",
-    "plugin", "slot_name", "origin", "endpos", "snapshot", "requirements", "filters_file",
+    "table_jobs",
+    "index_jobs",
+    "restore_jobs",
+    "large_objects_jobs",
+    "split_tables_larger_than",
+    "split_max_parts",
+    "drop_if_exists",
+    "roles",
+    "no_role_passwords",
+    "no_owner",
+    "no_acl",
+    "no_comments",
+    "no_tablespaces",
+    "skip_large_objects",
+    "skip_extensions",
+    "skip_ext_comments",
+    "skip_collations",
+    "skip_vacuum",
+    "skip_analyze",
+    "skip_db_properties",
+    "skip_split_by_ctid",
+    "fail_fast",
+    "restart",
+    "resume",
+    "not_consistent",
+    "follow",
+    "create_slot",
+    "wal2json_numeric_as_string",
+    "use_copy_binary",
+    "all_databases",
+    "estimate_table_sizes",
+    "plugin",
+    "slot_name",
+    "origin",
+    "endpos",
+    "snapshot",
+    "requirements",
+    "filters_file",
 ];
 
 /// Prompt-friendly top-level flags copied into `options` (subset of PGCOPY_OPTION_KEYS).
 const PGCOPY_FRIENDLY_FLAGS: &[&str] = &[
-    "drop_if_exists", "no_owner", "no_acl", "skip_extensions", "table_jobs", "index_jobs",
+    "drop_if_exists",
+    "no_owner",
+    "no_acl",
+    "skip_extensions",
+    "table_jobs",
+    "index_jobs",
 ];
 
 fn tool_prop() -> Value {
@@ -45,21 +89,42 @@ pub fn definitions() -> Vec<ToolDef> {
         })
     };
     let mut create_props = Map::new();
-    create_props.insert("name".into(), json!({"type":"string","description":"Profile name, e.g. supertokens-copy"}));
+    create_props.insert(
+        "name".into(),
+        json!({"type":"string","description":"Profile name, e.g. supertokens-copy"}),
+    );
     create_props.insert("id".into(), json!({"type":"string","description":"Existing pgcopy profile id to replace (update). Omit to create."}));
-    for (k, v) in conn_side("source", "cdc-postgres-source").as_object().unwrap() {
+    for (k, v) in conn_side("source", "cdc-postgres-source")
+        .as_object()
+        .unwrap()
+    {
         create_props.insert(k.clone(), v.clone());
     }
-    for (k, v) in conn_side("target", "cdc-postgres-target").as_object().unwrap() {
+    for (k, v) in conn_side("target", "cdc-postgres-target")
+        .as_object()
+        .unwrap()
+    {
         create_props.insert(k.clone(), v.clone());
     }
     create_props.insert("include_tables".into(), json!({"type":["string","array"],"description":"schema.table list (CSV or array). Empty = whole database."}));
     create_props.insert("drop_if_exists".into(), json!({"type":"boolean","default":false,"description":"DROP target objects before restore (destructive on run)."}));
     create_props.insert("no_owner".into(), json!({"type":"boolean","default":false,"description":"Skip ALTER OWNER (use when source owner roles do not exist on target)."}));
-    create_props.insert("no_acl".into(), json!({"type":"boolean","default":false,"description":"Skip GRANT/REVOKE."}));
-    create_props.insert("skip_extensions".into(), json!({"type":"boolean","default":false}));
-    create_props.insert("table_jobs".into(), json!({"type":"integer","description":"Parallel table copy jobs"}));
-    create_props.insert("index_jobs".into(), json!({"type":"integer","description":"Parallel index build jobs"}));
+    create_props.insert(
+        "no_acl".into(),
+        json!({"type":"boolean","default":false,"description":"Skip GRANT/REVOKE."}),
+    );
+    create_props.insert(
+        "skip_extensions".into(),
+        json!({"type":"boolean","default":false}),
+    );
+    create_props.insert(
+        "table_jobs".into(),
+        json!({"type":"integer","description":"Parallel table copy jobs"}),
+    );
+    create_props.insert(
+        "index_jobs".into(),
+        json!({"type":"integer","description":"Parallel index build jobs"}),
+    );
     create_props.insert("options".into(), json!({"type":"object","description":"Advanced pgcopydb options (keys of PgCopyCloneOptions; unknown keys are rejected). See cdc_migration_tool_contract tool_id=pgcopy."}));
     create_props.insert("test_connection".into(), json!({"type":"boolean","default":true,"description":"After saving, test source and target from the pgcopydb sidecar (read-only). Never starts a copy."}));
 
@@ -142,60 +207,116 @@ pub fn definitions() -> Vec<ToolDef> {
 pub async fn call(state: &AppState, call: &ToolCall) -> Option<Result<Value, ApiError>> {
     let args = &call.arguments;
     let out = match call.name.as_str() {
-        "cdc_copy_profile_list" => async {
-            let tool = tool_arg(args)?;
-            orch(state, Method::GET, &format!("/cdc/{tool}/profiles"), None).await
+        "cdc_copy_profile_list" => {
+            async {
+                let tool = tool_arg(args)?;
+                orch(state, Method::GET, &format!("/cdc/{tool}/profiles"), None).await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_profile_get" => async {
-            let tool = tool_arg(args)?;
-            let id = seg(arg_str(args, "id")?);
-            orch(state, Method::GET, &format!("/cdc/{tool}/profiles/{id}"), None).await
+        "cdc_copy_profile_get" => {
+            async {
+                let tool = tool_arg(args)?;
+                let id = seg(arg_str(args, "id")?);
+                orch(
+                    state,
+                    Method::GET,
+                    &format!("/cdc/{tool}/profiles/{id}"),
+                    None,
+                )
+                .await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_test_connection" => async {
-            let tool = tool_arg(args)?;
-            let body = test_connection_body(args)?;
-            orch(state, Method::POST, &format!("/cdc/{tool}/test-connection"), Some(body)).await
+        "cdc_copy_test_connection" => {
+            async {
+                let tool = tool_arg(args)?;
+                let body = test_connection_body(args)?;
+                orch(
+                    state,
+                    Method::POST,
+                    &format!("/cdc/{tool}/test-connection"),
+                    Some(body),
+                )
+                .await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_jobs" => async {
-            let tool = tool_arg(args)?;
-            let path = match args.get("job_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                Some(job) => format!("/cdc/{tool}/jobs/{}", seg(job)),
-                None => format!("/cdc/{tool}/jobs"),
-            };
-            orch(state, Method::GET, &path, None).await
+        "cdc_copy_jobs" => {
+            async {
+                let tool = tool_arg(args)?;
+                let path = match args
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(job) => format!("/cdc/{tool}/jobs/{}", seg(job)),
+                    None => format!("/cdc/{tool}/jobs"),
+                };
+                orch(state, Method::GET, &path, None).await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_job_logs" => async {
-            let tool = tool_arg(args)?;
-            let job = seg(arg_str(args, "job_id")?);
-            orch(state, Method::GET, &format!("/cdc/{tool}/jobs/{job}/logs"), None).await
+        "cdc_copy_job_logs" => {
+            async {
+                let tool = tool_arg(args)?;
+                let job = seg(arg_str(args, "job_id")?);
+                orch(
+                    state,
+                    Method::GET,
+                    &format!("/cdc/{tool}/jobs/{job}/logs"),
+                    None,
+                )
+                .await
+            }
+            .await
         }
-        .await,
         "cdc_pg_copy_create" => pg_copy_create(state, args).await,
-        "cdc_copy_run" => async {
-            guard_write(state)?;
-            let tool = tool_arg(args)?;
-            let id = seg(arg_str(args, "id")?);
-            orch(state, Method::POST, &format!("/cdc/{tool}/profiles/{id}/run"), None).await
+        "cdc_copy_run" => {
+            async {
+                guard_write(state)?;
+                let tool = tool_arg(args)?;
+                let id = seg(arg_str(args, "id")?);
+                orch(
+                    state,
+                    Method::POST,
+                    &format!("/cdc/{tool}/profiles/{id}/run"),
+                    None,
+                )
+                .await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_job_stop" => async {
-            guard_write(state)?;
-            let tool = tool_arg(args)?;
-            let job = seg(arg_str(args, "job_id")?);
-            orch(state, Method::POST, &format!("/cdc/{tool}/jobs/{job}/stop"), None).await
+        "cdc_copy_job_stop" => {
+            async {
+                guard_write(state)?;
+                let tool = tool_arg(args)?;
+                let job = seg(arg_str(args, "job_id")?);
+                orch(
+                    state,
+                    Method::POST,
+                    &format!("/cdc/{tool}/jobs/{job}/stop"),
+                    None,
+                )
+                .await
+            }
+            .await
         }
-        .await,
-        "cdc_copy_profile_delete" => async {
-            guard_write(state)?;
-            let tool = tool_arg(args)?;
-            let id = seg(arg_str(args, "id")?);
-            orch(state, Method::DELETE, &format!("/cdc/{tool}/profiles/{id}"), None).await
+        "cdc_copy_profile_delete" => {
+            async {
+                guard_write(state)?;
+                let tool = tool_arg(args)?;
+                let id = seg(arg_str(args, "id")?);
+                orch(
+                    state,
+                    Method::DELETE,
+                    &format!("/cdc/{tool}/profiles/{id}"),
+                    None,
+                )
+                .await
+            }
+            .await
         }
-        .await,
         _ => return None,
     };
     Some(out)
@@ -203,25 +324,58 @@ pub async fn call(state: &AppState, call: &ToolCall) -> Option<Result<Value, Api
 
 async fn pg_copy_create(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     guard_write(state)?;
-    let update_id = args.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let update_id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
     let body = pg_copy_body(args, update_id.is_some())?;
     let saved = match update_id {
-        Some(id) => orch(state, Method::PUT, &format!("/cdc/pgcopy/profiles/{}", seg(id)), Some(body.clone())).await?,
-        None => orch(state, Method::POST, "/cdc/pgcopy/profiles", Some(body.clone())).await?,
+        Some(id) => {
+            orch(
+                state,
+                Method::PUT,
+                &format!("/cdc/pgcopy/profiles/{}", seg(id)),
+                Some(body.clone()),
+            )
+            .await?
+        }
+        None => {
+            orch(
+                state,
+                Method::POST,
+                "/cdc/pgcopy/profiles",
+                Some(body.clone()),
+            )
+            .await?
+        }
     };
-    let profile_id = saved.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let profile_id = saved
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
     let mut tests = Value::Null;
-    if args.get("test_connection").and_then(Value::as_bool).unwrap_or(true) && !profile_id.is_empty() {
+    if args
+        .get("test_connection")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        && !profile_id.is_empty()
+    {
         let mut out = Map::new();
         for side in ["source", "target"] {
             // Redacted password + profile_id: the orchestrator fills the saved one (same login only).
             let mut conn = body[side].clone();
             conn["password"] = json!(REDACTED);
             let req = json!({"connection": conn, "side": side, "profile_id": profile_id});
-            let res = orch(state, Method::POST, "/cdc/pgcopy/test-connection", Some(req))
-                .await
-                .unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
+            let res = orch(
+                state,
+                Method::POST,
+                "/cdc/pgcopy/test-connection",
+                Some(req),
+            )
+            .await
+            .unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
             out.insert(side.into(), res);
         }
         tests = Value::Object(out);
@@ -241,8 +395,13 @@ fn pg_copy_body(args: &Value, is_update: bool) -> Result<Value, ApiError> {
     let name = arg_str(args, "name")?.trim().to_string();
     let source = pg_conn(args, "source", is_update)?;
     let target = pg_conn(args, "target", is_update)?;
-    if source["host"] == target["host"] && source["port"] == target["port"] && source["database"] == target["database"] {
-        return Err(ApiError::Message("source and target are the same database".into()));
+    if source["host"] == target["host"]
+        && source["port"] == target["port"]
+        && source["database"] == target["database"]
+    {
+        return Err(ApiError::Message(
+            "source and target are the same database".into(),
+        ));
     }
 
     let mut options = match args.get("options") {
@@ -255,7 +414,10 @@ fn pg_copy_body(args: &Value, is_update: bool) -> Result<Value, ApiError> {
             options.insert((*key).into(), v.clone());
         }
     }
-    let unknown: Vec<&String> = options.keys().filter(|k| !PGCOPY_OPTION_KEYS.contains(&k.as_str())).collect();
+    let unknown: Vec<&String> = options
+        .keys()
+        .filter(|k| !PGCOPY_OPTION_KEYS.contains(&k.as_str()))
+        .collect();
     if !unknown.is_empty() {
         return Err(ApiError::Message(format!(
             "unknown pgcopy option(s): {unknown:?}; see cdc_migration_tool_contract tool_id=pgcopy"
@@ -280,7 +442,10 @@ fn pg_conn(args: &Value, side: &str, is_update: bool) -> Result<Value, ApiError>
         }
     };
     let need = |k: &str| get(k).ok_or_else(|| ApiError::Message(format!("missing {side}_{k}")));
-    let password = match (args.get(format!("{side}_password")).and_then(Value::as_str), is_update) {
+    let password = match (
+        args.get(format!("{side}_password")).and_then(Value::as_str),
+        is_update,
+    ) {
         // Passwords are not trimmed: whitespace can be part of a password.
         (Some(p), _) if !p.is_empty() => p.to_string(),
         (_, true) => REDACTED.to_string(),
@@ -306,15 +471,26 @@ fn test_connection_body(args: &Value) -> Result<Value, ApiError> {
     let side = match s("side").as_str() {
         "" => "source".to_string(),
         "source" | "target" => s("side"),
-        other => return Err(ApiError::Message(format!("side must be source or target, got {other}"))),
+        other => {
+            return Err(ApiError::Message(format!(
+                "side must be source or target, got {other}"
+            )))
+        }
     };
-    let profile_id = args.get("profile_id").and_then(Value::as_str).filter(|v| !v.is_empty());
+    let profile_id = args
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
     let password = match args.get("password").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => p.to_string(),
         _ if profile_id.is_some() => REDACTED.to_string(),
         _ => String::new(),
     };
-    let db_type = if s("type").is_empty() { "postgres".to_string() } else { s("type") };
+    let db_type = if s("type").is_empty() {
+        "postgres".to_string()
+    } else {
+        s("type")
+    };
     let mut body = json!({
         "connection": {
             "type": db_type, "host": s("host"), "port": s("port"), "database": s("database"),
@@ -336,7 +512,9 @@ fn tool_arg(args: &Value) -> Result<&str, ApiError> {
     if TOOLS.contains(&tool) {
         Ok(tool)
     } else {
-        Err(ApiError::Message(format!("unknown copy tool {tool}; expected one of {TOOLS:?}")))
+        Err(ApiError::Message(format!(
+            "unknown copy tool {tool}; expected one of {TOOLS:?}"
+        )))
     }
 }
 
@@ -346,8 +524,19 @@ fn seg(s: &str) -> String {
 
 fn list_arg(args: &Value, key: &str) -> Vec<String> {
     match args.get(key) {
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
-        Some(Value::String(s)) => s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -371,7 +560,10 @@ mod tests {
         let b = pg_copy_body(&supertokens_args(), false).unwrap();
         assert_eq!(b["source"]["type"], "postgres");
         assert_eq!(b["source"]["port"], "5438");
-        assert_eq!(b["source"]["password"], "s3cret ", "password must not be trimmed");
+        assert_eq!(
+            b["source"]["password"], "s3cret ",
+            "password must not be trimmed"
+        );
         assert_eq!(b["target"]["port"], "5432");
         assert_eq!(b["include_tables"], json!([]));
         assert_eq!(b["options"], json!({}));
@@ -382,14 +574,20 @@ mod tests {
         let mut a = supertokens_args();
         a.as_object_mut().unwrap().remove("target_password");
         assert!(pg_copy_body(&a, false).is_err());
-        assert_eq!(pg_copy_body(&a, true).unwrap()["target"]["password"], REDACTED);
+        assert_eq!(
+            pg_copy_body(&a, true).unwrap()["target"]["password"],
+            REDACTED
+        );
     }
 
     #[test]
     fn pg_copy_body_rejects_unknown_options_and_same_db() {
         let mut a = supertokens_args();
         a["options"] = json!({"drop_if_exist": true});
-        assert!(pg_copy_body(&a, false).unwrap_err().to_string().contains("drop_if_exist"));
+        assert!(pg_copy_body(&a, false)
+            .unwrap_err()
+            .to_string()
+            .contains("drop_if_exist"));
 
         let mut a = supertokens_args();
         a["drop_if_exists"] = json!(true);
@@ -406,7 +604,10 @@ mod tests {
 
     #[test]
     fn test_connection_body_reuses_saved_password_via_profile() {
-        let b = test_connection_body(&json!({"tool":"pgcopy","host":"h","port":5438,"profile_id":"abc"})).unwrap();
+        let b = test_connection_body(
+            &json!({"tool":"pgcopy","host":"h","port":5438,"profile_id":"abc"}),
+        )
+        .unwrap();
         assert_eq!(b["connection"]["password"], REDACTED);
         assert_eq!(b["connection"]["port"], "5438");
         assert_eq!(b["side"], "source");
