@@ -5,7 +5,7 @@ when:
     branch:
       exclude: [main]
   - event: tag
-    tag: v*
+    ref: refs/tags/v*
 
 steps:
   test-orchestrator:
