@@ -35,6 +35,8 @@ export default defineNuxtConfig({
     autheliaClientSecret: env("AUTHELIA_CLIENT_SECRET"),
     public: {
       appName: env("APP_NAME") || "Hyper CDC WebUI",
+      // Baked into the image by CI: `v1.2.3` for v* tags, else `<branch>_<short-sha>`.
+      appVersion: env("APP_VERSION") || "dev",
       orchestratorUrl: env("PUBLIC_ORCHESTRATOR_URL") || "http://127.0.0.1:9788",
       authMode: authMode === "sso" ? "sso" : authMode === "local" ? "local" : "none",
       ssoProvider: env("SSO_PROVIDER") || "supertokens_gateway",

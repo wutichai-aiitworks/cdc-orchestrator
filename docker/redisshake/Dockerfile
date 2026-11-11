@@ -1,4 +1,6 @@
-FROM ghcr.io/tair-opensource/redisshake:latest
+# Upstream publishes only `latest`; pin the digest so release builds are reproducible.
+# Bump: docker buildx imagetools inspect ghcr.io/tair-opensource/redisshake:latest
+FROM ghcr.io/tair-opensource/redisshake:latest@sha256:ce1770f7af3b4dba6d87625c7d1d1078fd6c9dc0cbd136c1e87f87a8d8b31382
 
 USER root
 RUN apk add --no-cache python3 curl

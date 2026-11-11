@@ -16,6 +16,10 @@ ENV PORT=3000
 COPY --from=builder /app/.output ./.output
 COPY map-env.mjs /app/map-env.mjs
 
+# Shown on the login page. Last on purpose: a per-commit value must not bust the build cache.
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

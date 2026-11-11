@@ -9,6 +9,7 @@ const route = useRoute()
 const cfg = useRuntimeConfig()
 const ssoMode = computed(() => isSsoAuth(cfg))
 const localMode = computed(() => isLocalAuth(cfg))
+const appVersion = computed(() => String(cfg.public.appVersion || "dev"))
 const { loading, loginWithPassword } = useAuth()
 
 const username = ref("")
@@ -82,7 +83,7 @@ onMounted(async () => {
 
     <div class="relative w-full max-w-sm space-y-6 animate-slide-up">
       <div class="flex flex-col items-center gap-3">
-        <img src="/favicon.png" alt="Hyper CDC" class="h-14 w-14 object-contain" />
+        <img src="/favicon.png" alt="Hyper CDC" class="h-32 w-32 object-contain" />
         <p class="text-sm text-muted-foreground">Hyper CDC</p>
       </div>
 
@@ -164,6 +165,14 @@ onMounted(async () => {
           {{ ssoRedirecting ? "Redirecting…" : "Continue with SSO" }}
         </button>
       </div>
+
+      <p
+        v-if="localMode"
+        class="select-all text-center font-mono text-xs text-muted-foreground"
+        :title="`Build ${appVersion}`"
+      >
+        {{ appVersion }}
+      </p>
     </div>
   </div>
 </template>

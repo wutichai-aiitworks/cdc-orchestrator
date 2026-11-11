@@ -7,42 +7,98 @@ this directory, so extra files here would show up as separate pipelines.
 |------|-----------|------|
 | `test-orchestrator` | — | `cargo fmt --check`, `test --locked`, `clippy -D warnings` |
 | `test-mcp` | `test-orchestrator` | same checks in standalone `mcp/` |
-| `webui` | — (parallel with rust) | `cdc-native-ui`: `npm ci`, `openapi:check`, `typecheck`, `build` |
+| `webui` | — | `cdc-native-ui`: `npm ci`, `openapi:check`, `typecheck`, `build` |
+| `test-sidecars` | — | `unittest` for `docker/sidecar_common` + every Python sidecar |
+| `test-wireguard` | — | `go vet` + `go test` in `docker/wireguard` |
+| `test-jdbc-admin` | — | `mvn test` in `docker/jdbc-admin` (in-memory H2) |
 | `sonar` | rust tests | `sonar-scanner` against `sonar-project.properties`, waits for the quality gate |
-| `build-and-push` | `sonar`, `webui` | Builds and pushes all four images multi-arch |
-| `notify-discord` | `build-and-push` (success) | Discord embed with image tags |
+| `build-and-push` | `sonar`, `webui`, all sidecar tests | Builds and pushes all twelve images multi-arch |
+| `notify-discord` | `build-and-push` (success) | Discord embed + `images-<version>.env` attachment |
+| `notify-discord-failure` | `build-and-push` (failure) | Discord embed with the failing pipeline link |
 
 Runs on push / manual (not `main`) and on `v*` tags.
 
+## Tags
+
+`linux/amd64` + `linux/arm64`:
+
+| Trigger | Tags pushed |
+|---------|-------------|
+| `v*` git tag | the tag (`v1.2.3`, no commit id), then `latest` |
+| branch push | `<branch-slug>_<short-sha>` only (e.g. `feature-capture_view_31d8e3f`) |
+| no branch (detached) | `sha_<short-sha>` only |
+
+The same string is baked into `cdc-webui` as `APP_VERSION` (`--build-arg`) and shown
+under the sign-in form when `AUTH_MODE=local`, so the login page names the exact
+image tag. Local builds through `docker/compose.inc.sh` derive it from git with the
+same rule (override with `CDC_APP_VERSION`); a plain `docker build` shows `dev`.
+
+`latest` moves **only on `v*` tags** and only **after all twelve images built**, by
+retagging each image's pushed digest (`buildx imagetools create`). A branch build never
+changes what `latest` points at, and a release that fails halfway leaves `latest`
+on the previous release.
+
+Each build also carries:
+
+- OCI labels: `title`, `version`, `revision` (commit SHA), `source`, `created`.
+- Provenance (`mode=max`) and an SBOM attestation.
+- `--pull`, so floating bases (`postgres:18`, `debian:bookworm-slim`, …) pick up
+  security patches on every build.
+- Registry layer cache at `<image>:buildcache` (Docker Hub supports it with
+  `image-manifest=true`). A cache export error does not fail the build.
+
+## Release manifest (`images.env`)
+
+`build-and-push` writes `.ci-status/images.env`, one line per image in the compose
+variable format, pinned by digest:
+
+```
+CDC_ORCHESTRATOR_IMAGE=<ns>/cdc-orchestrator:v1.2.3@sha256:…
+CDC_PGCOPY_IMAGE=<ns>/cdc-pgcopydb:v1.2.3@sha256:…
+```
+
+The file is printed in the step log and attached to the Discord message. To deploy a
+release, paste it into `docker/.env.production` (see `.env.production.example`), then
+`docker compose … pull` and `up -d --no-build`.
+
 ## Images
 
-`linux/amd64` + `linux/arm64`, tagged `latest` plus the version:
+| Image | Compose variable | Dockerfile | Build context / extra |
+|-------|------------------|-----------|-----------------------|
+| `cdc-orchestrator` | `CDC_ORCHESTRATOR_IMAGE` | `docker/Dockerfile` | repo root |
+| `cdc-connect` | `CDC_CONNECT_IMAGE` | `docker/connect/Dockerfile` | repo root |
+| `cdc-webui` | `CDC_NATIVE_UI_IMAGE` | `cdc-native-ui/Dockerfile` | `cdc-native-ui` |
+| `cdc-mcp` | `MCP_CDC_IMAGE` | `mcp/Dockerfile` | `mcp` |
+| `cdc-jdbc-admin` | `CDC_JDBC_ADMIN_IMAGE` | `docker/jdbc-admin/Dockerfile` | `docker/jdbc-admin` |
+| `cdc-wireguard` | `CDC_WIREGUARD_IMAGE` | `docker/wireguard/Dockerfile` | `docker/wireguard` |
+| `cdc-pgcopydb` | `CDC_PGCOPY_IMAGE` | `docker/pgcopydb/Dockerfile` | + `common=docker/sidecar_common`, `PG_MAJOR=18` |
+| `cdc-pgdump` | `CDC_PGDUMP_IMAGE` | `docker/pgdump/Dockerfile` | `PG_MAJOR=18` |
+| `cdc-pgloader` | `CDC_PGLOADER_IMAGE` | `docker/pgloader/Dockerfile` | + `common=docker/sidecar_common` |
+| `cdc-redisshake` | `CDC_REDIS_SHAKE_IMAGE` | `docker/redisshake/Dockerfile` | + `common=docker/sidecar_common` |
+| `cdc-mongocopy` | `CDC_MONGOCOPY_IMAGE` | `docker/mongocopy/Dockerfile` | + `common=docker/sidecar_common` |
+| `cdc-rsync` | `CDC_RSYNC_IMAGE` | `docker/rsync/Dockerfile` | `docker/rsync` |
 
-| Trigger | Version tag |
-|---------|-------------|
-| `v*` git tag | the tag (`v1.2.3`) |
-| branch push | `<branch-slug>-<short-sha>` |
-| `main` or empty branch | `sha-<short-sha>` |
-
-| Image | Dockerfile | Build context |
-|-------|-----------|---------------|
-| `$REGISTRY_NAMESPACE/cdc-orchestrator` | `docker/Dockerfile` | repo root |
-| `$REGISTRY_NAMESPACE/cdc-connect` | `docker/connect/Dockerfile` | repo root |
-| `$REGISTRY_NAMESPACE/cdc-webui` | `cdc-native-ui/Dockerfile` | `cdc-native-ui` |
-| `$REGISTRY_NAMESPACE/cdc-mcp` | `mcp/Dockerfile` | `mcp` |
+All are pushed as `$REGISTRY_NAMESPACE/<image>`. Published names `cdc-webui` and `cdc-mcp`
+differ from the compose `:local` defaults (`cdc-native-ui`, `mcp-cdc`); the compose
+variables are what tie them together.
 
 The orchestrator image needs the repo root as its context because `docker/Dockerfile`
 copies `Cargo.toml`, `Cargo.lock`, `build.rs`, `proto/`, and `src/`. The Connect image
 also uses the repo root so it can compile the vendored `kafka-connect-jdbc/` fork.
+The `common` named context mirrors `additional_contexts` in
+`docker/docker-compose.sidecars.yaml`. Keep the two in sync.
+
+`PG_MAJOR=18` matches the compose default. `pg_dump` must be at least the newest source
+server's major version, so bump it here and in compose together.
 
 ## Required secrets
 
 | Secret | Used by |
 |--------|---------|
 | `DOCKERHUB_USERNAME` | `build-and-push` |
-| `DOCKERHUB_TOKEN` | `build-and-push` |
-| `REGISTRY_NAMESPACE` | `build-and-push` (image name prefix) |
-| `DISCORD_WEBHOOK` | `notify-discord` |
+| `DOCKERHUB_TOKEN` | `build-and-push` (needs read/write: it also pushes `:buildcache`) |
+| `REGISTRY_NAMESPACE` | `build-and-push`, `notify-discord` (image name prefix) |
+| `DISCORD_WEBHOOK` | `notify-discord`, `notify-discord-failure` |
 | `SONAR_TOKEN` | `sonar` (token for `https://sonarqube.b-quik-connect.com`, project `hyper-cdc-orchestrator`) |
 
 All steps need the secrets above (no pull-request path).
@@ -51,9 +107,14 @@ All steps need the secrets above (no pull-request path).
 
 - Rust is pinned to `1.97-bookworm` here and in every Dockerfile, matching local
   development. `cargo fmt` and `clippy` results drift between rustfmt versions, so keep
-  these in sync when bumping.
+  these in sync when bumping. Same for `golang:1.26` (wireguard), `maven:3.9.9-eclipse-temurin-17`
+  (jdbc-admin, Connect) and `python:3.12` (sidecars).
 - Shell expansions in `commands:` must be written `$${VAR}` so Woodpecker does not
-  substitute them before the step runs.
-- Four multi-arch images means two Rust release builds under arm64 emulation, so
-  publish is slow. A shared registry cache (`--cache-to` / `--cache-from`) or native
-  arm64 agents would help if that becomes a problem.
+  substitute them before the step runs. Inside an unquoted heredoc, backticks must be
+  escaped (`` \` ``) or the shell runs them as command substitution.
+- Multi-arch speed: the Go (wireguard) and Maven (jdbc-admin, Connect deps) build stages
+  run on `$BUILDPLATFORM` and only the runtime stage is per-arch. The two Rust images
+  still compile under arm64 emulation and dominate publish time; native arm64 agents
+  are the next lever.
+- `docker/redisshake` pins its upstream base by digest (upstream publishes only
+  `latest`). Bump it deliberately; the command is in the Dockerfile comment.

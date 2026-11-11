@@ -1,6 +1,7 @@
 # Debezium Connect plus Confluent Avro converter and JDBC source (trigger CDC).
 # Build context is the repo root so this image can compile kafka-connect-jdbc/.
-FROM maven:3.9.9-eclipse-temurin-17 AS deps
+# Jars are platform-independent: resolve/compile natively, only the final stage is per-arch.
+FROM --platform=$BUILDPLATFORM maven:3.9.9-eclipse-temurin-17 AS deps
 WORKDIR /build
 COPY docker/connect/maven-settings.xml /root/.m2/settings.xml
 COPY docker/connect/pom.xml .

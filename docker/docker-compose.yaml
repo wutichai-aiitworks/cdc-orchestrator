@@ -141,6 +141,9 @@ services:
     build:
       context: ../cdc-native-ui
       dockerfile: Dockerfile
+      args:
+        # Login-page version; compose.inc.sh derives it from git (v* tag, else <branch>_<sha>).
+        APP_VERSION: ${CDC_APP_VERSION:-dev}
     container_name: cdc-native-ui
     profiles: ["native-ui"]
     depends_on:

@@ -1,4 +1,5 @@
-FROM maven:3.9.9-eclipse-temurin-17 AS build
+# The jar is platform-independent: build it natively, only the JRE stage is per-arch.
+FROM --platform=$BUILDPLATFORM maven:3.9.9-eclipse-temurin-17 AS build
 WORKDIR /build
 COPY pom.xml .
 COPY src ./src
