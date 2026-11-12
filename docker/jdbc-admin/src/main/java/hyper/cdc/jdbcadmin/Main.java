@@ -35,6 +35,7 @@ public final class Main {
         server.createContext("/v1/query", exchange -> handle(exchange, token, Main::query));
         server.createContext("/v1/ddl", exchange -> handle(exchange, token, Main::ddl));
         server.createContext("/v1/stream", exchange -> stream(exchange, token));
+        server.createContext("/v1/lookup", exchange -> handle(exchange, token, Main::lookup));
         // A streaming copy can hold its request for many minutes; the default executor runs
         // every request on one thread and would block catalog/preview/count meanwhile.
         server.setExecutor(Executors.newCachedThreadPool());
@@ -132,6 +133,23 @@ public final class Main {
         return Map.of("columns", result.columns(), "rows", result.rows());
     }
 
+    /** Most key tuples one {@code /v1/lookup} request may carry (it batches internally). */
+    private static final int MAX_LOOKUP_KEYS = 5000;
+
+    /**
+     * {@code POST /v1/lookup}: rows of {@code schema.table} whose {@code key_columns} equal one
+     * of {@code keys} (canonical strings), as canonical values of {@code columns} (default:
+     * the key columns). Read-only; record diff uses it to recheck candidate differences.
+     */
+    private static Object lookup(AdminRequest req) throws Exception {
+        require(req.schema, "schema");
+        require(req.table, "table");
+        JdbcOps.LookupResult result = JdbcOps.lookup(
+                req.dbType, req.connection, req.schema, req.table, req.keyColumns, req.columns, req.keys
+        );
+        return Map.of("columns", result.columns(), "rows", result.rows());
+    }
+
     private static Object ddl(AdminRequest req) throws Exception {
         require(req.statement, "statement");
         long updateCount = JdbcOps.ddl(req.dbType, req.connection, req.statement, req.schema);
@@ -162,7 +180,8 @@ public final class Main {
             require(req.schema, "schema");
             require(req.table, "table");
             rows = JdbcOps.openStream(
-                    req.dbType, req.connection, req.schema, req.table, req.maxRows, req.fetchSize
+                    req.dbType, req.connection, req.schema, req.table, req.maxRows, req.fetchSize,
+                    req.columns, req.canonical
             );
         } catch (IllegalArgumentException e) {
             write(exchange, 400, Map.of("error", e.getMessage()));
@@ -271,8 +290,44 @@ public final class Main {
                 root.path("page").asLong(0),
                 root.path("page_size").asLong(50),
                 root.path("max_rows").asLong(0),
-                root.path("fetch_size").asInt(JdbcOps.STREAM_FETCH_SIZE)
+                root.path("fetch_size").asInt(JdbcOps.STREAM_FETCH_SIZE),
+                strings(root.get("columns")),
+                root.path("canonical").asBoolean(false),
+                strings(root.get("key_columns")),
+                keyTuples(root.get("keys"))
         );
+    }
+
+    private static List<String> strings(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            for (JsonNode item : node) {
+                if (item != null && !item.isNull() && !item.asText().isBlank()) {
+                    out.add(item.asText());
+                }
+            }
+        }
+        return out;
+    }
+
+    private static List<List<String>> keyTuples(JsonNode node) {
+        List<List<String>> out = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            for (JsonNode tuple : node) {
+                if (tuple == null || !tuple.isArray()) {
+                    continue;
+                }
+                List<String> key = new ArrayList<>();
+                for (JsonNode v : tuple) {
+                    key.add(v == null || v.isNull() ? null : v.asText());
+                }
+                out.add(key);
+            }
+        }
+        if (out.size() > MAX_LOOKUP_KEYS) {
+            throw new IllegalArgumentException("at most " + MAX_LOOKUP_KEYS + " keys per lookup");
+        }
+        return out;
     }
 
     private static void write(HttpExchange exchange, int status, Object body) throws IOException {
@@ -325,7 +380,15 @@ public final class Main {
             long page,
             long pageSize,
             long maxRows,
-            int fetchSize
+            int fetchSize,
+            /** {@code /v1/stream}, {@code /v1/lookup}: columns to read (empty = all). */
+            List<String> columns,
+            /** {@code /v1/stream}: emit canonical strings (record diff) instead of JSON-safe values. */
+            boolean canonical,
+            /** {@code /v1/lookup}: key column names. */
+            List<String> keyColumns,
+            /** {@code /v1/lookup}: key tuples as canonical strings, {@code keyColumns} order. */
+            List<List<String>> keys
     ) {}
 
     @FunctionalInterface

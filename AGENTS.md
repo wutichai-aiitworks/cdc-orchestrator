@@ -39,6 +39,7 @@ Instructions for AI coding agents working with the CDC control plane.
 | `docs/adr/0011-app-mode.md` | `APP_MODE=Production\|Maintenance\|Enhanced` (the one mode variable), corner ribbon, Production-default hardening |
 | `docs/patterns/deployment-mode/SKILL.md` | Reusable version of APP_MODE for other repos: contract, gotchas, templates (Rust/Python/Go/Nuxt/ops), agent prompt |
 | `docs/patterns/break-glass-admin/SKILL.md` | Reusable break-glass admin port (`127.0.0.1:4321`, local login beside SSO, same container): contract, gotchas, templates, agent prompt |
+| `docs/adr/0013-record-diff.md` | Record diff (source vs target by key, per table, async): hash-partitioned scan, canonical values, recheck by key, why not ORDER BY merge |
 | `docs/testing/api-test-plan.md` | How to run tests, coverage map, **known-bug register** (B-xx) and fix order |
 
 ## Demo defaults (compose profile `demo`)
@@ -54,6 +55,8 @@ Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`,
 4. **Orchestrator token:** `docker/install.sh` generates `ORCH_API_TOKEN` into `docker/.env` if missing. Host-side callers of `:9788` need `Authorization: Bearer $ORCH_API_TOKEN`.
 5. **UI conventions:** icons `class="h-4 w-4" :stroke-width="1.75"`; brand chips `bg-brand-500/10 text-primary`; focus `ring-1 ring-ring`; popovers teleport to body (see `AppInfoHint`, `AppUserMenu`); reuse `.icon-button`, `.avatar`, `.menu-panel`, `.menu-item`, `.auth-input`, `.btn-primary`, `.alert-*` instead of ad-hoc classes.
 6. **Verify:** `npm run build` then run `.output` with `AUTH_MODE=local node map-env.mjs ./.output/server/index.mjs` and exercise `/api/auth/login`, `/api/auth/me`, `/api/auth/logout`. Don't commit unless asked.
+6a. **List → detail pages:** a row/card opens a detail *page* via the URL (`/pipelines?pipeline=<id>`), not a panel under the list. Pages add trailing breadcrumb crumbs with `usePageCrumbs()` (clear on unmount); menu crumbs in the top bar link to the page's landing view and fire `useNavReselect` on same-path clicks. Client-side lists page with `components/ui/AppListPager.vue` (`v-model:page`, `v-model:page-size`).
+6b. **Verify Record tab** (`components/RecordDiffPanel.vue`, replica pipelines; API/code name stays "record diff"): `POST /cdc/profiles/{id}/record-diff` per table, polls while active, pages results with `AppListPager`, downloads stream through `server/api/.../record-diff/[jobId]/download.get.ts`. Engine: `src/record_diff.rs`; values come canonical from jdbc-admin (`/v1/stream` `columns`+`canonical`, `/v1/lookup`) — rebuild `cdc-jdbc-admin` when changing either side. Rules in ADR 0013.
 7. **Target DDL ("Create table" in the mapping step):** one generator, `utils/targetDdl.ts` (types via `utils/dbTypeTranslator.ts`) in `cdc-native-ui`. Runs through `POST /cdc/profiles/catalog/target/ddl` (create-only guard, one statement per call, audited as `target.create_tables`). Rules (ADR 0003): Oracle → Postgres lowercases every name like `fold_oracle_postgres_target`; identity/sequence defaults dropped; no foreign keys; expression/partial indexes become `-- NOTE` lines, never guesses. New source metadata (size/scale/default/indexes) needs a rebuilt `cdc-jdbc-admin` image.
 
 ## Testing

@@ -2,6 +2,7 @@
 import type { PipelineDetailAction } from "~/components/PipelineDetail.vue"
 import {
   ArrowDown,
+  ArrowLeft,
   ArrowRight,
   ArrowUp,
   ArrowUpDown,
@@ -74,6 +75,8 @@ const {
 const toast = useToast()
 
 const profiles = ref<CdcProfile[]>([])
+/** True after the first successful list load; tells "loading" from "not found" on the detail page. */
+const profilesLoaded = ref(false)
 const selectedId = ref("")
 const editing = ref(false)
 const step = ref<WizardStep>("source")
@@ -1221,6 +1224,8 @@ const buildPayload = (): ProfilePayload => {
 const resetForm = () => {
   selectedId.value = ""
   editing.value = true
+  // A new pipeline belongs to the list, not to the detail page it was started from.
+  if (detailId.value) void router.replace({ query: withoutDetail() })
   step.value = "source"
   sourceValidation.value = null
   targetValidation.value = null
@@ -1432,8 +1437,8 @@ const load = async () => {
   error.value = ""
   try {
     profiles.value = await fetchProfiles()
-    if (selectedId.value && !profiles.value.some((profile) => profile.id === selectedId.value)) selectedId.value = ""
-    if (selectedId.value) void loadSelectedDlq(selectedId.value)
+    profilesLoaded.value = true
+    if (selected.value) void loadSelectedDlq(selected.value.id)
   } catch (e: any) {
     error.value = formatApiError(e, "Failed to load CDC pipelines")
   } finally {
@@ -1442,11 +1447,9 @@ const load = async () => {
 }
 
 const refreshPipelineStatuses = async () => {
-  if (!selectedId.value || editing.value || document.hidden) return
+  if (editing.value || document.hidden) return
   try {
-    const latest = await fetchProfiles()
-    profiles.value = latest
-    if (!latest.some((profile) => profile.id === selectedId.value)) selectedId.value = ""
+    profiles.value = await fetchProfiles()
   } catch {
     // Keep the last known status during a transient polling failure. Manual
     // refresh still surfaces request errors to the user.
@@ -1503,6 +1506,8 @@ const saveDraft = () => save(true)
 
 const closeWizard = () => {
   editing.value = false
+  // Back to the view that opened the wizard: the detail page, or the list.
+  selectedId.value = detailId.value
 }
 
 const save = async (stayInWizard = false) => {
@@ -1553,7 +1558,13 @@ const save = async (stayInWizard = false) => {
       form.lakeSecretKey = ""
     }
 
-    if (!stayInWizard) editing.value = false
+    if (!stayInWizard) {
+      // Show the saved pipeline on its detail page.
+      editing.value = false
+      if (detailId.value !== result.profile.id) {
+        void router.replace({ query: { ...route.query, pipeline: result.profile.id } })
+      }
+    }
     await load()
   } catch (e: any) {
     error.value = formatApiError(e, "Failed to save pipeline")
@@ -2171,6 +2182,53 @@ const profilesByCapture = computed(() => {
 
 const visibleProfileIds = computed(() => new Set(filteredProfiles.value.map((p) => p.id)))
 
+// ── Pagination (client-side, every view mode) ────────────────────────────────
+const PIPELINE_PAGE_SIZES = [12, 24, 48, 96]
+const pipelinePage = ref(1)
+const pipelinePageSize = ref(24)
+onMounted(() => {
+  const saved = Number(getPref<number>("pipelines.pageSize", 24))
+  if (PIPELINE_PAGE_SIZES.includes(saved)) pipelinePageSize.value = saved
+})
+watch(pipelinePageSize, (size) => setPref("pipelines.pageSize", size))
+// A new query or view starts from the first page.
+watch(
+  [pipelineSearch, pipelineStatusFilter, pipelineTagFilter, pipelineSortKey, pipelineSortDir, pipelineViewMode],
+  () => {
+    pipelinePage.value = 1
+  },
+)
+const pageSlice = <T,>(items: T[]) => {
+  const start = (pipelinePage.value - 1) * pipelinePageSize.value
+  return items.slice(start, start + pipelinePageSize.value)
+}
+const pagedProfiles = computed(() => pageSlice(filteredProfiles.value))
+
+/**
+ * Grouped views page over the flattened (group, pipeline) entries so groups stay
+ * contiguous across pages; a group cut by a page boundary continues on the next.
+ * `total` keeps the group's full size for its header badge.
+ */
+const pageGroups = <G extends { key: string; items: CdcProfile[] }>(groups: G[]) => {
+  const flat = groups.flatMap((group) => group.items.map((profile) => ({ group, profile })))
+  const out = new Map<string, G & { total: number }>()
+  for (const { group, profile } of pageSlice(flat)) {
+    if (!out.has(group.key)) out.set(group.key, { ...group, total: group.items.length, items: [] })
+    out.get(group.key)!.items.push(profile)
+  }
+  return [...out.values()]
+}
+const profilesByTagEntries = computed(() => profilesByTag.value.reduce((n, g) => n + g.items.length, 0))
+const profilesByCaptureEntries = computed(() => profilesByCapture.value.reduce((n, g) => n + g.items.length, 0))
+const pagedProfilesByTag = computed(() => pageGroups(profilesByTag.value))
+const pagedProfilesByCapture = computed(() => pageGroups(profilesByCapture.value))
+/** Rows the pager counts in the current view (tag view repeats multi-tag pipelines). */
+const pipelinePagerTotal = computed(() => {
+  if (pipelineViewMode.value === "tags") return profilesByTagEntries.value
+  if (pipelineViewMode.value === "capture") return profilesByCaptureEntries.value
+  return filteredProfiles.value.length
+})
+
 const statusFilterOptions = computed(() => {
   const seen = new Set<string>()
   for (const profile of profiles.value) {
@@ -2185,16 +2243,54 @@ const openEdit = (profile: CdcProfile) => {
   editSelected()
 }
 
-const selectPipeline = (id: string) => {
-  selectedId.value = id
-  editing.value = false
+// The detail view is its own URL (/pipelines?pipeline=<id>) so it opens as a page,
+// survives reload, works with browser Back, and the breadcrumb can link to the list.
+// The wizard stays ref-driven (unsaved form state); it returns to whichever view opened it.
+const route = useRoute()
+const router = useRouter()
+const detailId = computed(() => (typeof route.query.pipeline === "string" ? route.query.pipeline : ""))
+watch(
+  detailId,
+  (id) => {
+    if (!editing.value) selectedId.value = id
+  },
+  { immediate: true },
+)
+const showDetailPage = computed(() => !editing.value && Boolean(detailId.value))
+const withoutDetail = () => {
+  const { pipeline: _pipeline, ...rest } = route.query
+  return rest
 }
 
-// Sidebar "CDC Pipelines" while already here: back to the list, like a fresh visit.
-const { onNavReselect } = useNavReselect()
-onNavReselect("/pipelines", () => {
+const selectPipeline = (id: string) => {
+  editing.value = false
+  selectedId.value = id
+  void router.push({ query: { ...route.query, pipeline: id } })
+}
+
+const backToList = () => {
   editing.value = false
   selectedId.value = ""
+  if (detailId.value) void router.push({ query: withoutDetail() })
+}
+
+// Sidebar / breadcrumb "CDC Pipelines" while already here: back to the list, like a fresh visit.
+const { onNavReselect } = useNavReselect()
+onNavReselect("/pipelines", backToList)
+
+// Trailing breadcrumb crumbs for the top bar: CDC / CDC Pipelines / <pipeline> / Edit.
+const pageCrumbs = usePageCrumbs()
+watchEffect(() => {
+  if (editing.value) {
+    pageCrumbs.value = selectedId.value ? [selected.value?.name || "Pipeline", "Edit"] : ["New pipeline"]
+  } else if (detailId.value) {
+    pageCrumbs.value = [selected.value?.name || (loading.value ? "Loading…" : "Not found")]
+  } else {
+    pageCrumbs.value = []
+  }
+})
+onUnmounted(() => {
+  pageCrumbs.value = []
 })
 
 const confirmDelete = async () => {
@@ -2206,6 +2302,7 @@ const confirmDelete = async () => {
     await deleteProfile(profile.id)
     toast.success(`Deleted ${profile.name}.`)
     if (selectedId.value === profile.id) selectedId.value = ""
+    if (detailId.value === profile.id) void router.replace({ query: withoutDetail() })
     pendingDelete.value = null
     await load()
   } catch (e: any) {
@@ -2334,9 +2431,13 @@ onUnmounted(() => {
 <template>
   <div class="page-container">
     <AppPageHeader
-      title="CDC Pipelines"
-      description="Database → database first. Capture from a source, write to a target, no Connect JSON."
+      :title="showDetailPage ? selected?.name || 'Pipeline' : 'CDC Pipelines'"
+      :description="showDetailPage ? (selected ? pipelineRoute(selected) : '') : 'Database → database first. Capture from a source, write to a target, no Connect JSON.'"
     >
+      <AppButton v-if="showDetailPage" @click="backToList">
+        <ArrowLeft class="h-4 w-4" :stroke-width="1.75" />
+        All pipelines
+      </AppButton>
       <AppButton :disabled="loading" @click="load">
         <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': loading }" :stroke-width="1.75" />
         Refresh
@@ -3522,6 +3623,39 @@ onUnmounted(() => {
         </form>
       </section>
 
+    <template v-else-if="showDetailPage">
+      <PipelineDetail
+        v-if="selected && selectedFlow"
+        :key="selected.id"
+        :profile="selected"
+        :flow="selectedFlow"
+        :connectors="pipelineConnectors"
+        :dlq-status="dlqStatus"
+        :dlq-loading="dlqLoading"
+        :can-start="canStartSelected"
+        :start-blocked-reason="startBlockedReason(selected.pattern) || ''"
+        :supports-test-sync="supportsCappedTableCopy"
+        :busy="actionBusy"
+        @action="onDetailAction"
+        @autostart="persistAutostart"
+        :tag-suggestions="allTags"
+        :tags-saving="tagsSaving"
+        @tags="persistTags"
+      />
+      <AppCard v-else>
+        <AppStateBlock
+          :kind="loading || !profilesLoaded ? 'loading' : 'empty'"
+          :message="loading || !profilesLoaded ? 'Loading pipeline…' : 'This pipeline no longer exists. It may have been deleted.'"
+        />
+        <div v-if="!loading && profilesLoaded" class="mt-3 flex justify-center">
+          <AppButton @click="backToList">
+            <ArrowLeft class="h-4 w-4" :stroke-width="1.75" />
+            All pipelines
+          </AppButton>
+        </div>
+      </AppCard>
+    </template>
+
     <template v-else>
       <AppCard>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-4">
@@ -3620,10 +3754,9 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr
-                v-for="profile in filteredProfiles"
+                v-for="profile in pagedProfiles"
                 :key="profile.id"
                 class="group cursor-pointer"
-                :class="{ 'bg-brand-500/5': selectedId === profile.id }"
                 @click="selectPipeline(profile.id)"
               >
                 <td>
@@ -3705,13 +3838,12 @@ onUnmounted(() => {
         <template v-else-if="pipelineViewMode === 'cards'">
           <div v-if="filteredProfiles.length" class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
             <PipelineCard
-              v-for="profile in filteredProfiles"
+              v-for="profile in pagedProfiles"
               :key="profile.id"
               :profile="profile"
               :route="pipelineRoute(profile)"
               :capture="captureModeLabel(profile)"
               :pattern="patternLabel(profile)"
-              :selected="selectedId === profile.id"
               @select="selectPipeline(profile.id)"
               @edit="openEdit(profile)"
               @delete="pendingDelete = profile"
@@ -3727,7 +3859,7 @@ onUnmounted(() => {
 
         <template v-else-if="pipelineViewMode === 'tags'">
           <div v-if="profilesByTag.length" class="space-y-5">
-            <section v-for="group in profilesByTag" :key="group.key">
+            <section v-for="group in pagedProfilesByTag" :key="group.key">
               <h3 class="mb-2 flex items-center gap-2 text-sm font-semibold text-foreground">
                 <Tags class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
                 <button
@@ -3740,7 +3872,7 @@ onUnmounted(() => {
                   {{ group.label }}
                 </button>
                 <span v-else class="text-muted-foreground">{{ group.label }}</span>
-                <span class="badge-neutral">{{ group.items.length }}</span>
+                <span class="badge-neutral">{{ group.total }}</span>
               </h3>
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
                   <PipelineCard
@@ -3750,7 +3882,6 @@ onUnmounted(() => {
                 :route="pipelineRoute(profile)"
                 :capture="captureModeLabel(profile)"
                 :pattern="patternLabel(profile)"
-                :selected="selectedId === profile.id"
                 @select="selectPipeline(profile.id)"
                 @edit="openEdit(profile)"
                 @delete="pendingDelete = profile"
@@ -3771,11 +3902,11 @@ onUnmounted(() => {
 
         <template v-else-if="pipelineViewMode === 'capture'">
           <div v-if="profilesByCapture.length" class="space-y-5">
-            <section v-for="group in profilesByCapture" :key="group.key">
+            <section v-for="group in pagedProfilesByCapture" :key="group.key">
               <h3 class="flex items-center gap-2 text-sm font-semibold text-foreground">
                 <Radar class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
                 {{ group.label }}
-                <span class="badge-neutral">{{ group.items.length }}</span>
+                <span class="badge-neutral">{{ group.total }}</span>
               </h3>
               <p class="mb-2 mt-0.5 text-xs text-muted-foreground">{{ group.description }}</p>
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -3786,7 +3917,6 @@ onUnmounted(() => {
                   :route="pipelineRoute(profile)"
                   :capture="captureModeLabel(profile)"
                   :pattern="patternLabel(profile)"
-                  :selected="selectedId === profile.id"
                   @select="selectPipeline(profile.id)"
                   @edit="openEdit(profile)"
                   @delete="pendingDelete = profile"
@@ -3804,30 +3934,22 @@ onUnmounted(() => {
 
         <PipelineScheduleView
           v-else
+          v-model:page="pipelinePage"
+          v-model:page-size="pipelinePageSize"
+          :page-sizes="PIPELINE_PAGE_SIZES"
           :visible-ids="visibleProfileIds"
-          :selected-id="selectedId"
           @select="selectPipeline"
         />
-      </AppCard>
 
-      <PipelineDetail
-        v-if="selected && selectedFlow"
-        :key="selected.id"
-        :profile="selected"
-        :flow="selectedFlow"
-        :connectors="pipelineConnectors"
-        :dlq-status="dlqStatus"
-        :dlq-loading="dlqLoading"
-        :can-start="canStartSelected"
-        :start-blocked-reason="startBlockedReason(selected.pattern) || ''"
-        :supports-test-sync="supportsCappedTableCopy"
-        :busy="actionBusy"
-        @action="onDetailAction"
-        @autostart="persistAutostart"
-        :tag-suggestions="allTags"
-        :tags-saving="tagsSaving"
-        @tags="persistTags"
-      />
+        <AppListPager
+          v-if="pipelineViewMode !== 'schedule'"
+          v-model:page="pipelinePage"
+          v-model:page-size="pipelinePageSize"
+          :total="pipelinePagerTotal"
+          :sizes="PIPELINE_PAGE_SIZES"
+          :noun="pipelineViewMode === 'tags' ? 'entries' : 'pipelines'"
+        />
+      </AppCard>
     </template>
 
     <AppConfirmDialog

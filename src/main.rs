@@ -30,6 +30,7 @@ mod postgres_trigger_cdc;
 mod processing_api;
 mod profile_table_status;
 mod reconcile;
+mod record_diff;
 mod redisshake;
 mod redisshake_handlers;
 mod rsync;
@@ -101,6 +102,8 @@ pub struct AppState {
     pub poll_audit_offsets: PollAuditOffsets,
     /// Background initial loads, keyed by profile id (in memory, this instance only).
     pub initial_loads: initial_load::InitialLoadRegistry,
+    /// Record diff jobs (source vs target by key); results on local disk (ADR 0013).
+    pub record_diffs: record_diff::RecordDiffRegistry,
     /// Copy & Sync timeline when rqlite is not configured (in memory, lost on restart).
     pub tool_events_mem: tool_events::MemoryLog,
     /// WireGuard tunnels for the Copy & Sync tools (ADR 0010).
@@ -201,6 +204,8 @@ async fn main() {
         }
     };
     let rqlite_for_wireguard = rqlite.clone();
+    let record_diffs = record_diff::RecordDiffs::from_env();
+    record_diffs.restore().await;
     let state = AppState {
         config: config.clone(),
         http: Client::builder()
@@ -226,6 +231,7 @@ async fn main() {
         poll_audit_clock: Arc::new(RwLock::new(HashMap::new())),
         poll_audit_offsets: Arc::new(RwLock::new(HashMap::new())),
         initial_loads: Arc::new(RwLock::new(HashMap::new())),
+        record_diffs: record_diffs.clone(),
         tool_events_mem: tool_events::MemoryLog::default(),
         wireguard_tunnels: wireguard::TunnelStore::new(rqlite_for_wireguard),
         profile_action_locks: handlers::ProfileActionLocks::default(),
@@ -352,6 +358,26 @@ async fn main() {
             post(handlers::start_initial_load)
                 .get(handlers::get_initial_load)
                 .delete(handlers::cancel_initial_load),
+        )
+        .route(
+            "/profiles/:id/record-diff",
+            post(handlers::start_record_diff).get(handlers::list_record_diffs),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id",
+            get(handlers::get_record_diff).delete(handlers::delete_record_diff),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/cancel",
+            post(handlers::cancel_record_diff),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/rows",
+            get(handlers::record_diff_rows),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/download",
+            get(handlers::download_record_diff),
         )
         .route("/profiles/:id/split", post(handlers::split_profile))
         .route("/profiles/:id/duplicate", post(handlers::duplicate_profile))
@@ -550,6 +576,26 @@ async fn main() {
             post(handlers::start_initial_load)
                 .get(handlers::get_initial_load)
                 .delete(handlers::cancel_initial_load),
+        )
+        .route(
+            "/profiles/:id/record-diff",
+            post(handlers::start_record_diff).get(handlers::list_record_diffs),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id",
+            get(handlers::get_record_diff).delete(handlers::delete_record_diff),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/cancel",
+            post(handlers::cancel_record_diff),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/rows",
+            get(handlers::record_diff_rows),
+        )
+        .route(
+            "/profiles/:id/record-diff/:job_id/download",
+            get(handlers::download_record_diff),
         )
         .route("/profiles/:id/split", post(handlers::split_profile))
         .route("/profiles/:id/duplicate", post(handlers::duplicate_profile))

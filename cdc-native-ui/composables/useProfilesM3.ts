@@ -212,6 +212,90 @@ export type DuplicateProfileResult = {
   created: CdcProfile
 }
 
+export type RecordDiffKind = "source_only" | "target_only" | "mismatched"
+export type RecordDiffState = "queued" | "running" | "succeeded" | "failed" | "cancelled"
+export type RecordDiffOptions = {
+  trim_trailing_spaces: boolean
+  case_insensitive: boolean
+  recheck: boolean
+  recheck_limit: number
+}
+export type RecordDiffRequest = {
+  table: string
+  key_columns: string[]
+  compare_columns: string[]
+  compare_all_columns: boolean
+  options: RecordDiffOptions
+}
+export type RecordDiffPlan = {
+  source_schema: string
+  source_table: string
+  target_schema: string
+  target_table: string
+  key_source: "request" | "mapping" | "source_pk" | "target_pk"
+  source_key_columns: string[]
+  target_key_columns: string[]
+  source_compare_columns: string[]
+  target_compare_columns: string[]
+  warnings?: string[]
+}
+export type RecordDiffCounts = {
+  source_rows: number
+  target_rows: number
+  matched: number
+  source_only: number
+  target_only: number
+  mismatched: number
+  source_duplicate_keys: number
+  target_duplicate_keys: number
+  source_null_keys: number
+  target_null_keys: number
+  resolved_in_flight: number
+  unverified: number
+}
+export type RecordDiffJob = {
+  id: string
+  profile_id: string
+  profile_name: string
+  table: string
+  state: RecordDiffState
+  phase: "queued" | "planning" | "scanning" | "comparing" | "rechecking" | "done"
+  actor: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  error?: string
+  options: RecordDiffOptions
+  requested_key_columns: string[]
+  requested_compare_columns: string[]
+  compare_all_columns: boolean
+  plan?: RecordDiffPlan
+  counts: RecordDiffCounts
+  progress: {
+    source_rows_read: number
+    target_rows_read: number
+    source_rows_estimate?: number
+    target_rows_estimate?: number
+    buckets_done: number
+    buckets_total: number
+    recheck_done: number
+    recheck_total: number
+  }
+}
+export type RecordDiffRow = {
+  key: Record<string, string | null>
+  status: "confirmed" | "unverified"
+  values?: Record<string, string | null>
+  differences?: Array<{ column: string; target_column: string; source: string | null; target: string | null }>
+}
+export type RecordDiffRowsPage = {
+  kind: RecordDiffKind
+  offset: number
+  limit: number
+  total: number
+  rows: RecordDiffRow[]
+}
+
 export type InitialLoadStatus = {
   profile_id: string
   state: "running" | "succeeded" | "failed" | "cancelled"
@@ -417,6 +501,23 @@ export const useProfilesM3 = () => {
   const cancelInitialLoad = (id: string) =>
     $fetch<InitialLoadStatus>(initialLoadPath(id), { method: "DELETE" })
 
+  // ── Record diff: source vs target by key, one table per background job ──
+  const recordDiffPath = (id: string, jobId?: string) =>
+    `/api/cdc/profiles/${encodeURIComponent(id)}/record-diff${jobId ? `/${encodeURIComponent(jobId)}` : ""}`
+  const startRecordDiff = (id: string, body: RecordDiffRequest) =>
+    $fetch<RecordDiffJob>(recordDiffPath(id), { method: "POST", body })
+  const listRecordDiffs = (id: string) => $fetch<RecordDiffJob[]>(recordDiffPath(id))
+  const getRecordDiff = (id: string, jobId: string) => $fetch<RecordDiffJob>(recordDiffPath(id, jobId))
+  const cancelRecordDiff = (id: string, jobId: string) =>
+    $fetch<RecordDiffJob>(`${recordDiffPath(id, jobId)}/cancel`, { method: "POST" })
+  const deleteRecordDiff = (id: string, jobId: string) =>
+    $fetch<{ ok: boolean }>(recordDiffPath(id, jobId), { method: "DELETE" })
+  const recordDiffRows = (id: string, jobId: string, kind: RecordDiffKind, offset: number, limit: number) =>
+    $fetch<RecordDiffRowsPage>(`${recordDiffPath(id, jobId)}/rows`, { query: { kind, offset, limit } })
+  /** Browser download URL (streamed by the Nuxt server). */
+  const recordDiffDownloadUrl = (id: string, jobId: string, kind: RecordDiffKind, format: "csv" | "ndjson") =>
+    `${recordDiffPath(id, jobId)}/download?kind=${kind}&format=${format}`
+
   /** Move tables into a new Draft pipeline with the same source and target. */
   const splitProfile = (id: string, body: { name: string; description?: string; tables: string[] }) =>
     $fetch<SplitProfileResult>(`/api/cdc/profiles/${encodeURIComponent(id)}/split`, { method: "POST", body })
@@ -426,6 +527,13 @@ export const useProfilesM3 = () => {
     $fetch<DuplicateProfileResult>(`/api/cdc/profiles/${encodeURIComponent(id)}/duplicate`, { method: "POST", body })
 
   return {
+    startRecordDiff,
+    listRecordDiffs,
+    getRecordDiff,
+    cancelRecordDiff,
+    deleteRecordDiff,
+    recordDiffRows,
+    recordDiffDownloadUrl,
     fetchSchedule,
     splitProfile,
     duplicateProfile,

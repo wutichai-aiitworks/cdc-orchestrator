@@ -1,6 +1,20 @@
 package hyper.cdc.jdbcadmin;
 
+import java.io.InputStream;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.sql.Blob;
+import java.sql.Clob;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.Types;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeParseException;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -244,7 +258,26 @@ final class JdbcOps {
             long maxRows,
             int fetchSize
     ) throws SQLException {
-        String sql = "SELECT * FROM " + JdbcUrls.qualified(dbType, schema, table);
+        return openStream(dbType, connection, schema, table, maxRows, fetchSize, List.of(), false);
+    }
+
+    /**
+     * Like {@link #openStream(String, Map, String, String, long, int)}, optionally reading only
+     * {@code columns} (quoted, in that order) and emitting {@linkplain #canonical canonical}
+     * values. Record diff uses both: keys + compared columns only, comparable across engines.
+     */
+    static RowStream openStream(
+            String dbType,
+            Map<String, String> connection,
+            String schema,
+            String table,
+            long maxRows,
+            int fetchSize,
+            List<String> columns,
+            boolean canonical
+    ) throws SQLException {
+        String sql = "SELECT " + projection(dbType, columns) + " FROM "
+                + JdbcUrls.qualified(dbType, schema, table);
         Connection conn = open(dbType, connection);
         try {
             // PostgreSQL only streams with a cursor when autocommit is off; harmless elsewhere.
@@ -256,11 +289,11 @@ final class JdbcOps {
             }
             ResultSet rs = stmt.executeQuery(sql);
             ResultSetMetaData md = rs.getMetaData();
-            List<String> columns = new ArrayList<>();
+            List<String> labels = new ArrayList<>();
             for (int i = 1; i <= md.getColumnCount(); i++) {
-                columns.add(md.getColumnLabel(i));
+                labels.add(md.getColumnLabel(i));
             }
-            return new RowStream(conn, stmt, rs, columns);
+            return new RowStream(conn, stmt, rs, labels, canonical ? sqlTypes(md) : null);
         } catch (SQLException | RuntimeException e) {
             try {
                 conn.close();
@@ -277,12 +310,15 @@ final class JdbcOps {
         private final Statement stmt;
         private final ResultSet rs;
         private final List<String> columns;
+        /** JDBC types per column when emitting canonical values; {@code null} = plain JSON-safe. */
+        private final int[] canonicalTypes;
 
-        private RowStream(Connection conn, Statement stmt, ResultSet rs, List<String> columns) {
+        private RowStream(Connection conn, Statement stmt, ResultSet rs, List<String> columns, int[] canonicalTypes) {
             this.conn = conn;
             this.stmt = stmt;
             this.rs = rs;
             this.columns = columns;
+            this.canonicalTypes = canonicalTypes;
         }
 
         List<String> columns() {
@@ -296,7 +332,9 @@ final class JdbcOps {
             }
             List<Object> row = new ArrayList<>(columns.size());
             for (int i = 1; i <= columns.size(); i++) {
-                row.add(jsonSafe(rs.getObject(i)));
+                row.add(canonicalTypes == null
+                        ? jsonSafe(rs.getObject(i))
+                        : canonical(rs, i, canonicalTypes[i - 1]));
             }
             return row;
         }
@@ -623,6 +661,253 @@ final class JdbcOps {
         return v.isEmpty() ? fallback : v;
     }
 
+    /** {@code *} or the quoted column list, in the given order. */
+    private static String projection(String dbType, List<String> columns) {
+        if (columns == null || columns.isEmpty()) {
+            return "*";
+        }
+        List<String> quoted = new ArrayList<>(columns.size());
+        for (String c : columns) {
+            quoted.add(JdbcUrls.quote(dbType, c));
+        }
+        return String.join(", ", quoted);
+    }
+
+    private static int[] sqlTypes(ResultSetMetaData md) throws SQLException {
+        int[] types = new int[md.getColumnCount()];
+        for (int i = 0; i < types.length; i++) {
+            types[i] = md.getColumnType(i + 1);
+        }
+        return types;
+    }
+
+    /**
+     * One column as a string that compares equal across database engines, or {@code null}.
+     *
+     * <p>Numbers: plain decimal without trailing zeros ({@code 10.50} → {@code 10.5}, {@code 1E+3}
+     * → {@code 1000}). Timestamps: ISO local date-time ({@code 2024-01-02T03:04:05.5}); zoned
+     * timestamps: UTC instant. Dates / times: ISO. Booleans: {@code true}/{@code false}. CLOB:
+     * text. BLOB / binary: {@code sha256:<hex>} so large values never travel. Everything else:
+     * its string form.
+     */
+    static String canonical(ResultSet rs, int i, int sqlType) throws SQLException {
+        switch (sqlType) {
+            case Types.TIMESTAMP: {
+                java.sql.Timestamp t = rs.getTimestamp(i);
+                return t == null ? null : t.toLocalDateTime().toString();
+            }
+            case Types.TIMESTAMP_WITH_TIMEZONE: {
+                try {
+                    OffsetDateTime t = rs.getObject(i, OffsetDateTime.class);
+                    return t == null ? null : t.toInstant().toString();
+                } catch (SQLException | RuntimeException e) {
+                    return rs.getString(i);
+                }
+            }
+            case Types.DATE: {
+                java.sql.Date d = rs.getDate(i);
+                return d == null ? null : d.toLocalDate().toString();
+            }
+            case Types.TIME: {
+                java.sql.Time t = rs.getTime(i);
+                return t == null ? null : t.toLocalTime().toString();
+            }
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY: {
+                byte[] b = rs.getBytes(i);
+                return b == null ? null : "sha256:" + hex(digest().digest(b));
+            }
+            default:
+                return canonicalValue(rs.getObject(i));
+        }
+    }
+
+    static String canonicalValue(Object v) throws SQLException {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof String s) {
+            return s;
+        }
+        if (v instanceof BigDecimal d) {
+            return plain(d);
+        }
+        if (v instanceof Double || v instanceof Float) {
+            double x = ((Number) v).doubleValue();
+            return Double.isNaN(x) || Double.isInfinite(x) ? String.valueOf(x) : plain(BigDecimal.valueOf(x));
+        }
+        if (v instanceof Long || v instanceof Integer || v instanceof Short || v instanceof Byte
+                || v instanceof BigInteger) {
+            return v.toString();
+        }
+        if (v instanceof Number n) {
+            return plain(new BigDecimal(n.toString()));
+        }
+        if (v instanceof Boolean b) {
+            return b.toString();
+        }
+        if (v instanceof java.sql.Timestamp t) {
+            return t.toLocalDateTime().toString();
+        }
+        if (v instanceof java.sql.Date d) {
+            return d.toLocalDate().toString();
+        }
+        if (v instanceof java.sql.Time t) {
+            return t.toLocalTime().toString();
+        }
+        if (v instanceof OffsetDateTime t) {
+            return t.toInstant().toString();
+        }
+        if (v instanceof byte[] b) {
+            return "sha256:" + hex(digest().digest(b));
+        }
+        if (v instanceof Clob c) {
+            long len = c.length();
+            return len == 0 ? "" : c.getSubString(1, (int) Math.min(len, Integer.MAX_VALUE));
+        }
+        if (v instanceof Blob blob) {
+            MessageDigest md = digest();
+            try (InputStream in = blob.getBinaryStream()) {
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    md.update(buf, 0, n);
+                }
+            } catch (java.io.IOException e) {
+                throw new SQLException("BLOB read failed: " + e.getMessage(), e);
+            }
+            return "sha256:" + hex(md.digest());
+        }
+        return String.valueOf(v);
+    }
+
+    private static String plain(BigDecimal d) {
+        return d.signum() == 0 ? "0" : d.stripTrailingZeros().toPlainString();
+    }
+
+    private static MessageDigest digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    /** Max key tuples per {@link #lookup} statement (bind-parameter limits: Oracle/MSSQL ~2000). */
+    static final int LOOKUP_BATCH = 200;
+
+    /**
+     * Re-read rows by key: {@code SELECT columns FROM t WHERE (k1 = ? AND k2 = ?) OR ...}.
+     * Keys arrive as {@linkplain #canonical canonical} strings and are bound with the key
+     * column's own JDBC type, so the key index is used. A key that cannot be converted to
+     * that type (e.g. {@code "abc"} for an INT key) cannot exist and is skipped. Returns the
+     * found rows as canonical values, {@code columns} order; at most one statement per
+     * {@link #LOOKUP_BATCH} keys, all on one read-only connection.
+     */
+    static LookupResult lookup(
+            String dbType,
+            Map<String, String> connection,
+            String schema,
+            String table,
+            List<String> keyColumns,
+            List<String> columns,
+            List<List<String>> keys
+    ) throws SQLException {
+        if (keyColumns == null || keyColumns.isEmpty()) {
+            throw new IllegalArgumentException("key_columns is required");
+        }
+        List<String> select = columns == null || columns.isEmpty() ? keyColumns : columns;
+        String qualified = JdbcUrls.qualified(dbType, schema, table);
+        List<List<String>> rows = new ArrayList<>();
+        try (Connection conn = open(dbType, connection)) {
+            conn.setReadOnly(true);
+            int[] keyTypes;
+            try (Statement probe = conn.createStatement();
+                 ResultSet rs = probe.executeQuery(
+                         "SELECT " + projection(dbType, keyColumns) + " FROM " + qualified + " WHERE 1 = 0")) {
+                keyTypes = sqlTypes(rs.getMetaData());
+            }
+            String where = "(" + String.join(" AND ", keyColumns.stream()
+                    .map(c -> JdbcUrls.quote(dbType, c) + " = ?").toList()) + ")";
+            String head = "SELECT " + projection(dbType, select) + " FROM " + qualified + " WHERE ";
+            List<Object[]> bound = new ArrayList<>();
+            for (List<String> key : keys == null ? List.<List<String>>of() : keys) {
+                Object[] values = bindable(key, keyTypes);
+                if (values != null) {
+                    bound.add(values);
+                }
+            }
+            for (int from = 0; from < bound.size(); from += LOOKUP_BATCH) {
+                List<Object[]> batch = bound.subList(from, Math.min(bound.size(), from + LOOKUP_BATCH));
+                String sql = head + String.join(" OR ", java.util.Collections.nCopies(batch.size(), where));
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    int p = 1;
+                    for (Object[] values : batch) {
+                        for (Object v : values) {
+                            ps.setObject(p++, v);
+                        }
+                    }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        int[] types = sqlTypes(rs.getMetaData());
+                        while (rs.next()) {
+                            List<String> row = new ArrayList<>(types.length);
+                            for (int i = 1; i <= types.length; i++) {
+                                row.add(canonical(rs, i, types[i - 1]));
+                            }
+                            rows.add(row);
+                        }
+                    }
+                }
+            }
+            try {
+                conn.rollback();
+            } catch (SQLException ignored) {
+                // autocommit connection: nothing to roll back
+            }
+        }
+        return new LookupResult(select, rows);
+    }
+
+    /** Canonical key strings → values of each key column's JDBC type; {@code null} = unconvertible. */
+    static Object[] bindable(List<String> key, int[] types) {
+        if (key == null || key.size() != types.length) {
+            return null;
+        }
+        Object[] out = new Object[types.length];
+        for (int i = 0; i < types.length; i++) {
+            String s = key.get(i);
+            if (s == null) {
+                return null;
+            }
+            try {
+                out[i] = switch (types[i]) {
+                    case Types.TINYINT, Types.SMALLINT, Types.INTEGER, Types.BIGINT ->
+                            new BigDecimal(s).toBigIntegerExact().longValueExact();
+                    case Types.NUMERIC, Types.DECIMAL, Types.REAL, Types.FLOAT, Types.DOUBLE ->
+                            new BigDecimal(s);
+                    case Types.BIT, Types.BOOLEAN -> s.equals("1") || Boolean.parseBoolean(s);
+                    case Types.DATE -> java.sql.Date.valueOf(LocalDate.parse(s.length() > 10 ? s.substring(0, 10) : s));
+                    case Types.TIMESTAMP -> java.sql.Timestamp.valueOf(
+                            s.length() == 10 ? LocalDate.parse(s).atStartOfDay() : LocalDateTime.parse(s));
+                    case Types.TIME -> java.sql.Time.valueOf(LocalTime.parse(s));
+                    default -> s;
+                };
+            } catch (ArithmeticException | NumberFormatException | DateTimeParseException e) {
+                return null;
+            }
+        }
+        return out;
+    }
+
     private static Object jsonSafe(Object value) {
         if (value == null) {
             return null;
@@ -676,6 +961,8 @@ final class JdbcOps {
     ) {}
 
     record QueryResult(List<String> columns, List<List<Object>> rows) {}
+
+    record LookupResult(List<String> columns, List<List<String>> rows) {}
 
     private record ColumnRow(
             String name,

@@ -51,6 +51,50 @@ struct AdminRequest<'a> {
     /// `/v1/stream` only: rows per cursor round trip on the source.
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch_size: Option<u32>,
+    /// `/v1/stream`, `/v1/lookup`: columns to read, in order (empty = every column).
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    columns: &'a [String],
+    /// `/v1/stream`: canonical, engine-neutral string values (record diff).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    canonical: bool,
+    /// `/v1/lookup`: key column names.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    key_columns: &'a [String],
+    /// `/v1/lookup`: key tuples (canonical strings, `key_columns` order).
+    #[serde(skip_serializing_if = "<[Vec<Option<String>>]>::is_empty")]
+    keys: &'a [Vec<Option<String>>],
+}
+
+impl<'a> AdminRequest<'a> {
+    fn new(db_type: &'a str, connection: &'a HashMap<String, String>) -> Self {
+        Self {
+            db_type,
+            connection,
+            schema: None,
+            table: None,
+            statement: None,
+            search: None,
+            schema_filter: Vec::new(),
+            page: None,
+            page_size: None,
+            max_rows: None,
+            fetch_size: None,
+            columns: &[],
+            canonical: false,
+            key_columns: &[],
+            keys: &[],
+        }
+    }
+}
+
+/// `POST /v1/lookup` result: canonical rows found by key.
+#[derive(Debug, Deserialize)]
+pub struct LookupRows {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub rows: Vec<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +216,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -201,6 +246,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -239,6 +285,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -280,6 +327,7 @@ impl JdbcAdminClient {
                 page_size: Some(page_size),
                 max_rows: None,
                 fetch_size: None,
+                ..AdminRequest::new(db_type, connection)
             },
         )
         .await
@@ -306,6 +354,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -342,6 +391,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -372,6 +422,7 @@ impl JdbcAdminClient {
                 page_size: None,
                 max_rows: None,
                 fetch_size: None,
+                ..AdminRequest::new(db_type, connection)
             },
         )
         .await
@@ -399,6 +450,7 @@ impl JdbcAdminClient {
                     page_size: None,
                     max_rows: None,
                     fetch_size: None,
+                    ..AdminRequest::new(db_type, connection)
                 },
             )
             .await?;
@@ -416,6 +468,50 @@ impl JdbcAdminClient {
         schema: &str,
         table: &str,
         max_rows: Option<u64>,
+    ) -> Result<TableRowStream, AppError> {
+        self.open_stream_with(db_type, connection, schema, table, max_rows, &[], false)
+            .await
+    }
+
+    /// `POST /v1/lookup`: rows whose `key_columns` equal one of `keys`, as canonical
+    /// values of `columns` (empty = the key columns). At most 5000 keys per call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lookup(
+        &self,
+        db_type: &str,
+        connection: &HashMap<String, String>,
+        schema: &str,
+        table: &str,
+        key_columns: &[String],
+        columns: &[String],
+        keys: &[Vec<Option<String>>],
+    ) -> Result<LookupRows, AppError> {
+        self.post(
+            "/v1/lookup",
+            &AdminRequest {
+                schema: Some(schema),
+                table: Some(table),
+                columns,
+                key_columns,
+                keys,
+                ..AdminRequest::new(db_type, connection)
+            },
+        )
+        .await
+    }
+
+    /// [`Self::open_stream`] reading only `columns` (in order; empty = all), optionally as
+    /// canonical strings that compare equal across engines (`/v1/stream` `canonical`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_stream_with(
+        &self,
+        db_type: &str,
+        connection: &HashMap<String, String>,
+        schema: &str,
+        table: &str,
+        max_rows: Option<u64>,
+        columns: &[String],
+        canonical: bool,
     ) -> Result<TableRowStream, AppError> {
         let path = "/v1/stream";
         let mut req = self.stream_http.post(format!("{}{path}", self.base));
@@ -436,6 +532,9 @@ impl JdbcAdminClient {
             page_size: None,
             max_rows,
             fetch_size: None,
+            columns,
+            canonical,
+            ..AdminRequest::new(db_type, connection)
         };
         let res = req
             .json(&body)

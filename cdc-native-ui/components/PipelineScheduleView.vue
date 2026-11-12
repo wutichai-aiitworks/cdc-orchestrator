@@ -14,7 +14,12 @@ const props = defineProps<{
   /** Pipelines the page filters (search, status, tag) leave visible; null shows all. */
   visibleIds: Set<string> | null
   selectedId?: string
+  /** Rows-per-page choices; paging runs over the next-run order, not the page's sort. */
+  pageSizes?: number[]
 }>()
+
+const page = defineModel<number>("page", { default: 1 })
+const pageSize = defineModel<number>("pageSize", { default: 24 })
 
 const emit = defineEmits<{ select: [id: string] }>()
 
@@ -84,6 +89,12 @@ const rows = computed(() => {
     return a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true })
   })
 })
+
+const pagedRows = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return rows.value.slice(start, start + pageSize.value)
+})
+const rowOffset = computed(() => (page.value - 1) * pageSize.value)
 
 const counts = computed(() => {
   const c = { poll: 0, stream: 0, once: 0, idle: 0 }
@@ -187,7 +198,7 @@ const firstUpId = computed(() => {
       </thead>
       <tbody>
         <tr
-          v-for="(e, i) in rows"
+          v-for="(e, i) in pagedRows"
           :key="e.profile_id"
           class="cursor-pointer"
           :class="{
@@ -196,7 +207,7 @@ const firstUpId = computed(() => {
           }"
           @click="emit('select', e.profile_id)"
         >
-          <td class="font-mono text-xs text-muted-foreground">{{ i + 1 }}</td>
+          <td class="font-mono text-xs text-muted-foreground">{{ rowOffset + i + 1 }}</td>
           <td>
             <p class="font-medium">{{ e.name }}</p>
             <div v-if="e.tags.length" class="mt-1 flex flex-wrap gap-1">
@@ -255,5 +266,13 @@ const firstUpId = computed(() => {
         </tr>
       </tbody>
     </AppTable>
+
+    <AppListPager
+      v-model:page="page"
+      v-model:page-size="pageSize"
+      :total="rows.length"
+      :sizes="pageSizes"
+      noun="pipelines"
+    />
   </div>
 </template>

@@ -177,17 +177,32 @@ const onNavClick = (to: string) => {
 const pageTitle = computed(
   () => [...nav].sort((a, b) => b.to.length - a.to.length).find((item) => isActive(item.to))?.label || "Hyper CDC"
 )
-/** Breadcrumb trail for the top bar: menu group, parent item (e.g. Postgres tools), page. */
-const breadcrumb = computed(() => {
-  for (const group of navGroups) {
+type Crumb = { label: string; to?: string }
+const pageCrumbs = usePageCrumbs()
+/**
+ * Breadcrumb trail for the top bar: menu group, parent item (e.g. Postgres tools), page,
+ * then any crumbs the page adds (pipeline name, "Edit"). Menu crumbs link to the page's
+ * landing view, so "CDC" / "CDC Pipelines" lead back to the list from a detail or editor.
+ */
+const breadcrumb = computed<Crumb[]>(() => {
+  let trail: Crumb[] = [{ label: pageTitle.value }]
+  outer: for (const group of navGroups) {
     for (const item of group.items) {
       const leaves = item.children ?? [item]
       const hit = [...leaves].sort((a, b) => (b.to?.length || 0) - (a.to?.length || 0)).find((l) => l.to && isActive(l.to))
-      if (hit) return [group.label, ...(item.children ? [item.label] : []), hit.label]
+      if (hit) {
+        trail = [group, ...(item.children ? [item] : []), hit].map((c) => ({ label: c.label, to: hit.to }))
+        break outer
+      }
     }
   }
-  return [pageTitle.value]
+  return [...trail, ...pageCrumbs.value.map((label) => ({ label }))]
 })
+const onCrumbClick = (to: string) => {
+  // Same-path clicks (e.g. from the open editor) don't navigate; let the page reset its view.
+  if (route.path === to) reselect(to)
+  if (route.fullPath !== to) void navigateTo(to)
+}
 
 const orchestratorChip = computed(() => {
   if (capabilityLoading.value || (!capability.value && !capabilityError.value)) {
@@ -485,11 +500,18 @@ onUnmounted(() => {
             <ol class="flex min-w-0 items-center gap-1.5 text-sm">
               <li v-for="(crumb, i) in breadcrumb" :key="i" class="flex min-w-0 items-center gap-1.5">
                 <span v-if="i" class="text-muted-foreground opacity-50" aria-hidden="true">/</span>
+                <a
+                  v-if="crumb.to && i < breadcrumb.length - 1"
+                  :href="crumb.to"
+                  class="truncate text-muted-foreground hover:text-foreground hover:underline"
+                  @click.prevent="onCrumbClick(crumb.to)"
+                >{{ crumb.label }}</a>
                 <span
+                  v-else
                   class="truncate"
                   :class="i === breadcrumb.length - 1 ? 'font-medium text-foreground' : 'text-muted-foreground'"
                   :aria-current="i === breadcrumb.length - 1 ? 'page' : undefined"
-                >{{ crumb }}</span>
+                >{{ crumb.label }}</span>
               </li>
             </ol>
           </nav>

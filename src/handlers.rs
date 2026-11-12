@@ -1999,6 +1999,189 @@ pub async fn split_profile(
     ))
 }
 
+// ── Record diff (source vs target by key) ─────────────────────────────────────
+
+/// `POST /cdc/profiles/{id}/record-diff` — queue a background diff of one table.
+pub async fn start_record_diff(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<crate::record_diff::RecordDiffRequest>,
+) -> Result<(StatusCode, Json<crate::record_diff::DiffJobStatus>), AppError> {
+    let profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let actor = actor_from_headers(&headers);
+    let table = request.table.clone();
+    let started = crate::record_diff::start(&state, &profile, request, &actor).await;
+    let (outcome, detail) = match &started {
+        Ok(job) => ("success", json!({ "job_id": job.id, "table": job.table })),
+        Err(e) => (
+            "failure",
+            json!({ "table": table, "error": e.to_string_message() }),
+        ),
+    };
+    let event = new_event(
+        &actor,
+        "profile.record_diff_start",
+        outcome,
+        &detail_json(detail),
+        Some(profile.id),
+        Some(profile.name.as_str()),
+    );
+    emit(&state, event).await;
+    Ok((StatusCode::ACCEPTED, Json(started?)))
+}
+
+/// `GET /cdc/profiles/{id}/record-diff` — this pipeline's diff jobs, newest first.
+pub async fn list_record_diffs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Json<Vec<crate::record_diff::DiffJobStatus>> {
+    Json(crate::record_diff::list(&state, id).await)
+}
+
+/// `GET /cdc/profiles/{id}/record-diff/{job_id}` — status, plan and counts.
+pub async fn get_record_diff(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<crate::record_diff::DiffJobStatus>, AppError> {
+    crate::record_diff::get(&state, id, job_id)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound("record diff not found".into()))
+}
+
+/// `POST /cdc/profiles/{id}/record-diff/{job_id}/cancel` — stop a queued/running diff.
+pub async fn cancel_record_diff(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<crate::record_diff::DiffJobStatus>, AppError> {
+    let status = crate::record_diff::cancel(&state, id, job_id)
+        .await
+        .ok_or_else(|| AppError::NotFound("record diff not found".into()))?;
+    let event = new_event(
+        &actor_from_headers(&headers),
+        "profile.record_diff_cancel",
+        "success",
+        &detail_json(json!({ "job_id": job_id, "table": status.table })),
+        Some(id),
+        Some(status.profile_name.as_str()),
+    );
+    emit(&state, event).await;
+    Ok(Json(status))
+}
+
+/// `DELETE /cdc/profiles/{id}/record-diff/{job_id}` — remove a finished diff and its files.
+pub async fn delete_record_diff(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    crate::record_diff::delete(&state, id, job_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RecordDiffRowsQuery {
+    kind: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Download only: `ndjson` (default) or `csv`.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn record_diff_kind(raw: &str) -> Result<crate::record_diff::DiffKind, AppError> {
+    crate::record_diff::DiffKind::parse(raw).ok_or_else(|| {
+        AppError::BadRequest("kind must be source_only, target_only or mismatched".into())
+    })
+}
+
+/// `GET /cdc/profiles/{id}/record-diff/{job_id}/rows?kind=&offset=&limit=` — one page.
+pub async fn record_diff_rows(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<RecordDiffRowsQuery>,
+) -> Result<Json<crate::record_diff::DiffRowsPage>, AppError> {
+    let kind = record_diff_kind(&q.kind)?;
+    let page =
+        crate::record_diff::rows_page(&state, id, job_id, kind, q.offset, q.limit.unwrap_or(50))
+            .await?;
+    Ok(Json(page))
+}
+
+/// `GET /cdc/profiles/{id}/record-diff/{job_id}/download?kind=&format=ndjson|csv` —
+/// every row of one result kind, streamed from disk.
+pub async fn download_record_diff(
+    State(state): State<AppState>,
+    Path((id, job_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<RecordDiffRowsQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use tokio::io::AsyncBufReadExt;
+    let kind = record_diff_kind(&q.kind)?;
+    let csv = q
+        .format
+        .as_deref()
+        .is_some_and(|f| f.eq_ignore_ascii_case("csv"));
+    let (status, path) = crate::record_diff::result_file(&state, id, job_id, kind).await?;
+    let plan = status
+        .plan
+        .clone()
+        .ok_or_else(|| AppError::Internal("record diff has no plan".into()))?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| AppError::NotFound(format!("result file: {e}")))?;
+    let table = status.table.replace(['.', ' ', '/', '"'], "_");
+    let filename = format!(
+        "record-diff_{table}_{}.{}",
+        kind.label(),
+        if csv { "csv" } else { "ndjson" }
+    );
+    let body = async_stream::stream! {
+        if csv {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from(crate::record_diff::csv_header(&plan, kind)));
+        }
+        let mut lines = tokio::io::BufReader::new(file).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let out = if csv {
+                        crate::record_diff::csv_line(&plan, kind, &line).unwrap_or_default()
+                    } else {
+                        format!("{line}\n")
+                    };
+                    yield Ok(bytes::Bytes::from(out));
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::Response::builder()
+        .header(
+            "content-type",
+            if csv {
+                "text/csv; charset=utf-8"
+            } else {
+                "application/x-ndjson"
+            },
+        )
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from_stream(body))
+        .map_err(|e| AppError::Internal(format!("record diff download: {e}")))
+}
+
 /// `GET /cdc/profiles/{id}/initial-load` — progress of the latest load on this instance.
 pub async fn get_initial_load(
     State(state): State<AppState>,

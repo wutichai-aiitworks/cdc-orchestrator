@@ -7,6 +7,7 @@ import {
   AlertTriangle,
   Copy,
   FlaskConical,
+  GitCompareArrows,
   MoreHorizontal,
   Pause,
   Pencil,
@@ -100,12 +101,17 @@ watch(
   },
 )
 
-type TabKey = "tables" | "activity" | "logs" | "configuration"
+type TabKey = "tables" | "diff" | "activity" | "logs" | "configuration"
 
 const isReplica = computed(() => props.profile.pattern === "source_to_target")
 type TabDef = { key: TabKey; label: string; icon: Component }
 const tabs = computed<TabDef[]>(() => [
-  ...(isReplica.value ? [{ key: "tables" as const, label: "Tables", icon: Table2 }] : []),
+  ...(isReplica.value
+    ? [
+        { key: "tables" as const, label: "Tables", icon: Table2 },
+        { key: "diff" as const, label: "Verify Record", icon: GitCompareArrows },
+      ]
+    : []),
   { key: "activity", label: "Activity", icon: Activity },
   { key: "logs", label: "Logs", icon: ScrollText },
   { key: "configuration", label: "Configuration", icon: Settings2 },
@@ -451,6 +457,12 @@ const configRows = computed(() => [
             target: { image: flow.targetImage, label: flow.targetLabel, caption: flow.targetCaption },
           }"
           @health="endpointHealth = $event"
+        />
+
+        <RecordDiffPanel
+          v-else-if="tab === 'diff'"
+          :key="`${profile.id}-diff`"
+          :profile="profile"
         />
 
         <PipelineActivityTimeline

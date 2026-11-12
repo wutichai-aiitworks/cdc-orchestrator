@@ -183,4 +183,78 @@ class JdbcOpsTest {
             assertEquals(7, n);
         }
     }
+
+    private static final Map<String, String> DIFF = Map.of(
+            "jdbc_url", "jdbc:h2:mem:cdc_admin_diff;MODE=PostgreSQL;DB_CLOSE_DELAY=-1",
+            "username", "sa",
+            "password", ""
+    );
+
+    private static void diffTable() throws Exception {
+        JdbcOps.ddl("h2", DIFF, "CREATE SCHEMA IF NOT EXISTS \"d\"", "d");
+        JdbcOps.ddl(
+                "h2",
+                DIFF,
+                "CREATE TABLE IF NOT EXISTS \"d\".\"t\" (branch INT, code VARCHAR(8), amount DECIMAL(10,2),"
+                        + " ts TIMESTAMP, dt DATE, note VARCHAR(16), PRIMARY KEY (branch, code))",
+                "d"
+        );
+        JdbcOps.ddl("h2", DIFF, "DELETE FROM \"d\".\"t\"", null);
+        JdbcOps.ddl("h2", DIFF, "INSERT INTO \"d\".\"t\" VALUES (1, 'A', 10.50, TIMESTAMP '2024-01-02 03:04:05.5',"
+                + " DATE '2024-01-02', 'x')", null);
+        JdbcOps.ddl("h2", DIFF, "INSERT INTO \"d\".\"t\" VALUES (2, 'B', 0.00, NULL, NULL, NULL)", null);
+    }
+
+    @Test
+    void canonicalStreamProjectsColumnsAndNormalisesValues() throws Exception {
+        diffTable();
+        try (JdbcOps.RowStream rows = JdbcOps.openStream(
+                "h2", DIFF, "d", "t", 0, 0, List.of("BRANCH", "CODE", "AMOUNT", "TS", "DT"), true)) {
+            assertEquals(5, rows.columns().size());
+            List<Object> first = rows.next();
+            List<Object> second = rows.next();
+            List<Object> one = "1".equals(first.get(0)) ? first : second;
+            List<Object> two = one == first ? second : first;
+            assertEquals(List.of("1", "A", "10.5", "2024-01-02T03:04:05.500", "2024-01-02"), one);
+            assertEquals("0", two.get(2));
+            assertEquals(null, two.get(3));
+        }
+    }
+
+    @Test
+    void canonicalValueIsEngineNeutral() throws Exception {
+        assertEquals("1000", JdbcOps.canonicalValue(new java.math.BigDecimal("1E+3")));
+        assertEquals("10.5", JdbcOps.canonicalValue(10.50d));
+        assertEquals("7", JdbcOps.canonicalValue(7L));
+        assertEquals("true", JdbcOps.canonicalValue(Boolean.TRUE));
+        assertTrue(String.valueOf(JdbcOps.canonicalValue(new byte[] {1, 2})).startsWith("sha256:"));
+    }
+
+    @Test
+    void lookupFindsRowsByCompositeKeyAndSkipsUnconvertibleKeys() throws Exception {
+        diffTable();
+        JdbcOps.LookupResult found = JdbcOps.lookup(
+                "h2",
+                DIFF,
+                "d",
+                "t",
+                List.of("BRANCH", "CODE"),
+                List.of("BRANCH", "CODE", "AMOUNT"),
+                List.of(List.of("1", "A"), List.of("2", "Z"), List.of("abc", "A"), List.of("2.0", "B"))
+        );
+        assertEquals(2, found.rows().size());
+        assertTrue(found.rows().contains(List.of("1", "A", "10.5")));
+        assertTrue(found.rows().contains(List.of("2", "B", "0")));
+    }
+
+    @Test
+    void lookupBatchesManyKeys() throws Exception {
+        diffTable();
+        List<List<String>> keys = new java.util.ArrayList<>();
+        for (int i = 0; i < JdbcOps.LOOKUP_BATCH * 2 + 5; i++) {
+            keys.add(List.of(String.valueOf(i), "A"));
+        }
+        JdbcOps.LookupResult found = JdbcOps.lookup("h2", DIFF, "d", "t", List.of("BRANCH", "CODE"), List.of(), keys);
+        assertEquals(List.of(List.of("1", "A")), found.rows());
+    }
 }

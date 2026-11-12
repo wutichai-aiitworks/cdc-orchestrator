@@ -1638,6 +1638,149 @@ paths:
               schema: { $ref: "#/components/schemas/InitialLoadStatus" }
         "404":
           description: No initial load has run for this pipeline on this instance
+  /cdc/profiles/{id}/record-diff:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: Start a record diff of one table (source vs target, by key)
+      description: |
+        Finds rows that exist only in the source, only in the target, or (when columns are
+        compared) in both with different values. Runs in the background (ADR 0013): both
+        tables are read once through cdc-jdbc-admin (`/v1/stream`, key + compared columns,
+        canonical values), hash-partitioned by key into bucket files on the orchestrator's
+        disk, then compared bucket by bucket. Candidates are re-read by key
+        (`/v1/lookup`) so rows that converged during the scan are dropped
+        (`resolved_in_flight`). Read-only on both databases. One active diff per table;
+        `ORCH_RECORD_DIFF_CONCURRENCY` jobs run at once, the rest queue.
+        Audit: `profile.record_diff_start`, `profile.record_diff`.
+      operationId: startRecordDiff
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecordDiffRequest" }
+      responses:
+        "202":
+          description: Diff queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecordDiffJob" }
+        "400":
+          description: Not a source_to_target pipeline, jdbc-admin not configured, or a table outside the pipeline
+        "404":
+          description: Pipeline not found
+        "409":
+          description: A diff of this table is already queued or running
+    get:
+      summary: Record diff jobs of this pipeline, newest first
+      operationId: listRecordDiffs
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Jobs (the newest 20 finished per pipeline are kept)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RecordDiffJob" }
+  /cdc/profiles/{id}/record-diff/{job_id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      - { in: path, name: job_id, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: Status, plan, progress and counts of one record diff
+      operationId: getRecordDiff
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecordDiffJob" }
+        "404":
+          description: Not found
+    delete:
+      summary: Delete a finished record diff and its result files
+      operationId: deleteRecordDiff
+      tags: [Profiles]
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+        "409":
+          description: Still queued or running — cancel it first
+  /cdc/profiles/{id}/record-diff/{job_id}/cancel:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      - { in: path, name: job_id, required: true, schema: { type: string, format: uuid } }
+    post:
+      summary: Cancel a queued or running record diff
+      description: Stops between read batches / buckets; work files are removed.
+      operationId: cancelRecordDiff
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Current status (state becomes cancelled once it stops)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecordDiffJob" }
+        "404":
+          description: Not found
+  /cdc/profiles/{id}/record-diff/{job_id}/rows:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      - { in: path, name: job_id, required: true, schema: { type: string, format: uuid } }
+      - in: query
+        name: kind
+        required: true
+        schema: { type: string, enum: [source_only, target_only, mismatched] }
+      - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
+      - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+    get:
+      summary: One page of a succeeded diff's results
+      operationId: getRecordDiffRows
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Rows
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecordDiffRowsPage" }
+        "400":
+          description: Unknown kind, or the diff has not succeeded
+        "404":
+          description: Not found
+  /cdc/profiles/{id}/record-diff/{job_id}/download:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      - { in: path, name: job_id, required: true, schema: { type: string, format: uuid } }
+      - in: query
+        name: kind
+        required: true
+        schema: { type: string, enum: [source_only, target_only, mismatched] }
+      - in: query
+        name: format
+        schema: { type: string, enum: [ndjson, csv], default: ndjson }
+    get:
+      summary: Download every row of one result kind (streamed)
+      description: CSV cells starting with = + - @ are prefixed with ' (spreadsheet formula guard).
+      operationId: downloadRecordDiff
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Result file
+          content:
+            application/x-ndjson: { schema: { type: string } }
+            text/csv: { schema: { type: string } }
+        "400":
+          description: Unknown kind, or the diff has not succeeded
+        "404":
+          description: Not found
   /cdc/processing-pipelines:
     get:
       summary: List Kafka-native processing pipelines
@@ -3184,6 +3327,98 @@ components:
           maximum: 31
           default: 1
           description: "rolling_window only: previous days included besides today (1 = today + yesterday)."
+    RecordDiffRequest:
+      type: object
+      required: [table]
+      properties:
+        table: { type: string, description: "Source table SCHEMA.TABLE (one of the pipeline's tables)." }
+        key_columns:
+          type: array
+          items: { type: string }
+          description: "Source key column(s). Empty = mapping pk_columns, else source PK, else target PK."
+        compare_columns:
+          type: array
+          items: { type: string }
+          description: Source columns whose values are compared for rows on both sides.
+        compare_all_columns:
+          type: boolean
+          default: false
+          description: Compare every mapped, untransformed non-key column.
+        options:
+          type: object
+          properties:
+            trim_trailing_spaces: { type: boolean, default: true }
+            case_insensitive: { type: boolean, default: false }
+            recheck: { type: boolean, default: true }
+            recheck_limit: { type: integer, default: 10000, description: Candidates rechecked per kind; the rest are `unverified`. }
+    RecordDiffJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        profile_id: { type: string, format: uuid }
+        profile_name: { type: string }
+        table: { type: string }
+        state: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        phase: { type: string, enum: [queued, planning, scanning, comparing, rechecking, done] }
+        actor: { type: string }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        error: { type: string }
+        options: { type: object }
+        requested_key_columns: { type: array, items: { type: string } }
+        requested_compare_columns: { type: array, items: { type: string } }
+        compare_all_columns: { type: boolean }
+        plan:
+          type: object
+          properties:
+            source_schema: { type: string }
+            source_table: { type: string }
+            target_schema: { type: string }
+            target_table: { type: string }
+            key_source: { type: string, enum: [request, mapping, source_pk, target_pk] }
+            source_key_columns: { type: array, items: { type: string } }
+            target_key_columns: { type: array, items: { type: string } }
+            source_compare_columns: { type: array, items: { type: string } }
+            target_compare_columns: { type: array, items: { type: string } }
+            warnings: { type: array, items: { type: string } }
+        counts:
+          type: object
+          properties:
+            source_rows: { type: integer }
+            target_rows: { type: integer }
+            matched: { type: integer }
+            source_only: { type: integer }
+            target_only: { type: integer }
+            mismatched: { type: integer }
+            source_duplicate_keys: { type: integer }
+            target_duplicate_keys: { type: integer }
+            source_null_keys: { type: integer }
+            target_null_keys: { type: integer }
+            resolved_in_flight: { type: integer }
+            unverified: { type: integer }
+        progress:
+          type: object
+          properties:
+            source_rows_read: { type: integer }
+            target_rows_read: { type: integer }
+            source_rows_estimate: { type: integer }
+            target_rows_estimate: { type: integer }
+            buckets_done: { type: integer }
+            buckets_total: { type: integer }
+            recheck_done: { type: integer }
+            recheck_total: { type: integer }
+    RecordDiffRowsPage:
+      type: object
+      properties:
+        kind: { type: string, enum: [source_only, target_only, mismatched] }
+        offset: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        rows:
+          type: array
+          description: "{ key: {col: value}, status: confirmed|unverified, values?: {...}, differences?: [{column, target_column, source, target}] }"
+          items: { type: object }
     InitialLoadRequest:
       type: object
       properties:
