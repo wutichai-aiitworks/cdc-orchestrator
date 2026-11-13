@@ -288,7 +288,7 @@ fn diagnose_connectivity(t: &str, side: Side, who: &str) -> Option<Diagnosis> {
             ErrorArea::Network,
             side,
             format!("The {who} database is not reachable"),
-            "Check the database is running and the host/port are correct. If it goes through an SSH tunnel or port-forward (e.g. Termius), make sure the tunnel is connected.",
+            "Check the database is running, the host/port are correct, and anything in between (VPN, firewall, proxy, SSH tunnel or port-forward) is up and allows the connection.",
         ));
     }
     None

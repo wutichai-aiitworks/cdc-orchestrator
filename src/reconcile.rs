@@ -70,6 +70,18 @@ pub(crate) fn topic_prefix_for(profile: &CdcProfile) -> String {
         .to_ascii_lowercase()
 }
 
+/// Logical replication slot a Postgres source connector uses (`connection.slot` wins).
+pub(crate) fn postgres_slot_name(profile: &CdcProfile) -> String {
+    profile
+        .source
+        .connection
+        .get("slot")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cdc_{}", topic_prefix_for(profile).replace('-', "_")))
+}
+
 pub(crate) fn apply_avro_converters(cfg: &mut HashMap<String, String>, schema_registry_url: &str) {
     let registry = schema_registry_url.trim();
     cfg.insert(
@@ -188,12 +200,11 @@ pub fn build_debezium_config(
     cfg.insert("topic.prefix".into(), server_name.clone());
     cfg.insert(
         "snapshot.mode".into(),
-        if src.capture_mode == crate::models::CaptureMode::SyncOnce {
-            "initial_only".into()
-        } else {
-            "initial".into()
-        },
+        crate::start_position::snapshot_mode(src).into(),
     );
+    if let Some(marker) = crate::start_position::marker(&src.start_position) {
+        cfg.insert(crate::start_position::MARKER_KEY.into(), marker);
+    }
 
     apply_debezium_dialect(&mut cfg, profile, &db_type, database, &server_name);
     apply_debezium_transforms(&mut cfg, profile);
@@ -259,18 +270,14 @@ fn apply_postgres_debezium(
             .cloned()
             .unwrap_or_else(|| "dbz_publication".into()),
     );
-    cfg.insert(
-        "slot.name".into(),
-        src.connection
-            .get("slot")
-            .cloned()
-            .unwrap_or_else(|| format!("cdc_{}", server_name.replace('-', "_"))),
-    );
+    let _ = server_name;
+    cfg.insert("slot.name".into(), postgres_slot_name(profile));
     cfg.insert("publication.autocreate.mode".into(), "disabled".into());
     if src.schema_mode == SchemaSelectionMode::SpecificSchemas && !src.schemas.is_empty() {
         cfg.insert("schema.include.list".into(), src.schemas.join(","));
     }
     insert_table_include(cfg, profile);
+    include_heartbeat(cfg, profile);
     // Explicit overrides only; `reconcile_start` re-applies with catalog-derived keys.
     let _ = apply_message_key_columns(cfg, profile, &HashMap::new());
 }
@@ -288,46 +295,9 @@ pub(crate) fn apply_message_key_columns(
     profile: &CdcProfile,
     keyless: &HashMap<(String, String), crate::connector_catalog::KeylessTable>,
 ) -> Result<(), AppError> {
-    let src = &profile.source;
-    let mut entries: Vec<String> = Vec::new();
-    let mut overridden: Vec<String> = Vec::new();
-    if let Some(raw) = src.connection.get("message_key_columns") {
-        for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
-            if let Some((table, _)) = entry.split_once(':') {
-                overridden.push(table.trim().replace("\\.", ".").to_ascii_lowercase());
-            }
-            entries.push(entry.to_string());
-        }
-    }
-
-    let include: Vec<String> = source_table_include_list(profile)
-        .iter()
-        .map(|t| t.trim().to_ascii_lowercase())
-        .collect();
-    let schemas: Vec<String> = if src.schema_mode == SchemaSelectionMode::SpecificSchemas {
-        src.schemas
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut candidates: Vec<_> = keyless
-        .iter()
-        .filter(|((schema, table), _)| {
-            let qualified = format!("{schema}.{table}").to_ascii_lowercase();
-            if !include.is_empty() {
-                include.contains(&qualified)
-            } else {
-                schemas.is_empty() || schemas.contains(&schema.to_ascii_lowercase())
-            }
-        })
-        .collect();
-    candidates.sort_by(|a, b| a.0.cmp(b.0));
-
+    let (mut entries, overridden) = message_key_overrides(profile);
     let mut missing = Vec::new();
-    for ((schema, table), facts) in candidates {
+    for ((schema, table), facts) in keyless_candidates(profile, keyless) {
         let qualified = format!("{schema}.{table}");
         if overridden.contains(&qualified.to_ascii_lowercase()) {
             continue;
@@ -359,6 +329,80 @@ pub(crate) fn apply_message_key_columns(
         cfg.insert("message.key.columns".into(), entries.join(";"));
     }
     Ok(())
+}
+
+/// Entries from `source.connection.message_key_columns`, and the tables they cover
+/// (lowercase `schema.table`).
+fn message_key_overrides(profile: &CdcProfile) -> (Vec<String>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut overridden = Vec::new();
+    let raw = profile.source.connection.get("message_key_columns");
+    for entry in raw
+        .into_iter()
+        .flat_map(|r| r.split(';'))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        if let Some((table, _)) = entry.split_once(':') {
+            overridden.push(table.trim().replace("\\.", ".").to_ascii_lowercase());
+        }
+        entries.push(entry.to_string());
+    }
+    (entries, overridden)
+}
+
+/// Keyless tables this profile captures, sorted by (schema, table).
+fn keyless_candidates<'a>(
+    profile: &CdcProfile,
+    keyless: &'a HashMap<(String, String), crate::connector_catalog::KeylessTable>,
+) -> Vec<(
+    &'a (String, String),
+    &'a crate::connector_catalog::KeylessTable,
+)> {
+    let src = &profile.source;
+    let lower =
+        |v: &[String]| -> Vec<String> { v.iter().map(|t| t.trim().to_ascii_lowercase()).collect() };
+    let include = lower(&source_table_include_list(profile));
+    let schemas = if src.schema_mode == SchemaSelectionMode::SpecificSchemas {
+        lower(&src.schemas)
+    } else {
+        Vec::new()
+    };
+    let mut candidates: Vec<_> = keyless
+        .iter()
+        .filter(|((schema, table), _)| {
+            if !include.is_empty() {
+                include.contains(&format!("{schema}.{table}").to_ascii_lowercase())
+            } else {
+                schemas.is_empty() || schemas.contains(&schema.to_ascii_lowercase())
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    candidates
+}
+
+/// The latency probe's heartbeat table (ADR 0016) is captured like any other table: add it to
+/// explicit schema / table include lists. Without include lists everything is captured.
+fn include_heartbeat(cfg: &mut HashMap<String, String>, profile: &CdcProfile) {
+    if !heartbeat_on(profile) {
+        return;
+    }
+    for (key, item) in [
+        ("schema.include.list", crate::latency::probe::SCHEMA),
+        ("table.include.list", crate::latency::probe::QUALIFIED),
+    ] {
+        if let Some(list) = cfg.get_mut(key) {
+            if !list.split(',').any(|v| v.trim() == item) {
+                list.push(',');
+                list.push_str(item);
+            }
+        }
+    }
+}
+
+pub(crate) fn heartbeat_on(profile: &CdcProfile) -> bool {
+    profile.latency_probe.enabled && crate::latency::probe::unsupported_reason(profile).is_none()
 }
 
 fn insert_table_include(cfg: &mut HashMap<String, String>, profile: &CdcProfile) {
@@ -450,7 +494,10 @@ pub fn build_jdbc_sink_config(
         "io.debezium.connector.jdbc.JdbcSinkConnector".into(),
     );
     cfg.insert("tasks.max".into(), "1".into());
-    let capture_tables = source_table_include_list(profile);
+    let mut capture_tables = source_table_include_list(profile);
+    if !capture_tables.is_empty() && heartbeat_on(profile) {
+        capture_tables.push(crate::latency::probe::QUALIFIED.to_string());
+    }
     let topics_regex = if !capture_tables.is_empty() {
         let parts: Vec<String> = capture_tables.iter().map(|t| regex_escape(t)).collect();
         format!("{prefix}\\.({})", parts.join("|"))
@@ -842,7 +889,55 @@ fn offsets_incompatible_reason(
     if get(old, "snapshot.mode") == "initial_only" && get(new, "snapshot.mode") != "initial_only" {
         return Some("switched from Sync once to ongoing capture".into());
     }
+    // Stored offsets belong to the old start position; keeping them would ignore the new one.
+    let marker = crate::start_position::MARKER_KEY;
+    if get(old, marker) != get(new, marker) {
+        return Some("start position changed".into());
+    }
     None
+}
+
+/// Create (or re-config) a STOPPED source connector, write its offset, then run it.
+///
+/// Kafka Connect only accepts `PATCH /offsets` on a STOPPED connector (KIP-875); a new
+/// connector is created straight into STOPPED (KIP-980) so it never reads from the
+/// wrong place first.
+async fn start_connector_at(
+    state: &AppState,
+    name: &str,
+    config: &HashMap<String, String>,
+    offsets: &Value,
+) -> Result<(), AppError> {
+    if connector_exists(state, name).await? {
+        halt_connector(state, name).await?;
+        wait_for_stopped(state, name).await?;
+        upsert_connector(state, name, config).await?;
+    } else {
+        connect_request(
+            state,
+            Method::POST,
+            "/connectors",
+            Some(json!({ "name": name, "config": config, "initial_state": "STOPPED" })),
+        )
+        .await?;
+        wait_for_stopped(state, name).await?;
+    }
+    connect_request(
+        state,
+        Method::PATCH,
+        &format!("/connectors/{}/offsets", urlencoding::encode(name)),
+        Some(offsets.clone()),
+    )
+    .await?;
+    resume_connector(state, name).await
+}
+
+/// Offset body that seeds `profile`'s source connector at `pos`.
+fn seed_offsets(profile: &CdcProfile, pos: &crate::models::LogPosition) -> Result<Value, AppError> {
+    let dialect = crate::start_position::Dialect::of(&profile.source.source_type)
+        .ok_or_else(|| AppError::BadRequest("unsupported source for a start position".into()))?;
+    let database = req(&profile.source.connection, "database")?;
+    crate::start_position::offset_body(dialect, &topic_prefix_for(profile), database, pos)
 }
 
 async fn cleanup_leftover_connectors(state: &AppState, profile: &CdcProfile) {
@@ -915,81 +1010,15 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
     }
     let registry = schema_registry_url(state);
     let name = connector_name_for(profile);
-    // Incremental pipelines may need one source connector per rolling-window / full-copy
-    // table on top of the table-mode watermark connector; the first one keeps `name`.
-    let sources: Vec<(String, HashMap<String, String>)> = match profile.source.capture_mode {
-        crate::models::CaptureMode::Trigger => vec![(
-            name.clone(),
-            crate::postgres_trigger_cdc::build_jdbc_source_config(profile, &registry)?,
-        )],
-        crate::models::CaptureMode::Incremental => {
-            let columns = incremental_source_columns(profile).await?;
-            crate::incremental_cdc::source_connector_plan(profile, &name, &registry, &columns)?
-                .into_iter()
-                .map(|spec| (spec.name, spec.config))
-                .collect()
-        }
-        _ => {
-            let mut cfg = build_debezium_config(profile, &registry)?;
-            if matches!(
-                profile
-                    .source
-                    .source_type
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "postgres" | "postgresql"
-            ) {
-                let insight = crate::connector_catalog::insight_from_connection(
-                    "postgres",
-                    &profile.source.connection,
-                );
-                // Best effort: if the orchestrator can't reach the source, start with
-                // explicit overrides only (Connect may still reach it on its network).
-                let keyless = match crate::connector_catalog::postgres_client(&insight).await {
-                    Ok(client) => crate::connector_catalog::postgres_keyless_tables(&client).await,
-                    Err(e) => Err(e),
-                };
-                match keyless {
-                    Ok(keyless) => apply_message_key_columns(&mut cfg, profile, &keyless)?,
-                    Err(err) => tracing::warn!(
-                        connector = %name,
-                        error = %err,
-                        "could not read source keys; keyless tables will emit null record keys"
-                    ),
-                }
-            }
-            vec![(name.clone(), cfg)]
-        }
-    };
+    let sources = plan_source_connectors(profile, &name, &registry).await?;
     cleanup_leftover_connectors(state, profile).await;
-    for stale in existing_poll_connectors(state, profile).await {
-        if !sources.iter().any(|(n, _)| *n == stale) {
-            if let Err(err) = stop_connector(state, &stale, true).await {
-                tracing::warn!(connector = %stale, error = %err, "failed to delete stale poll connector");
-            }
-        }
-    }
+    delete_stale_poll_connectors(state, profile, &sources).await;
+    let seeded_position = profile.source.capture_mode == crate::models::CaptureMode::Logical
+        && profile.source.start_position.is_seeded();
     for (source_name, config) in &sources {
-        if let Some(reason) = existing_offsets_incompatible(state, source_name, config).await {
-            // Stored offsets would make the new connector skip rows (e.g. Sync once →
-            // Change capture: Debezium sees a finished snapshot and streams only from
-            // now, losing everything written in between). Reset so it snapshots again;
-            // the sink upserts by key, so re-sent rows do not duplicate.
-            halt_connector(state, source_name).await?;
-            wait_for_stopped(state, source_name).await?;
-            reset_connector_offsets(state, source_name).await?;
-            profile.push_history(HistoryItem {
-                timestamp: Utc::now(),
-                level: "warn".to_string(),
-                event: "source_offsets_reset".to_string(),
-                detail: format!(
-                    "{reason}: cleared stored offsets of {source_name}; a full snapshot runs before streaming"
-                ),
-            });
-        }
-        upsert_connector(state, source_name, config).await?;
-        ensure_running(state, source_name).await;
+        // A seeded start position (earliest retained / custom) applies to the primary connector.
+        let seeded = seeded_position && *source_name == name;
+        start_source(state, profile, source_name, config, seeded).await?;
     }
     profile.connector_name = Some(name.clone());
     ensure_capture_topics(state, profile).await;
@@ -1020,6 +1049,147 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
         detail: "CDC pipeline reconciled and running".to_string(),
     });
     Ok(())
+}
+
+/// Source connectors to run: incremental pipelines may need one per rolling-window /
+/// full-copy table on top of the table-mode watermark connector; the first one keeps `name`.
+async fn plan_source_connectors(
+    profile: &CdcProfile,
+    name: &str,
+    registry: &str,
+) -> Result<Vec<(String, HashMap<String, String>)>, AppError> {
+    Ok(match profile.source.capture_mode {
+        crate::models::CaptureMode::Trigger => vec![(
+            name.to_string(),
+            crate::postgres_trigger_cdc::build_jdbc_source_config(profile, registry)?,
+        )],
+        crate::models::CaptureMode::Incremental => {
+            let columns = incremental_source_columns(profile).await?;
+            crate::incremental_cdc::source_connector_plan(profile, name, registry, &columns)?
+                .into_iter()
+                .map(|spec| (spec.name, spec.config))
+                .collect()
+        }
+        _ => vec![(
+            name.to_string(),
+            debezium_source_config(profile, name, registry).await?,
+        )],
+    })
+}
+
+/// Debezium config; Postgres sources also get `message.key.columns` for keyless tables.
+async fn debezium_source_config(
+    profile: &CdcProfile,
+    name: &str,
+    registry: &str,
+) -> Result<HashMap<String, String>, AppError> {
+    let mut cfg = build_debezium_config(profile, registry)?;
+    let source_type = profile.source.source_type.trim().to_ascii_lowercase();
+    if !matches!(source_type.as_str(), "postgres" | "postgresql") {
+        return Ok(cfg);
+    }
+    let insight =
+        crate::connector_catalog::insight_from_connection("postgres", &profile.source.connection);
+    // Best effort: if the orchestrator can't reach the source, start with
+    // explicit overrides only (Connect may still reach it on its network).
+    let keyless = match crate::connector_catalog::postgres_client(&insight).await {
+        Ok(client) => crate::connector_catalog::postgres_keyless_tables(&client).await,
+        Err(e) => Err(e),
+    };
+    match keyless {
+        Ok(keyless) => apply_message_key_columns(&mut cfg, profile, &keyless)?,
+        Err(err) => tracing::warn!(
+            connector = %name,
+            error = %err,
+            "could not read source keys; keyless tables will emit null record keys"
+        ),
+    }
+    Ok(cfg)
+}
+
+async fn delete_stale_poll_connectors(
+    state: &AppState,
+    profile: &CdcProfile,
+    sources: &[(String, HashMap<String, String>)],
+) {
+    for stale in existing_poll_connectors(state, profile).await {
+        if sources.iter().any(|(n, _)| *n == stale) {
+            continue;
+        }
+        if let Err(err) = stop_connector(state, &stale, true).await {
+            tracing::warn!(connector = %stale, error = %err, "failed to delete stale poll connector");
+        }
+    }
+}
+
+/// Upserts and runs one source connector. `seeded`: the profile's seeded start position
+/// applies to it, once: when the connector has no offsets yet, or its offsets came from
+/// another position.
+async fn start_source(
+    state: &AppState,
+    profile: &mut CdcProfile,
+    source_name: &str,
+    config: &HashMap<String, String>,
+    seeded: bool,
+) -> Result<(), AppError> {
+    let fresh = seeded && !connector_exists(state, source_name).await?;
+    let reset = existing_offsets_incompatible(state, source_name, config).await;
+    if seeded && (fresh || reset.is_some()) {
+        return start_source_seeded(state, profile, source_name, config, reset).await;
+    }
+    if let Some(reason) = reset {
+        // Stored offsets would make the new connector skip rows (e.g. Sync once →
+        // Change capture: Debezium sees a finished snapshot and streams only from
+        // now, losing everything written in between). Reset so it snapshots again;
+        // the sink upserts by key, so re-sent rows do not duplicate.
+        clear_offsets(state, source_name).await?;
+        profile.push_history(HistoryItem {
+            timestamp: Utc::now(),
+            level: "warn".to_string(),
+            event: "source_offsets_reset".to_string(),
+            detail: format!(
+                "{reason}: cleared stored offsets of {source_name}; a full snapshot runs before streaming"
+            ),
+        });
+    }
+    upsert_connector(state, source_name, config).await?;
+    ensure_running(state, source_name).await;
+    Ok(())
+}
+
+async fn start_source_seeded(
+    state: &AppState,
+    profile: &mut CdcProfile,
+    source_name: &str,
+    config: &HashMap<String, String>,
+    reset: Option<String>,
+) -> Result<(), AppError> {
+    let pos = crate::start_position::resolve(profile, &profile.source.start_position)
+        .await?
+        .ok_or_else(|| AppError::Internal("seeded start position resolved to none".into()))?;
+    let offsets = seed_offsets(profile, &pos)?;
+    if reset.is_some() {
+        clear_offsets(state, source_name).await?;
+    }
+    start_connector_at(state, source_name, config, &offsets).await?;
+    let why = reset.map(|r| format!("{r}: ")).unwrap_or_default();
+    profile.push_history(HistoryItem {
+        timestamp: Utc::now(),
+        level: "info".to_string(),
+        event: "source_position_seeded".to_string(),
+        detail: format!(
+            "{why}{source_name} starts at {} (no row copy)",
+            serde_json::to_string(&pos).unwrap_or_default()
+        ),
+    });
+    Ok(())
+}
+
+/// Stops the connector and deletes its stored offsets.
+async fn clear_offsets(state: &AppState, name: &str) -> Result<(), AppError> {
+    halt_connector(state, name).await?;
+    wait_for_stopped(state, name).await?;
+    reset_connector_offsets(state, name).await
 }
 
 pub async fn reconcile_pause(state: &AppState, profile: &mut CdcProfile) -> Result<(), AppError> {
@@ -1570,6 +1740,17 @@ pub async fn reconcile_resync(
     row_limit: Option<u64>,
 ) -> Result<(), AppError> {
     let source_name = connector_name_for(profile);
+    if profile.source.capture_mode == crate::models::CaptureMode::Logical
+        && profile.source.start_position != crate::models::StartPosition::SnapshotThenStream
+    {
+        // Resync means "copy everything again", which this pipeline's snapshot.mode
+        // (no_data / recovery) never does. Reposition, or switch the start position.
+        return Err(AppError::BadRequest(
+            "this pipeline starts from a log position without copying rows, so resync cannot replay it; \
+             use Reposition to move it, or set start_position to snapshot_then_stream and Start"
+                .into(),
+        ));
+    }
     require_row_limit_for_profile(profile, row_limit)?;
     guard_clear_target_for_rolling_window(profile, clear_target)?;
     if !connector_exists(state, &source_name).await? {
@@ -1735,6 +1916,141 @@ fn build_managed_sink_config_inner(
     }
 }
 
+/// Move a running log-based pipeline to another source position (ADR 0014).
+///
+/// Halts sink and source, optionally empties the target, replaces the source offset and
+/// resumes. Forward leaves a gap in the target; backward replays changes, which the
+/// upserting sink absorbs. Returns the position the source now resumes from.
+pub async fn reconcile_reposition(
+    state: &AppState,
+    profile: &mut CdcProfile,
+    target: crate::models::StartPosition,
+    clear_target: bool,
+) -> Result<crate::models::LogPosition, AppError> {
+    use crate::models::StartPosition;
+    if profile.source.capture_mode != crate::models::CaptureMode::Logical {
+        return Err(AppError::BadRequest(
+            "reposition applies only to log-based capture (capture_mode=logical)".into(),
+        ));
+    }
+    let mut next_source = profile.source.clone();
+    next_source.start_position = target.clone();
+    crate::start_position::validate_static(&next_source)?;
+    let name = connector_name_for(profile);
+    if !connector_exists(state, &name).await? {
+        return Err(AppError::BadRequest(
+            "the pipeline has no source connector yet; set start_position and Start instead".into(),
+        ));
+    }
+    let pos = match &target {
+        StartPosition::SnapshotThenStream => {
+            return Err(AppError::BadRequest(
+                "snapshot_then_stream copies rows again: use Resync for that".into(),
+            ))
+        }
+        StartPosition::Latest => crate::start_position::current_source_position(profile).await?,
+        seeded => crate::start_position::resolve(profile, seeded)
+            .await?
+            .ok_or_else(|| AppError::Internal("start position resolved to none".into()))?,
+    };
+    let offsets = seed_offsets(profile, &pos)?;
+
+    // Keep everything Start configured; only the snapshot mode and marker follow the
+    // new position, so a later Start sees matching offsets and leaves them alone.
+    let path = format!("/connectors/{}/config", urlencoding::encode(&name));
+    let mut config: HashMap<String, String> =
+        serde_json::from_value(connect_request(state, Method::GET, &path, None).await?)
+            .map_err(|e| AppError::Upstream(format!("invalid connector config: {e}")))?;
+    config.insert(
+        "snapshot.mode".into(),
+        crate::start_position::snapshot_mode(&next_source).into(),
+    );
+    match crate::start_position::marker(&target) {
+        Some(m) => config.insert(crate::start_position::MARKER_KEY.into(), m),
+        None => config.remove(crate::start_position::MARKER_KEY),
+    };
+
+    let sink = profile
+        .has_managed_sink()
+        .then(|| sink_connector_name_for(profile));
+    if let Some(sink) = sink.as_deref() {
+        halt_connector(state, sink).await?;
+    }
+    halt_connector(state, &name).await?;
+    wait_for_stopped(state, &name).await?;
+    let cleared = if clear_target {
+        truncate_target_tables(profile).await?
+    } else {
+        Vec::new()
+    };
+    // Drop the whole stored offset first: a PATCH would leave lsn_proc / lsn_commit from
+    // the old position next to the new lsn.
+    reset_connector_offsets(state, &name).await?;
+    upsert_connector(state, &name, &config).await?;
+    connect_request(
+        state,
+        Method::PATCH,
+        &format!("/connectors/{}/offsets", urlencoding::encode(&name)),
+        Some(offsets),
+    )
+    .await?;
+    resume_connector(state, &name).await?;
+    if let Some(sink) = sink {
+        resume_connector(state, &sink).await?;
+        profile.sink_connector_name = Some(sink);
+    }
+
+    profile.source.start_position = target;
+    profile.connector_name = Some(name.clone());
+    profile.status = ProfileStatus::Running;
+    profile.last_error = None;
+    profile.updated_at = Utc::now();
+    let cleared_note = if cleared.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; cleared {} target table(s) ({})",
+            cleared.len(),
+            cleared.join(", ")
+        )
+    };
+    profile.push_history(HistoryItem {
+        timestamp: Utc::now(),
+        level: "warn".to_string(),
+        event: "source_repositioned".to_string(),
+        detail: format!(
+            "{name} resumes at {}{cleared_note}",
+            serde_json::to_string(&pos).unwrap_or_default()
+        ),
+    });
+    Ok(pos)
+}
+
+/// The position the profile's source connector last committed, if any.
+pub async fn committed_position(
+    state: &AppState,
+    profile: &CdcProfile,
+) -> Result<Option<crate::models::LogPosition>, AppError> {
+    if profile.source.capture_mode != crate::models::CaptureMode::Logical {
+        return Ok(None);
+    }
+    let Some(dialect) = crate::start_position::Dialect::of(&profile.source.source_type) else {
+        return Ok(None);
+    };
+    let name = connector_name_for(profile);
+    if !connector_exists(state, &name).await? {
+        return Ok(None);
+    }
+    let offsets = connect_request(
+        state,
+        Method::GET,
+        &format!("/connectors/{}/offsets", urlencoding::encode(&name)),
+        None,
+    )
+    .await?;
+    Ok(crate::start_position::current_position(dialect, &offsets))
+}
+
 pub async fn apply_profile_action(
     state: &AppState,
     profile: &mut CdcProfile,
@@ -1769,6 +2085,41 @@ mod tests {
     };
     use chrono::Utc;
     use uuid::Uuid;
+
+    #[test]
+    fn heartbeat_probe_adds_its_table_to_source_include_lists_and_sink_topics() {
+        let mut p = crate::postgres_trigger_cdc::tests::profile();
+        p.source.capture_mode = crate::models::CaptureMode::Logical;
+        p.source.connection.insert("password".into(), "x".into());
+        p.target
+            .as_mut()
+            .unwrap()
+            .connection
+            .insert("password".into(), "x".into());
+        let src = build_debezium_config(&p, "http://sr:8081").unwrap();
+        assert!(
+            !src["table.include.list"].contains("hyper_cdc_heartbeat"),
+            "off by default"
+        );
+
+        p.latency_probe.enabled = true;
+        let src = build_debezium_config(&p, "http://sr:8081").unwrap();
+        assert_eq!(src["schema.include.list"], "bookings,hyper_cdc");
+        assert_eq!(
+            src["table.include.list"],
+            "bookings.tickets,hyper_cdc.hyper_cdc_heartbeat"
+        );
+        let sink = build_jdbc_sink_config(&p, "http://sr:8081").unwrap();
+        assert!(
+            sink["topics.regex"].contains("hyper_cdc\\.hyper_cdc_heartbeat"),
+            "{}",
+            sink["topics.regex"]
+        );
+
+        // Unsupported combinations never change the connector config.
+        p.source.capture_mode = crate::models::CaptureMode::Trigger;
+        assert!(!heartbeat_on(&p));
+    }
 
     fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1837,6 +2188,7 @@ mod tests {
                 incrementing_column: None,
                 upsert_key_columns: vec![],
                 table_poll: vec![],
+                start_position: Default::default(),
             },
             target: Some(TargetConfig {
                 name: "warehouse".into(),
@@ -1865,6 +2217,7 @@ mod tests {
             tags: vec![],
             connector_name: None,
             sink_connector_name: None,
+            latency_probe: Default::default(),
         }
     }
 

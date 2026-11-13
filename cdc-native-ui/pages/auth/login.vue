@@ -84,7 +84,7 @@ onMounted(async () => {
     <div class="relative w-full max-w-sm space-y-6 animate-slide-up">
       <div class="flex flex-col items-center gap-3">
         <img src="/favicon.png" alt="Hyper CDC" class="h-32 w-32 object-contain" />
-        <p class="text-sm text-muted-foreground">Hyper CDC</p>
+        <p class="text-2xl font-bold tracking-tight text-foreground">Hyper CDC</p>
       </div>
 
       <form v-if="localMode" class="auth-card space-y-4 p-6" @submit.prevent="submitLocal">

@@ -23,6 +23,7 @@ volumes:
   cdc-postgres-data:
   cdc-postgres-target-data:
   cdc-lake-data:
+  cdc-mcp-data:
 
 services:
   # ── Message bus (Redpanda) ─────────────────────────────────────
@@ -453,5 +454,12 @@ services:
       CDC_ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
       # Local prompting: set ALLOW_WRITE_TOOLS=true in .env
       ALLOW_WRITE_TOOLS: ${ALLOW_WRITE_TOOLS:-false}
+      # OAuth for Claude.ai / ChatGPT connectors (ADR 0017): the public https URL clients use,
+      # e.g. https://cdc-mcp.example.com (behind a TLS proxy or Cloudflare tunnel).
+      MCP_OAUTH: ${MCP_OAUTH:-true}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
+      MCP_OAUTH_STORE: /data/oauth-store.json
+    volumes:
+      - cdc-mcp-data:/data
     networks: [server_zone]
     restart: unless-stopped

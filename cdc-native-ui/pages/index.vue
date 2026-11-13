@@ -13,8 +13,10 @@ import {
   Server,
   ShieldCheck,
   Workflow,
+  Timer,
 } from "@lucide/vue"
 import type { Component } from "vue"
+import { formatMs, type LatencyCurrent } from "~/utils/latency"
 import type { CdcProfile } from "~/composables/useProfilesM3"
 import { formatApiError } from "~/utils/apiError"
 
@@ -31,6 +33,16 @@ const topics = ref(0)
 const profiles = ref<CdcProfile[]>([])
 const loading = ref(false)
 const loaded = ref(false)
+/** The topic count comes from the broker and lands after the rest; its card waits alone. */
+const topicsLoaded = ref(false)
+const { fetchLatency } = useLatency()
+const latencies = ref<LatencyCurrent[]>([])
+/** Highest current end-to-end latency among running pipelines. */
+const worstLatency = computed(() =>
+  latencies.value
+    .filter((l) => l.e2e_ms !== null && l.status !== "stopped")
+    .sort((a, b) => (b.e2e_ms ?? 0) - (a.e2e_ms ?? 0))[0] ?? null,
+)
 const error = ref("")
 const lastUpdatedAt = ref<number | null>(null)
 const now = ref(Date.now())
@@ -179,7 +191,7 @@ const bannerClass: Record<string, string> = {
 
 // ── KPI tiles ──────────────────────────────────────────────────────
 type Segment = { value: number; class: string; label: string }
-type Kpi = { label: string; value: number; total?: number; icon: Component; to: string; segments: Segment[]; footnote: string }
+type Kpi = { label: string; value: number | string; total?: number; pending?: boolean; icon: Component; to: string; segments: Segment[]; footnote: string }
 
 const kpis = computed<Kpi[]>(() => [
   {
@@ -229,8 +241,19 @@ const kpis = computed<Kpi[]>(() => [
     value: topics.value,
     icon: List,
     to: "/topics",
+    pending: !topicsLoaded.value,
     segments: [],
     footnote: "Event streams on the cluster",
+  },
+  {
+    label: "Worst latency",
+    value: worstLatency.value ? formatMs(worstLatency.value.e2e_ms) : "—",
+    icon: Timer,
+    to: worstLatency.value ? `/pipelines?pipeline=${worstLatency.value.profile_id}` : "/pipelines",
+    segments: [],
+    footnote: worstLatency.value
+      ? `${worstLatency.value.name} · ${latencies.value.filter((l) => l.e2e_ms !== null).length} measured`
+      : "No running pipeline measured yet",
   },
 ])
 
@@ -283,21 +306,24 @@ const refresh = async () => {
   if (loading.value) return
   loading.value = true
   error.value = ""
-  const results = await Promise.allSettled([
-    fetchEngineStatus(),
-    fetchConnectors(),
-    fetchTopics({ page: 1, page_size: 1 }),
-    fetchProfiles(),
-  ])
+  const topicsRequest = fetchTopics({ page: 1, page_size: 1, summary: true }).then((r) => {
+    topics.value = r.total
+    topicsLoaded.value = true
+  })
+  fetchLatency()
+    .then((r) => (latencies.value = r.items))
+    .catch(() => {})
+  const results = await Promise.allSettled([fetchEngineStatus(), fetchConnectors(), fetchProfiles()])
   if (results[0].status === "fulfilled") engine.value = results[0].value
   else engine.value = null
   if (results[1].status === "fulfilled") connectors.value = results[1].value.connectors || {}
-  if (results[2].status === "fulfilled") topics.value = results[2].value.total
-  if (results[3].status === "fulfilled") profiles.value = results[3].value
-  const failed = results.find((result) => result.status === "rejected")
+  if (results[2].status === "fulfilled") profiles.value = results[2].value
+  // Show the page now; don't hold it for the broker.
+  loaded.value = true
+  const [topicsResult] = await Promise.allSettled([topicsRequest])
+  const failed = [...results, topicsResult].find((result) => result.status === "rejected")
   if (failed?.status === "rejected") error.value = formatApiError(failed.reason, "Some overview data could not be loaded")
   lastUpdatedAt.value = Date.now()
-  loaded.value = true
   loading.value = false
 }
 
@@ -373,7 +399,7 @@ onBeforeUnmount(() => {
     </section>
 
     <!-- KPI tiles -->
-    <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+    <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
       <NuxtLink
         v-for="kpi in kpis"
         :key="kpi.label"
@@ -385,7 +411,7 @@ onBeforeUnmount(() => {
           <component :is="kpi.icon" class="h-4 w-4 text-muted-foreground transition-colors group-hover:text-primary" :stroke-width="1.75" />
         </div>
         <p class="font-display text-3xl font-semibold leading-none tabular-nums text-foreground">
-          <span v-if="!loaded" class="inline-block h-7 w-12 animate-pulse rounded bg-muted align-middle" />
+          <span v-if="!loaded || kpi.pending" class="inline-block h-7 w-12 animate-pulse rounded bg-muted align-middle" />
           <template v-else>
             {{ kpi.value }}<span v-if="kpi.total !== undefined" class="text-lg font-medium text-muted-foreground"> / {{ kpi.total }}</span>
           </template>

@@ -4,7 +4,7 @@ mod auto_recover;
 mod diff;
 mod dispatch;
 mod poll_audit;
-mod rules;
+pub(crate) mod rules;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -215,23 +215,40 @@ async fn tick(state: &AppState) -> Result<(), AppError> {
     // Restart tasks that died because something was briefly unreachable.
     auto_recover::recover(state, &next).await;
 
+    let rules_owned = rules::load_enabled_rules(state).await?;
+    let failed: Vec<(String, Vec<String>)> = next
+        .values()
+        .filter(|s| s.state == "FAILED")
+        .map(|s| {
+            let errors = s
+                .task_errors
+                .iter()
+                .map(|te| format!("Task {}: {}", te.task_id, te.trace))
+                .collect();
+            (s.name.clone(), errors)
+        })
+        .collect();
+    crate::notify::check_failed_for(state, &rules_owned, &failed).await;
+
     if prev.is_empty() && !next.is_empty() {
         *state.connector_snapshots.write().await = next;
-        check_dlq_growth(state).await?;
+        check_dlq_growth(state, &rules_owned).await?;
         return Ok(());
     }
 
     let transitions = diff::diff_transitions(&prev, &next);
-    let rules_owned = rules::load_enabled_rules(state).await?;
     for t in transitions {
         handle_transition(state, &t, rules_owned.as_slice()).await;
     }
     *state.connector_snapshots.write().await = next;
-    check_dlq_growth(state).await?;
+    check_dlq_growth(state, &rules_owned).await?;
     Ok(())
 }
 
-async fn check_dlq_growth(state: &AppState) -> Result<(), AppError> {
+async fn check_dlq_growth(
+    state: &AppState,
+    rules_owned: &[crate::models::AlertRule],
+) -> Result<(), AppError> {
     let statuses = crate::kafka_topics::load_profile_dlq_statuses(state).await?;
     let mut increases = Vec::new();
     {
@@ -263,6 +280,28 @@ async fn check_dlq_growth(state: &AppState) -> Result<(), AppError> {
         });
         if let Ok(json) = serde_json::to_string(&payload) {
             let _ = state.alerts_tx.send(json);
+        }
+        let matched = rules::rules_for(rules_owned, "dlq_growth", &topic);
+        if !matched.is_empty() {
+            let ev = crate::notify::render::NotificationEvent {
+                condition: "dlq_growth".into(),
+                severity: crate::notify::render::Severity::Warning,
+                title: format!("Dead-letter queue growing: {topic}"),
+                summary: format!(
+                    "{} new record(s) (high watermark {old} → {current})",
+                    current - old
+                ),
+                subject: topic.clone(),
+                subject_kind: "topic".into(),
+                from: Some(old.to_string()),
+                to: current.to_string(),
+                errors: vec![],
+                ts: chrono::Utc::now(),
+                rule: None,
+                link: crate::notify::link(state, "/topics"),
+                test: false,
+            };
+            crate::notify::fanout(state, &matched, ev).await;
         }
         tracing::warn!(
             target = "cdc_dlq_watcher",

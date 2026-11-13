@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { databaseMeta, type ConnectorKind, type ConnectorDatabaseType } from "~/utils/connectorMeta"
+import { dbIconPath } from "~/utils/dbIcon"
 
 const props = withDefaults(
   defineProps<{
@@ -25,22 +26,16 @@ const kindLabel = computed(() => {
   if (kind === "sink") return "Sink"
   return ""
 })
-const tileClass = computed(() => {
-  const size = {
-    sm: "h-9 w-9 text-sm",
-    md: "h-11 w-11 text-sm",
-    lg: "h-14 w-14 text-lg",
-  }[props.size]
-  const tone: Record<string, string> = {
-    sky: "bg-sky-500/15 text-sky-700 dark:text-sky-300 ring-sky-500/25",
-    cyan: "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 ring-cyan-500/25",
-    amber: "bg-amber-500/15 text-amber-800 dark:text-amber-300 ring-amber-500/25",
-    red: "bg-red-500/15 text-red-700 dark:text-red-300 ring-red-500/25",
-    orange: "bg-brand-500/15 text-primary ring-brand-500/30",
-    slate: "bg-muted text-muted-foreground ring-border",
-  }
-  return `${size} ${tone[meta.value.tone] || tone.slate}`
-})
+// Vendor logo (same images as the pipeline pages); unknown vendors get the generic database icon.
+const iconSrc = computed(() => dbIconPath(meta.value.value === "unknown" ? null : meta.value.value))
+const tileClass = computed(
+  () =>
+    ({
+      sm: "h-9 w-9 p-1.5",
+      md: "h-11 w-11 p-2",
+      lg: "h-14 w-14 p-2.5",
+    })[props.size],
+)
 const kindClass = computed(() =>
   String(props.kind).toLowerCase() === "sink"
     ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
@@ -51,11 +46,11 @@ const kindClass = computed(() =>
 <template>
   <div class="flex min-w-0 items-center gap-3">
     <div
-      class="flex flex-shrink-0 items-center justify-center rounded-xl font-display font-bold ring-1"
+      class="flex flex-shrink-0 items-center justify-center rounded-xl bg-card ring-1 ring-border"
       :class="tileClass"
       :title="meta.label"
     >
-      {{ meta.monogram }}
+      <img :src="iconSrc" :alt="meta.label" class="h-full w-full object-contain" />
     </div>
     <div class="min-w-0">
       <div class="flex flex-wrap items-center gap-1.5">

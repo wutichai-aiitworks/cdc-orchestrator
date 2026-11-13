@@ -233,38 +233,49 @@ pub fn changes(before: &Value, after: &Value) -> Vec<Value> {
 
 fn diff_into(path: &str, a: &Value, b: &Value, out: &mut Vec<Value>) {
     if let (Value::Object(ma), Value::Object(mb)) = (a, b) {
-        let mut keys: Vec<&String> = ma.keys().chain(mb.keys()).collect();
-        keys.sort();
-        keys.dedup();
-        for k in keys {
-            if path.is_empty() && IGNORED_KEYS.contains(&k.as_str()) {
-                continue;
-            }
-            let field = if path.is_empty() {
-                k.clone()
-            } else {
-                format!("{path}.{k}")
-            };
-            let (va, vb) = (
-                ma.get(k).unwrap_or(&Value::Null),
-                mb.get(k).unwrap_or(&Value::Null),
-            );
-            if is_secret_key(k) {
-                if va != vb && !(blank(va) && blank(vb)) {
-                    out.push(json!({ "field": field, "secret": true }));
-                }
-            } else {
-                diff_into(&field, va, vb, out);
-            }
-        }
+        diff_objects(path, ma, mb, out);
         return;
     }
-    if a != b && !(blank(a) && blank(b)) {
+    if changed(a, b) {
         let (mut va, mut vb) = (a.clone(), b.clone());
         redact(&mut va);
         redact(&mut vb);
         out.push(json!({ "field": path, "before": va, "after": vb }));
     }
+}
+
+fn diff_objects(
+    path: &str,
+    ma: &Map<String, Value>,
+    mb: &Map<String, Value>,
+    out: &mut Vec<Value>,
+) {
+    let mut keys: Vec<&String> = ma.keys().chain(mb.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let top = path.is_empty();
+    for k in keys {
+        if top && IGNORED_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        let field = if top {
+            k.clone()
+        } else {
+            format!("{path}.{k}")
+        };
+        let va = ma.get(k).unwrap_or(&Value::Null);
+        let vb = mb.get(k).unwrap_or(&Value::Null);
+        if !is_secret_key(k) {
+            diff_into(&field, va, vb, out);
+        } else if changed(va, vb) {
+            out.push(json!({ "field": field, "secret": true }));
+        }
+    }
+}
+
+/// Different, counting missing, null, "" and [] as the same.
+fn changed(a: &Value, b: &Value) -> bool {
+    a != b && !(blank(a) && blank(b))
 }
 
 /// "1 h 05 m", "3 m 12 s", "4 s" — the same style as the UI's formatDuration.
@@ -615,15 +626,9 @@ pub fn finished_event(tool: &str, job: &Value, tail: Option<&str>) -> Option<Too
     let ts = |k: &str| job.get(k).and_then(Value::as_str).and_then(norm_ts);
     let started = ts("started_at").or_else(|| ts("created_at"));
     let finished = ts("finished_at");
-    let duration = match (&started, &finished) {
-        (Some(s), Some(f)) => DateTime::parse_from_rfc3339(f)
-            .ok()
-            .zip(DateTime::parse_from_rfc3339(s).ok())
-            .map(|(f, s)| (f - s).num_seconds()),
-        _ => None,
-    };
-    let took = duration.map(fmt_duration);
-    let exit = job.get("exit_code").and_then(Value::as_i64);
+    let duration = started
+        .zip(finished.clone())
+        .and_then(|(s, f)| Some((parse_ts(&f)? - parse_ts(&s)?).num_seconds()));
     let error = job
         .get("error")
         .and_then(Value::as_str)
@@ -632,10 +637,9 @@ pub fn finished_event(tool: &str, job: &Value, tail: Option<&str>) -> Option<Too
     // No error from the sidecar (e.g. pgcopydb exit 12): the log says why.
     let reason = error.clone().or_else(|| tail.and_then(first_error_line));
 
-    let what = run_label(job);
     let mut e = base(tool, "run.finished", "system");
     e.event_id = run_event_id(tool, job_id, "run.finished");
-    e.timestamp = finished.clone().unwrap_or_else(now_ts);
+    e.timestamp = finished.unwrap_or_else(now_ts);
     e.job_id = Some(job_id.to_string());
     e.profile_id = job
         .get("profile_id")
@@ -643,29 +647,57 @@ pub fn finished_event(tool: &str, job: &Value, tail: Option<&str>) -> Option<Too
         .map(str::to_string);
     e.profile_name = job.get("name").and_then(Value::as_str).map(str::to_string);
     e.status = Some(status.to_string());
-    e.summary = match status {
-        "succeeded" => match &took {
-            Some(t) => format!("{what} succeeded in {t}"),
-            None => format!("{what} succeeded"),
-        },
-        "stopped" => match &took {
-            Some(t) => format!("{what} stopped after {t}"),
-            None => format!("{what} stopped"),
-        },
-        _ => {
-            let mut s = match &took {
-                Some(t) => format!("{what} failed after {t}"),
-                None => format!("{what} failed"),
-            };
-            if let Some(code) = exit {
-                s.push_str(&format!(", exit {code}"));
-            }
-            if let Some(err) = &reason {
-                s.push_str(&format!(": {}", short(err, 140)));
-            }
-            s
-        }
+    e.summary = finished_summary(job, status, duration, reason.as_deref());
+    // The sidecar's error is already in JOB_FIELDS; only a log-derived reason is added.
+    let log_reason = if error.is_none() {
+        reason.as_deref()
+    } else {
+        None
     };
+    e.detail = finished_detail(job, duration, log_reason, tail);
+    Some(e)
+}
+
+fn parse_ts(s: &str) -> Option<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(s).ok()
+}
+
+/// "pgcopydb run succeeded in 3 m 12 s", "… failed after 4 s, exit 12: <reason>".
+fn finished_summary(
+    job: &Value,
+    status: &str,
+    duration: Option<i64>,
+    reason: Option<&str>,
+) -> String {
+    let what = run_label(job);
+    let (verb, prep) = match status {
+        "succeeded" => ("succeeded", "in"),
+        "stopped" => ("stopped", "after"),
+        _ => ("failed", "after"),
+    };
+    let mut s = match duration.map(fmt_duration) {
+        Some(t) => format!("{what} {verb} {prep} {t}"),
+        None => format!("{what} {verb}"),
+    };
+    if verb != "failed" {
+        return s;
+    }
+    if let Some(code) = job.get("exit_code").and_then(Value::as_i64) {
+        s.push_str(&format!(", exit {code}"));
+    }
+    if let Some(err) = reason {
+        s.push_str(&format!(": {}", short(err, 140)));
+    }
+    s
+}
+
+/// Redacted JSON detail: the job's fields, duration, a log-derived reason and the log tail.
+fn finished_detail(
+    job: &Value,
+    duration: Option<i64>,
+    log_reason: Option<&str>,
+    tail: Option<&str>,
+) -> String {
     let mut detail = Map::new();
     for k in JOB_FIELDS {
         if let Some(v) = job.get(k).filter(|v| !v.is_null()) {
@@ -675,18 +707,15 @@ pub fn finished_event(tool: &str, job: &Value, tail: Option<&str>) -> Option<Too
     if let Some(d) = duration {
         detail.insert("duration_secs".into(), json!(d));
     }
-    if error.is_none() {
-        if let Some(r) = &reason {
-            detail.insert("reason".into(), json!(r));
-        }
+    if let Some(r) = log_reason {
+        detail.insert("reason".into(), json!(r));
     }
     if let Some(t) = tail.filter(|t| !t.is_empty()) {
         detail.insert("log_tail".into(), json!(t));
     }
     let mut detail = Value::Object(detail);
     redact(&mut detail);
-    e.detail = detail.to_string();
-    Some(e)
+    detail.to_string()
 }
 
 /// run.started seen by the watcher (runs started outside this orchestrator, or when the handler's
@@ -718,80 +747,90 @@ pub fn spawn_run_watcher(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut last_trim = std::time::Instant::now() - Duration::from_secs(3600);
         loop {
-            let mut still: HashSet<String> = HashSet::new();
-            for tool in TOOLS {
-                let Ok(list) = list_jobs(&state, tool).await else {
-                    continue;
-                }; // not configured / down
-                let jobs = list
-                    .get("jobs")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for job in &jobs {
-                    let status = job
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    // A running job is announced once it is clearly not the one a handler just started.
-                    let old_enough = job
-                        .get("created_at")
-                        .and_then(Value::as_str)
-                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                        .is_some_and(|t| {
-                            (Utc::now() - t.with_timezone(&Utc)).num_seconds()
-                                > 2 * every.as_secs() as i64
-                        });
-                    let mut events = Vec::new();
-                    if is_terminal(status) || old_enough {
-                        events.extend(started_event(tool, job));
-                    }
-                    let finish_id = job
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(|id| run_event_id(tool, id, "run.finished"));
-                    let tail = if matches!(status, "failed" | "stopped")
-                        && finish_id.as_ref().is_some_and(|id| !seen.contains(id))
-                    {
-                        let id = job.get("id").and_then(Value::as_str).unwrap_or_default();
-                        job_logs(&state, tool, id)
-                            .await
-                            .ok()
-                            .and_then(|v| v.get("log").and_then(Value::as_str).map(log_tail))
-                    } else {
-                        None
-                    };
-                    events.extend(finished_event(tool, job, tail.as_deref()));
-                    for ev in events {
-                        still.insert(ev.event_id.clone());
-                        if seen.insert(ev.event_id.clone()) {
-                            record(&state, ev).await;
-                        }
-                    }
-                }
-            }
-            // Forget jobs the sidecars no longer list (INSERT OR IGNORE covers a restart).
-            seen.retain(|id| still.contains(id));
-
+            poll_tools(&state, every, &mut seen).await;
             if last_trim.elapsed() >= Duration::from_secs(3600) {
                 last_trim = std::time::Instant::now();
-                if let Some(rqlite) = state.rqlite.as_ref() {
-                    let before = (Utc::now()
-                        - chrono::Duration::days(i64::from(
-                            state.config.tool_events_retention_days,
-                        )))
-                    .to_rfc3339_opts(SecondsFormat::Millis, true);
-                    if let Err(e) = rqlite
-                        .trim_tool_events(&before, state.config.tool_events_max_rows)
-                        .await
-                    {
-                        warn!(error = %e, "tool event retention failed");
-                    }
-                }
+                trim_retention(&state).await;
             }
             tokio::time::sleep(every).await;
         }
     })
+}
+
+/// One pass over every sidecar's job list. `seen` holds the event ids already recorded.
+async fn poll_tools(state: &AppState, every: Duration, seen: &mut HashSet<String>) {
+    let mut still: HashSet<String> = HashSet::new();
+    for tool in TOOLS {
+        let Ok(list) = list_jobs(state, tool).await else {
+            continue;
+        }; // not configured / down
+        let jobs = list.get("jobs").and_then(Value::as_array);
+        for job in jobs.into_iter().flatten() {
+            for ev in job_events(state, tool, job, every, seen).await {
+                still.insert(ev.event_id.clone());
+                if seen.insert(ev.event_id.clone()) {
+                    record(state, ev).await;
+                }
+            }
+        }
+    }
+    // Forget jobs the sidecars no longer list (INSERT OR IGNORE covers a restart).
+    seen.retain(|id| still.contains(id));
+}
+
+/// run.started / run.finished events a job listing implies right now.
+async fn job_events(
+    state: &AppState,
+    tool: &str,
+    job: &Value,
+    every: Duration,
+    seen: &HashSet<String>,
+) -> Vec<ToolEventRow> {
+    let status = job
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    // A running job is announced once it is clearly not the one a handler just started.
+    if is_terminal(status) || created_before(job, 2 * every.as_secs() as i64) {
+        events.extend(started_event(tool, job));
+    }
+    let id = job.get("id").and_then(Value::as_str);
+    // Fetch the log only for a failed/stopped run not yet recorded.
+    let needs_tail = matches!(status, "failed" | "stopped")
+        && id.is_some_and(|id| !seen.contains(&run_event_id(tool, id, "run.finished")));
+    let tail = match id.filter(|_| needs_tail) {
+        Some(id) => job_logs(state, tool, id)
+            .await
+            .ok()
+            .and_then(|v| v.get("log").and_then(Value::as_str).map(log_tail)),
+        None => None,
+    };
+    events.extend(finished_event(tool, job, tail.as_deref()));
+    events
+}
+
+/// The job's `created_at` is more than `secs` ago.
+fn created_before(job: &Value, secs: i64) -> bool {
+    job.get("created_at")
+        .and_then(Value::as_str)
+        .and_then(parse_ts)
+        .is_some_and(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds() > secs)
+}
+
+async fn trim_retention(state: &AppState) {
+    let Some(rqlite) = state.rqlite.as_ref() else {
+        return;
+    };
+    let days = i64::from(state.config.tool_events_retention_days);
+    let before =
+        (Utc::now() - chrono::Duration::days(days)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    if let Err(e) = rqlite
+        .trim_tool_events(&before, state.config.tool_events_max_rows)
+        .await
+    {
+        warn!(error = %e, "tool event retention failed");
+    }
 }
 
 // ── API: GET /cdc/tool-events ───────────────────────────────────────────────

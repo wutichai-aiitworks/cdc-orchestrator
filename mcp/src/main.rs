@@ -18,7 +18,7 @@ use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
@@ -34,6 +34,8 @@ use tower_http::{
 use uuid::Uuid;
 
 mod copy_tools;
+mod oauth;
+mod ops_tools;
 mod redact;
 mod tools;
 
@@ -71,6 +73,8 @@ pub(crate) struct AppState {
     http: Client,
     sessions: Arc<Mutex<Sessions>>,
     rate_limit: Arc<Mutex<RateLimiter>>,
+    /// OAuth clients and token hashes (ADR 0017).
+    oauth: Arc<Mutex<oauth::OAuthStore>>,
 }
 
 #[derive(Clone)]
@@ -86,6 +90,8 @@ pub(crate) struct Config {
     rate_limit_rpm: u32,
     session_ttl: Duration,
     max_sessions: usize,
+    /// OAuth bridge for Claude.ai / ChatGPT style remote connectors (ADR 0017).
+    oauth: oauth::OAuthConfig,
 }
 
 impl Config {
@@ -141,6 +147,30 @@ impl Config {
                     .unwrap_or(86_400),
             ),
             max_sessions: env_or("MCP_MAX_SESSIONS", "1000").parse().unwrap_or(1000),
+            oauth: oauth::OAuthConfig {
+                enabled: env_or("MCP_OAUTH", "true").eq_ignore_ascii_case("true"),
+                public_url: env::var("MCP_PUBLIC_URL")
+                    .ok()
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty()),
+                store_path: env::var("MCP_OAUTH_STORE")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+                access_ttl: Duration::from_secs(
+                    env_or("MCP_OAUTH_ACCESS_TTL_SECS", "3600")
+                        .parse()
+                        .unwrap_or(3600)
+                        .max(60),
+                ),
+                refresh_ttl: Duration::from_secs(
+                    env_or("MCP_OAUTH_REFRESH_TTL_SECS", "2592000")
+                        .parse()
+                        .unwrap_or(2_592_000)
+                        .max(3600),
+                ),
+            },
         })
     }
 }
@@ -149,43 +179,13 @@ impl Config {
 /// (scope = read | write). `MCP_BEARER_TOKEN` (legacy) adds client `default` with write scope;
 /// writes still need `ALLOW_WRITE_TOOLS=true`.
 fn load_clients(keys: Option<&str>, legacy: Option<&str>) -> Result<Vec<ClientKey>> {
-    let mut clients = Vec::new();
-    for entry in keys
+    let mut clients = keys
         .unwrap_or_default()
         .split([',', '\n'])
         .map(str::trim)
         .filter(|e| !e.is_empty())
-    {
-        let mut parts = entry.splitn(3, ':');
-        let (Some(name), Some(scope), Some(token)) = (parts.next(), parts.next(), parts.next())
-        else {
-            bail!(
-                "MCP_CLIENT_KEYS entry must be name:scope:token (got an entry with {} part(s))",
-                entry.split(':').count()
-            );
-        };
-        let name = name.trim();
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        {
-            bail!("MCP_CLIENT_KEYS client name `{name}`: use 1-64 of [A-Za-z0-9-_.]");
-        }
-        let scope = match scope.trim().to_ascii_lowercase().as_str() {
-            "read" => Scope::Read,
-            "write" => Scope::Write,
-            other => {
-                bail!("MCP_CLIENT_KEYS client `{name}`: scope must be read or write, got `{other}`")
-            }
-        };
-        clients.push(ClientKey {
-            name: name.to_string(),
-            scope,
-            token: token.trim().to_string(),
-        });
-    }
+        .map(parse_client_entry)
+        .collect::<Result<Vec<_>>>()?;
     if let Some(tok) = legacy.map(str::trim).filter(|t| !t.is_empty()) {
         clients.push(ClientKey {
             name: "default".into(),
@@ -196,6 +196,46 @@ fn load_clients(keys: Option<&str>, legacy: Option<&str>) -> Result<Vec<ClientKe
     if clients.is_empty() {
         bail!("no MCP client keys: set MCP_CLIENT_KEYS (name:scope:token,...) or MCP_BEARER_TOKEN");
     }
+    check_unique_clients(&clients)?;
+    Ok(clients)
+}
+
+/// One `name:scope:token` entry of `MCP_CLIENT_KEYS`.
+fn parse_client_entry(entry: &str) -> Result<ClientKey> {
+    let mut parts = entry.splitn(3, ':');
+    let (Some(name), Some(scope), Some(token)) = (parts.next(), parts.next(), parts.next()) else {
+        bail!(
+            "MCP_CLIENT_KEYS entry must be name:scope:token (got an entry with {} part(s))",
+            entry.split(':').count()
+        );
+    };
+    let name = name.trim();
+    if !valid_client_name(name) {
+        bail!("MCP_CLIENT_KEYS client name `{name}`: use 1-64 of [A-Za-z0-9-_.]");
+    }
+    let scope = match scope.trim().to_ascii_lowercase().as_str() {
+        "read" => Scope::Read,
+        "write" => Scope::Write,
+        other => {
+            bail!("MCP_CLIENT_KEYS client `{name}`: scope must be read or write, got `{other}`")
+        }
+    };
+    Ok(ClientKey {
+        name: name.to_string(),
+        scope,
+        token: token.trim().to_string(),
+    })
+}
+
+fn valid_client_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// Each client needs its own name and its own key.
+fn check_unique_clients(clients: &[ClientKey]) -> Result<()> {
     for (i, a) in clients.iter().enumerate() {
         for b in &clients[i + 1..] {
             if a.name == b.name {
@@ -210,7 +250,7 @@ fn load_clients(keys: Option<&str>, legacy: Option<&str>) -> Result<Vec<ClientKe
             }
         }
     }
-    Ok(clients)
+    Ok(())
 }
 
 fn env_or(k: &str, d: &str) -> String {
@@ -432,7 +472,13 @@ async fn main() -> Result<()> {
         http,
         sessions: Arc::new(Mutex::new(Sessions::new(cfg.session_ttl, cfg.max_sessions))),
         rate_limit: Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit_rpm))),
+        oauth: Arc::new(Mutex::new(oauth::OAuthStore::load(
+            cfg.oauth.store_path.as_ref(),
+        ))),
     };
+    if cfg.oauth.enabled && cfg.oauth.public_url.is_none() {
+        tracing::warn!("MCP_OAUTH is on but MCP_PUBLIC_URL is unset: OAuth URLs are derived from request headers; set it to the public https URL for Claude.ai / ChatGPT connectors");
+    }
 
     let app = router(state);
     let addr: SocketAddr = cfg.bind_addr.parse()?;
@@ -455,6 +501,33 @@ fn router(state: AppState) -> Router {
             get(|| async { Json(json!({"ok":true,"service":"mcp-cdc"})) }),
         )
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
+        // OAuth bridge (ADR 0017). Both metadata paths: clients probe the root and the /mcp suffix.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(oauth::authorization_server),
+        )
+        .route(
+            "/.well-known/openid-configuration",
+            get(oauth::authorization_server),
+        )
+        .route("/oauth/register", post(oauth::register))
+        .route(
+            "/oauth/authorize",
+            get(oauth::authorize_get).post(oauth::authorize_post),
+        )
+        .route("/oauth/token", post(oauth::token))
         .with_state(state)
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
@@ -512,6 +585,12 @@ fn authenticate(headers: &HeaderMap, clients: &[ClientKey]) -> Option<ClientCtx>
     found
 }
 
+/// A configured key, or an OAuth access token issued against one (ADR 0017).
+fn authenticate_any(state: &AppState, headers: &HeaderMap) -> Option<ClientCtx> {
+    authenticate(headers, &state.cfg.clients)
+        .or_else(|| oauth::authenticate_token(state, bearer(headers)?))
+}
+
 fn session_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("mcp-session-id").and_then(|v| v.to_str().ok())
 }
@@ -529,7 +608,7 @@ async fn mcp_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let client = authenticate(&headers, &state.cfg.clients).ok_or(ApiError::Unauthorized)?;
+    let client = authenticate_any(&state, &headers).ok_or(ApiError::Unauthorized)?;
     let Some(sid) = session_header(&headers) else {
         return Ok(StatusCode::BAD_REQUEST);
     };
@@ -546,7 +625,9 @@ async fn mcp_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let client = authenticate(&headers, &state.cfg.clients).ok_or(ApiError::Unauthorized)?;
+    let Some(client) = authenticate_any(&state, &headers) else {
+        return Ok(oauth::unauthorized(&state, &headers));
+    };
     if state.cfg.rate_limit_enabled {
         // Keyed by client, not IP: behind a proxy every caller shares one address.
         if let Err(retry) = state.rate_limit.lock().unwrap().check(&client.name) {
@@ -625,8 +706,13 @@ async fn handle_rpc(
                 "capabilities": {"tools":{"listChanged":false},"prompts":{"listChanged":false}},
                 "instructions": format!(
                     "Operate Hyper CDC without the web UI. Start with cdc_help or cdc_overview. \
+                     Pipelines can be named instead of using ids. \
                      Pipelines: cdc_source_validate / cdc_target_validate, then cdc_pipeline_create. \
+                     Health and speed: cdc_latency, cdc_pipeline_latency, cdc_audit_events (outcome=failure), cdc_pipeline_logs. \
+                     Alerts: cdc_notification_channels_list, cdc_notification_rules_list, cdc_notification_deliveries. \
                      Copy & Sync: cdc_copy_test_connection, cdc_pg_copy_create (saves only), cdc_copy_run (starts; only when asked). \
+                     Anything else: cdc_api_catalog to find the operation, then cdc_api_get (read) or cdc_api_call (write). \
+                     Confirm destructive actions (delete, stop, resync, clear) with the user first. \
                      Write tools for this client: {}.",
                     if writes { "enabled" } else { "disabled" }
                 ),
@@ -845,6 +931,13 @@ mod tests {
             rate_limit_rpm: 60,
             session_ttl: Duration::from_secs(60),
             max_sessions: 3,
+            oauth: oauth::OAuthConfig {
+                enabled: true,
+                public_url: Some("https://mcp.example.com".into()),
+                store_path: None,
+                access_ttl: Duration::from_secs(3600),
+                refresh_ttl: Duration::from_secs(86400),
+            },
         });
         AppState {
             cfg: cfg.clone(),
@@ -854,6 +947,7 @@ mod tests {
                 .unwrap(),
             sessions: Arc::new(Mutex::new(Sessions::new(cfg.session_ttl, cfg.max_sessions))),
             rate_limit: Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit_rpm))),
+            oauth: Arc::new(Mutex::new(oauth::OAuthStore::default())),
         }
     }
 
@@ -952,10 +1046,16 @@ mod tests {
 
     #[test]
     fn every_tool_is_dispatched() {
-        let src = [include_str!("tools.rs"), include_str!("copy_tools.rs")].concat();
+        let src = [
+            include_str!("tools.rs"),
+            include_str!("copy_tools.rs"),
+            include_str!("ops_tools.rs"),
+        ]
+        .concat();
         for d in tools::definitions() {
             assert!(
-                src.contains(&format!("\"{}\" =>", d.name)),
+                src.contains(&format!("\"{}\" =>", d.name))
+                    || src.contains(&format!("\"{}\" |", d.name)),
                 "tool {} is advertised but has no match arm in tools::call",
                 d.name
             );

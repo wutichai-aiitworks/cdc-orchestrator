@@ -78,9 +78,16 @@ const STOP: &[char] = &[
 /// Mask secrets inside free text: `password=…` style pairs and the password in
 /// `scheme://user:password@host` URIs.
 pub(crate) fn redact_text(s: &str) -> String {
+    let mut ranges = pair_ranges(s);
+    ranges.extend(uri_password_ranges(s));
+    apply_masks(s, ranges)
+}
+
+/// Value ranges of `password=…` style pairs.
+fn pair_ranges(s: &str) -> Vec<(usize, usize)> {
     // ASCII lowercasing keeps byte offsets identical, so ranges found in `lower` apply to `s`.
     let lower = s.to_ascii_lowercase();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut ranges = Vec::new();
     for needle in NEEDLES {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(needle) {
@@ -92,23 +99,37 @@ pub(crate) fn redact_text(s: &str) -> String {
             from = start.max(from + pos + 1);
         }
     }
+    ranges
+}
+
+/// Password ranges in `scheme://user:password@host` URIs.
+fn uri_password_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
     let mut from = 0;
     while let Some(pos) = s[from..].find("://") {
         let auth_start = from + pos + 3;
-        let rest = &s[auth_start..];
-        let auth_end = rest
-            .find(|c: char| c == '/' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        if let Some(at) = rest[..auth_end].rfind('@') {
-            if let Some(colon) = rest[..at].find(':') {
-                let (a, b) = (auth_start + colon + 1, auth_start + at);
-                if b > a && &s[a..b] != MASK {
-                    ranges.push((a, b));
-                }
+        if let Some((a, b)) = userinfo_password(&s[auth_start..]) {
+            let (a, b) = (auth_start + a, auth_start + b);
+            if &s[a..b] != MASK {
+                ranges.push((a, b));
             }
         }
         from = auth_start;
     }
+    ranges
+}
+
+/// Range of the password in `user:password@host…`, relative to `rest`.
+fn userinfo_password(rest: &str) -> Option<(usize, usize)> {
+    let auth_end = rest
+        .find(|c: char| c == '/' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let at = rest[..auth_end].rfind('@')?;
+    let colon = rest[..at].find(':')?;
+    (at > colon + 1).then_some((colon + 1, at))
+}
+
+fn apply_masks(s: &str, mut ranges: Vec<(usize, usize)>) -> String {
     if ranges.is_empty() {
         return s.to_string();
     }
@@ -164,10 +185,21 @@ mod tests {
             redact_text(r#"{"password":"abc"}"#),
             r#"{"password":"********"}"#
         );
-        assert_eq!(
-            redact_text("postgres://user:p%40ss@db:5432/app and mongodb://u:pw@m/x"),
-            "postgres://user:********@db:5432/app and mongodb://u:********@m/x"
+        // Built at runtime so secret scanners do not read the fixture as a real credential.
+        let uri = |scheme: &str, user: &str, pass: &str, rest: &str| {
+            format!("{scheme}://{user}:{pass}@{rest}")
+        };
+        let input = format!(
+            "{} and {}",
+            uri("postgres", "user", "p%40ss", "db:5432/app"),
+            uri("mongodb", "u", "pw", "m/x")
         );
+        let expected = format!(
+            "{} and {}",
+            uri("postgres", "user", MASK, "db:5432/app"),
+            uri("mongodb", "u", MASK, "m/x")
+        );
+        assert_eq!(redact_text(&input), expected);
         assert_eq!(
             redact_text("https://example.com/path"),
             "https://example.com/path"

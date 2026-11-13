@@ -353,74 +353,10 @@ pub async fn route_payload(state: &AppState, body: &mut Value) -> Result<Vec<Str
         let Some(conn) = body.get_mut(key) else {
             continue;
         };
-        let Some(tid) = conn
-            .get("tunnel_id")
-            .and_then(Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())
-        else {
-            if let Some(o) = conn.as_object_mut() {
-                o.remove("tunnel_id");
-            }
-            continue;
-        };
-        // A cluster hands out node addresses the tunnel forward cannot follow.
-        let side = if key == "target" { "target" } else { "source" };
-        if opts.get(format!("{side}_cluster")).and_then(Value::as_bool) == Some(true) {
-            return Err(AppError::BadRequest(format!(
-                "the {side} is a Redis Cluster: cluster redirects cannot follow a WireGuard forward; use a single server or a proxy at the site"
-            )));
+        if let Some((name, is_ssh)) = route_conn(state, key, conn, &opts).await? {
+            rsync_tunnel |= is_ssh;
+            used.push(name);
         }
-        let tunnel = state.wireguard_tunnels.get(tid).await?.ok_or_else(|| {
-            AppError::BadRequest(format!("WireGuard tunnel {tid} not found (deleted?)"))
-        })?;
-        let host = conn
-            .get("host")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if host.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "{key}: a host is required to use a WireGuard tunnel"
-            )));
-        }
-        // File sync endpoints are SSH hosts (they carry a `path`); databases carry a `type`.
-        let is_ssh = conn.get("path").is_some();
-        let daemon = conn
-            .get("protocol")
-            .and_then(Value::as_str)
-            .is_some_and(|p| p.eq_ignore_ascii_case("daemon"));
-        let kind = if is_ssh && daemon {
-            "rsync".to_string()
-        } else if is_ssh {
-            "ssh".to_string()
-        } else {
-            conn.get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        rsync_tunnel |= is_ssh;
-        let port = match conn.get("port") {
-            Some(Value::String(s)) if !s.trim().is_empty() => s.trim().parse::<u16>().ok(),
-            Some(Value::Number(n)) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
-            _ => None,
-        }
-        .unwrap_or_else(|| default_port(&kind));
-        let fwd = ensure_forward(state, &tunnel, &host, port).await?;
-        let o = conn.as_object_mut().expect("connection object");
-        o.insert("host".into(), json!(fwd.0));
-        o.insert(
-            "port".into(),
-            if matches!(o.get("port"), Some(Value::Number(_))) {
-                json!(fwd.1)
-            } else {
-                json!(fwd.1.to_string())
-            },
-        );
-        o.remove("tunnel_id");
-        o.insert("via_tunnel".into(), json!(tunnel.name));
-        used.push(tunnel.name.clone());
     }
     if rsync_tunnel {
         if let Some(o) = body.get_mut("options").and_then(Value::as_object_mut) {
@@ -428,6 +364,85 @@ pub async fn route_payload(state: &AppState, body: &mut Value) -> Result<Vec<Str
         }
     }
     Ok(used)
+}
+
+/// Routes one connection object through its tunnel. Returns the tunnel name and whether the
+/// endpoint is an SSH/rsync host, or `None` when the object has no (valid) `tunnel_id`.
+async fn route_conn(
+    state: &AppState,
+    key: &str,
+    conn: &mut Value,
+    opts: &Value,
+) -> Result<Option<(String, bool)>, AppError> {
+    let tid = conn
+        .get("tunnel_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let Some(tid) = tid else {
+        if let Some(o) = conn.as_object_mut() {
+            o.remove("tunnel_id");
+        }
+        return Ok(None);
+    };
+    // A cluster hands out node addresses the tunnel forward cannot follow.
+    let side = if key == "target" { "target" } else { "source" };
+    if opts.get(format!("{side}_cluster")).and_then(Value::as_bool) == Some(true) {
+        return Err(AppError::BadRequest(format!(
+            "the {side} is a Redis Cluster: cluster redirects cannot follow a WireGuard forward; use a single server or a proxy at the site"
+        )));
+    }
+    let tunnel = state.wireguard_tunnels.get(tid).await?.ok_or_else(|| {
+        AppError::BadRequest(format!("WireGuard tunnel {tid} not found (deleted?)"))
+    })?;
+    let host = conn
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if host.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "{key}: a host is required to use a WireGuard tunnel"
+        )));
+    }
+    let (kind, is_ssh) = endpoint_kind(conn);
+    let port = conn_port(conn).unwrap_or_else(|| default_port(&kind));
+    let fwd = ensure_forward(state, &tunnel, &host, port).await?;
+    let o = conn.as_object_mut().expect("connection object");
+    let port_value = if matches!(o.get("port"), Some(Value::Number(_))) {
+        json!(fwd.1)
+    } else {
+        json!(fwd.1.to_string())
+    };
+    o.insert("host".into(), json!(fwd.0));
+    o.insert("port".into(), port_value);
+    o.remove("tunnel_id");
+    o.insert("via_tunnel".into(), json!(tunnel.name));
+    Ok(Some((tunnel.name, is_ssh)))
+}
+
+/// Endpoint kind for the default port, and whether it is a file sync SSH host.
+/// File sync endpoints are SSH hosts (they carry a `path`); databases carry a `type`.
+fn endpoint_kind(conn: &Value) -> (String, bool) {
+    if conn.get("path").is_none() {
+        let kind = conn.get("type").and_then(Value::as_str).unwrap_or("");
+        return (kind.to_string(), false);
+    }
+    let daemon = conn
+        .get("protocol")
+        .and_then(Value::as_str)
+        .is_some_and(|p| p.eq_ignore_ascii_case("daemon"));
+    let kind = if daemon { "rsync" } else { "ssh" };
+    (kind.to_string(), true)
+}
+
+/// Explicit `port`, as a number or a numeric string.
+fn conn_port(conn: &Value) -> Option<u16> {
+    match conn.get("port") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().parse::<u16>().ok(),
+        Some(Value::Number(n)) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+        _ => None,
+    }
 }
 
 async fn ensure_forward(

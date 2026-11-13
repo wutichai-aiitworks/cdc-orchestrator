@@ -50,6 +50,7 @@ pub async fn emit(state: &AppState, event: AuditEvent) -> String {
         timestamp = %event.timestamp,
         "audit_event"
     );
+    crate::notify::on_audit(state, &event);
     if let Some(client) = state.audit_redis.as_ref() {
         if let Err(e) = persist_redis(state, client, &event).await {
             tracing::warn!(error = %e, action = %event.action, "audit redis persist failed");

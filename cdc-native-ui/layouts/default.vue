@@ -107,15 +107,17 @@ const navGroups: NavGroup[] = [
       { label: "Alerts", to: "/alerts", icon: Bell },
     ],
   },
-  {
-    label: "Developer",
-    items: [{ label: "API Reference", to: "/api-docs", icon: FileText }],
-  },
+
 ]
+/** Pinned under the scrolling menu, above Collapse (same placement as supertokens-webui). */
+const footerNav: Array<NavItem & { to: string }> = [{ label: "API Reference", to: "/api-docs", icon: FileText }]
 /** Every page link, children included (page title lookup). */
-const nav = navGroups
-  .flatMap((group) => group.items.flatMap((item) => item.children ?? [item]))
-  .filter((item): item is NavItem & { to: string } => !!item.to)
+const nav = [
+  ...navGroups
+    .flatMap((group) => group.items.flatMap((item) => item.children ?? [item]))
+    .filter((item): item is NavItem & { to: string } => !!item.to),
+  ...footerNav,
+]
 // Items tied to a feature switch (e.g. ORCH_KSQL_ENABLED, off by default) appear only once the
 // orchestrator reports the feature on — hidden while loading or when the capability call fails.
 const featureOn = (item: NavItem) => !item.feature || capability.value?.features?.[item.feature] === true
@@ -375,6 +377,26 @@ onUnmounted(() => {
       >
         <span class="truncate text-center text-xs text-muted-foreground">{{ appVersion }}</span>
       </div>
+      <div class="flex-shrink-0 space-y-1 border-t border-sidebar-border px-2 py-2">
+        <NuxtLink
+          v-for="item in footerNav"
+          :key="item.to"
+          :to="item.to"
+          :title="item.label"
+          @click="onNavClick(item.to)"
+          :class="[
+            'flex h-10 items-center overflow-hidden rounded-xl text-sm font-medium transition-colors duration-150',
+            isActive(item.to)
+              ? 'bg-brand-500/15 text-primary'
+              : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+          ]"
+        >
+          <span class="flex h-10 w-12 flex-shrink-0 items-center justify-center">
+            <component :is="item.icon" class="h-5 w-5" :stroke-width="1.75" />
+          </span>
+          <span :class="sidebarLabelClass">{{ item.label }}</span>
+        </NuxtLink>
+      </div>
       <div class="flex-shrink-0 border-t border-sidebar-border px-2 py-4">
         <button
           type="button"
@@ -412,7 +434,7 @@ onUnmounted(() => {
               <X class="h-4 w-4" :stroke-width="1.75" />
             </button>
           </div>
-          <nav class="flex-1 overflow-y-auto px-3 py-4">
+          <nav class="min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <div v-for="(group, groupIndex) in visibleNavGroups" :key="group.label" :class="groupIndex ? 'mt-4' : ''">
               <button
                 v-if="group.collapsible"
@@ -480,6 +502,23 @@ onUnmounted(() => {
               </template>
             </div>
           </nav>
+          <div class="flex-shrink-0 space-y-1 border-t border-sidebar-border px-3 py-3">
+            <NuxtLink
+              v-for="item in footerNav"
+              :key="item.to"
+              :to="item.to"
+              @click="onNavClick(item.to)"
+              :class="[
+                'flex h-10 items-center gap-3 rounded-xl px-3 text-sm font-medium transition-colors',
+                isActive(item.to)
+                  ? 'bg-brand-500/15 text-primary'
+                  : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+              ]"
+            >
+              <component :is="item.icon" class="h-5 w-5" :stroke-width="1.75" />
+              {{ item.label }}
+            </NuxtLink>
+          </div>
         </aside>
       </div>
     </Transition>

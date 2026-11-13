@@ -219,6 +219,8 @@ Full fork workflow: [compendium Ch.14](docs/architecture/hyper-cdc-orchestrator-
 # Maintenance / Enhanced show an amber / violet corner ribbon — set ORCH_REQUIRE_* explicitly there.
 APP_MODE=Production
 ORCH_API_TOKEN=<random ≥24 chars>
+# Encrypts notification channel secrets; keep stable and back up (ADR 0015)
+ORCH_SECRET_KEY=<openssl rand -base64 32>
 ORCH_RQLITE_URL=http://cdc-rqlite:4001
 ORCH_JDBC_ADMIN_URL=http://cdc-jdbc-admin:8084
 HYPER_CDC_ORCHESTRATOR_BIND=127.0.0.1

@@ -481,6 +481,9 @@ pub struct PaginationQuery {
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     pub state: Option<String>,
+    /// `GET /topics` only: names and internal flag from `rpk topic list`, skipping the
+    /// per-topic describe and storage calls (for counts, e.g. the Overview page).
+    pub summary: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,6 +600,51 @@ pub enum CaptureMode {
     Incremental,
 }
 
+/// Where a log-based (`capture_mode=logical`) source starts reading on its first Start.
+///
+/// One-shot: used only while the source connector has no stored offset (first Start)
+/// or through an explicit reposition. Once streaming, the stored offset wins so a
+/// restart never rewinds. See ADR 0014.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum StartPosition {
+    /// Copy every row, then stream (Debezium `snapshot.mode=initial`). Default.
+    #[default]
+    SnapshotThenStream,
+    /// No row copy; stream changes from now (`snapshot.mode=no_data`).
+    Latest,
+    /// No row copy; stream from the oldest change log still retained on the source.
+    EarliestRetained,
+    /// No row copy; stream from an operator-supplied log position.
+    Custom { position: LogPosition },
+}
+
+impl StartPosition {
+    /// Positions that seed the connector offset before it first runs.
+    pub fn is_seeded(&self) -> bool {
+        matches!(self, Self::EarliestRetained | Self::Custom { .. })
+    }
+}
+
+/// A source change-log position, per database dialect.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LogPosition {
+    /// PostgreSQL WAL LSN, `X/Y` hex (as `pg_current_wal_lsn()` prints it) or decimal.
+    PostgresLsn { lsn: String },
+    /// MySQL/MariaDB binlog coordinates; `gtid_set` resumes by GTID when GTID mode is on.
+    MysqlBinlog {
+        file: String,
+        pos: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gtid_set: Option<String>,
+    },
+    /// SQL Server CDC LSN, `0000002a:00000c10:0003` or `0x0000002A00000C100003`.
+    SqlServerLsn { commit_lsn: String },
+    /// Oracle system change number.
+    OracleScn { scn: String },
+}
+
 /// How an incremental (`capture_mode=incremental`) pipeline polls one table.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -702,6 +750,9 @@ pub struct SourceConfig {
     /// copy). Tables not listed use the watermark columns above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub table_poll: Vec<TablePollRule>,
+    /// Log-based capture: where the source starts on its first Start (ADR 0014).
+    #[serde(default)]
+    pub start_position: StartPosition,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1181,6 +1232,27 @@ pub struct CdcProfile {
     /// Kafka Connect JDBC or lake sink connector name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_connector_name: Option<String>,
+    /// Exact end-to-end latency via a heartbeat row written on the source (ADR 0016).
+    #[serde(default)]
+    pub latency_probe: LatencyProbe,
+}
+
+/// Opt-in heartbeat probe (ADR 0016). Needs CREATE/INSERT on the source and read on the target.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct LatencyProbe {
+    pub enabled: bool,
+    /// Seconds between heartbeat writes (5–300).
+    pub interval_secs: u32,
+}
+
+impl Default for LatencyProbe {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 10,
+        }
+    }
 }
 
 /// Upper bound on tags per pipeline.
@@ -1332,6 +1404,7 @@ mod tests {
             incrementing_column: None,
             upsert_key_columns: vec![],
             table_poll: vec![],
+            start_position: Default::default(),
         };
         assert_eq!(
             source.capture_identity(),
@@ -1473,6 +1546,9 @@ pub struct CapabilityFeatures {
     pub kafka: bool,
     pub logs: bool,
     pub notifications: bool,
+    /// `ORCH_SECRET_KEY` is set, so channel secrets can be stored (ADR 0015).
+    #[serde(default)]
+    pub notification_secrets: bool,
     pub alerts_ws: bool,
     pub metrics: bool,
     pub persistence: bool,
@@ -1495,13 +1571,24 @@ pub struct CapabilityFeatures {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AlertRule {
+    /// Generated on create when empty or omitted.
+    #[serde(default)]
     pub id: String,
     pub name: String,
     pub condition_type: String,
     #[serde(default)]
     pub condition_value: Option<Value>,
     pub connector_filter: String,
+    /// Pre-ADR-0015 channel kinds (`["webhook"]`); ignored once `channel_ids` is set.
+    #[serde(default)]
     pub channels: Vec<String>,
+    /// Notification channels (`cdc_config` kind `channel`) this rule sends to.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// Suppress repeats for the same rule, condition and subject for this long (0 = never).
+    #[serde(default)]
+    pub cooldown_minutes: u32,
+    /// Legacy inline webhook; moved to a channel by the startup migration.
     #[serde(default)]
     pub webhook_url: Option<String>,
     #[serde(default)]
@@ -1541,17 +1628,6 @@ pub struct HistoryEntry {
     pub payload: CdcAlertPayload,
     #[serde(default)]
     pub resolved: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookBody {
-    pub event: String,
-    pub connector: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    pub to: String,
-    pub ts: DateTime<Utc>,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

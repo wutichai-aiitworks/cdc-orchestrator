@@ -72,7 +72,8 @@ clients (other teams' agents, other MCP hosts) exposed gaps:
 
 - **OAuth 2.1 authorization server (MCP auth spec).** Right for public multi-tenant servers; heavy
   for an internal control plane whose clients are a handful of agents. Revisit when a client must
-  authenticate as an end user rather than as a service.
+  authenticate as an end user rather than as a service. **Revisited in ADR 0017:** claude.ai and
+  ChatGPT connectors need OAuth; a thin bridge issues tokens against these same client keys.
 - **Hashed keys in env.** Same process holds both; it would protect only against env dumps, which
   already expose `CDC_ORCHESTRATOR_TOKEN`.
 - **Per-tool scopes.** Read/write covers the current clients; tool-level ACLs can extend the scope

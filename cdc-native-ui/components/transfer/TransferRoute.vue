@@ -3,7 +3,7 @@
 // every tool. Flat, like the rest of the app: solid brass fills and 1px borders, no shadows or
 // glows. The track fills up to the step a run reached. Motion (live flow, current-step ring) only
 // while a run is live, and never under reduced motion.
-import { AlertTriangle, Check, X } from "@lucide/vue"
+import { AlertTriangle, ArrowRight, Check, X } from "@lucide/vue"
 import type { RouteEnd } from "~/utils/transferTools/types"
 import type { RouteStep } from "~/utils/transferView"
 
@@ -30,14 +30,23 @@ const progress = computed(() => {
   return ((reached.value + 0.5) / n) * 100
 })
 const failed = computed(() => props.steps.some((s) => s.state === "failed"))
+const doneCount = computed(() => props.steps.filter((s) => s.state === "done").length)
+/** One-line status above the track in the stacked layouts: "2 of 3 done", "Running: Data", "Stopped at Data". */
+const headline = computed(() => {
+  const stop = props.steps.find((s) => s.state === "failed")
+  if (stop) return `Stopped at ${stop.label}`
+  const now = props.steps.find((s) => s.state === "now")
+  if (now) return `${now.label} · step ${props.steps.indexOf(now) + 1} of ${props.steps.length}`
+  return `${doneCount.value} of ${props.steps.length} done`
+})
 const STATE_TEXT = { pending: "not started", now: "in progress", done: "done", failed: "failed" } as const
 </script>
 
 <template>
   <section class="route-card relative overflow-hidden rounded-xl border border-border bg-card" :class="live ? 'is-live' : ''" aria-label="Route">
-    <div class="grid items-center gap-6 px-5 py-6 md:grid-cols-[minmax(0,16rem)_minmax(0,1fr)_minmax(0,16rem)] md:gap-4 md:px-7 md:py-7">
+    <div class="route-grid grid items-center">
       <!-- Source -->
-      <div class="flex min-w-0 items-center gap-4">
+      <div class="route-source flex min-w-0 items-center gap-4">
         <span class="route-medallion"><TransferEngineMark :engine="source.engine" size="lg" /></span>
         <div class="min-w-0">
           <div class="route-role">{{ source.role }}</div>
@@ -49,31 +58,44 @@ const STATE_TEXT = { pending: "not started", now: "in progress", done: "done", f
         </div>
       </div>
 
+      <!-- Source → target connector (stacked layouts only) -->
+      <div class="route-arrow" aria-hidden="true">
+        <span class="route-arrow-line" />
+        <span class="route-arrow-head"><ArrowRight class="h-3.5 w-3.5" :stroke-width="2" /></span>
+        <span class="route-arrow-line" />
+      </div>
+
       <!-- Steps on a track -->
-      <div class="relative py-1">
-        <div class="route-track absolute left-0 right-0 top-[1.125rem] h-[2px] rounded-full" aria-hidden="true">
-          <div class="route-progress h-full rounded-full" :class="failed ? 'is-failed' : ''" :style="{ width: `${progress}%` }" />
-          <div v-if="live" class="route-flow absolute inset-0 rounded-full" />
+      <div class="route-steps">
+        <div class="route-steps-head">
+          <span class="route-role">Progress</span>
+          <span class="truncate text-xs tabular-nums text-muted-foreground">{{ headline }}</span>
         </div>
-        <ol class="relative flex justify-around gap-2">
-          <li v-for="(s, i) in steps" :key="s.key" class="flex min-w-0 flex-1 flex-col items-center text-center">
-            <span class="route-node" :class="`is-${s.state}`">
-              <Check v-if="s.state === 'done'" class="h-4 w-4" :stroke-width="2.5" />
-              <X v-else-if="s.state === 'failed'" class="h-4 w-4" :stroke-width="2.5" />
-              <template v-else>{{ i + 1 }}</template>
-            </span>
-            <span class="mt-3 text-sm font-medium tracking-tight" :class="s.state === 'pending' ? 'text-muted-foreground' : 'text-foreground'">{{ s.label }}</span>
-            <span class="mt-0.5 max-w-[11rem] truncate text-[11px] tabular-nums text-muted-foreground" :title="s.detail">{{ s.detail }}</span>
-            <span class="sr-only">{{ STATE_TEXT[s.state] }}</span>
-          </li>
-        </ol>
+        <div class="relative py-1">
+          <div class="route-track absolute left-0 right-0 top-[1.125rem] h-[2px] rounded-full" aria-hidden="true">
+            <div class="route-progress h-full rounded-full" :class="failed ? 'is-failed' : ''" :style="{ width: `${progress}%` }" />
+            <div v-if="live" class="route-flow absolute inset-0 rounded-full" />
+          </div>
+          <ol class="relative flex justify-around gap-2">
+            <li v-for="(s, i) in steps" :key="s.key" class="flex min-w-0 flex-1 flex-col items-center text-center">
+              <span class="route-node" :class="`is-${s.state}`">
+                <Check v-if="s.state === 'done'" class="h-4 w-4" :stroke-width="2.5" />
+                <X v-else-if="s.state === 'failed'" class="h-4 w-4" :stroke-width="2.5" />
+                <template v-else>{{ i + 1 }}</template>
+              </span>
+              <span class="mt-3 max-w-full truncate text-sm font-medium tracking-tight" :class="s.state === 'pending' ? 'text-muted-foreground' : 'text-foreground'" :title="s.label">{{ s.label }}</span>
+              <span class="mt-0.5 max-w-full truncate text-[11px] tabular-nums text-muted-foreground" :title="s.detail">{{ s.detail }}</span>
+              <span class="sr-only">{{ STATE_TEXT[s.state] }}</span>
+            </li>
+          </ol>
+        </div>
       </div>
 
       <!-- Destination(s) -->
-      <div class="flex min-w-0 flex-col gap-4">
-        <div v-for="(d, i) in destinations" :key="i" class="flex min-w-0 items-center gap-4 md:justify-end md:text-right">
-          <span class="route-medallion md:order-2"><TransferEngineMark :engine="d.engine" size="lg" /></span>
-          <div class="min-w-0 md:order-1">
+      <div class="route-dests flex min-w-0 flex-col gap-4">
+        <div v-for="(d, i) in destinations" :key="i" class="route-dest flex min-w-0 items-center gap-4">
+          <span class="route-medallion route-dest-mark"><TransferEngineMark :engine="d.engine" size="lg" /></span>
+          <div class="route-dest-text min-w-0">
             <div class="route-role">{{ d.role }}</div>
             <div class="mt-1 truncate text-base font-semibold tracking-tight text-foreground" :title="d.title">{{ d.title || "Not set" }}</div>
             <div class="mt-0.5 truncate text-xs text-muted-foreground" :class="d.mono ? 'font-mono' : ''" :title="d.detail">{{ d.detail }}</div>
@@ -93,6 +115,116 @@ const STATE_TEXT = { pending: "not started", now: "in progress", done: "done", f
   --brass: var(--primary);
   --brass-deep: color-mix(in oklab, var(--primary) 78%, black);
   --brass-line: color-mix(in oklab, var(--primary) 40%, var(--border));
+  container-type: inline-size;
+}
+
+/* Layout follows the card's own width, not the viewport: on tool pages the sidebar and the
+   saved-profiles rail take most of a laptop screen.
+     narrow  (< 34rem): source, target, then the steps band — one column
+     medium  (34–58rem): source → target on one row, the steps band underneath
+     wide    (≥ 58rem): source | steps | target on one line, no band */
+.route-grid {
+  --pad: 1.25rem;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "source" "dest" "steps";
+  gap: 1rem;
+  padding: var(--pad) var(--pad) 0;
+}
+.route-source {
+  grid-area: source;
+}
+.route-dests {
+  grid-area: dest;
+}
+.route-arrow {
+  grid-area: arrow;
+  display: none;
+}
+.route-steps {
+  grid-area: steps;
+  /* Full-bleed band at the bottom of the card. */
+  margin: 0.25rem calc(var(--pad) * -1) 0;
+  padding: 0.875rem var(--pad) 1.125rem;
+  border-top: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 45%, var(--card));
+}
+.route-steps-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.875rem;
+}
+/* The node outline cuts the track; it must match the band behind it. */
+.route-steps .route-node {
+  outline-color: color-mix(in oklab, var(--muted) 45%, var(--card));
+}
+
+@container (min-width: 34rem) {
+  .route-grid {
+    --pad: 1.5rem;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    grid-template-areas: "source arrow dest" "steps steps steps";
+    column-gap: 1.25rem;
+  }
+  .route-arrow {
+    display: flex;
+    align-items: center;
+    width: clamp(3rem, 12cqi, 8rem);
+  }
+  .route-dest {
+    justify-content: flex-end;
+    text-align: right;
+  }
+  .route-dest-mark {
+    order: 2;
+  }
+  .route-dest-text {
+    order: 1;
+  }
+}
+
+@container (min-width: 58rem) {
+  .route-grid {
+    --pad: 1.75rem;
+    grid-template-columns: minmax(0, 16rem) minmax(0, 1fr) minmax(0, 16rem);
+    grid-template-areas: "source steps dest";
+    padding: var(--pad);
+  }
+  .route-arrow,
+  .route-steps-head {
+    display: none;
+  }
+  .route-steps {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+  }
+  .route-steps .route-node {
+    outline-color: var(--card);
+  }
+}
+
+/* Source → target connector: hairline, brass arrow in a small tile. */
+.route-arrow-line {
+  flex: 1;
+  height: 1px;
+  background: var(--brass-line);
+}
+.route-arrow-head {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 9999px;
+  border: 1px solid var(--brass-line);
+  color: var(--brass-deep);
+  background: var(--card);
+}
+:global(.dark) .route-arrow-head {
+  color: color-mix(in oklab, var(--brass) 85%, white);
 }
 
 /* Small-caps role label: SOURCE / TARGET / SFTP… */

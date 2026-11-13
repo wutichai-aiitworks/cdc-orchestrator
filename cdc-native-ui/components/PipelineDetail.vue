@@ -21,6 +21,7 @@ import {
   Square,
   Table2,
   Split,
+  Timer,
   Trash2,
   Unplug,
 } from "@lucide/vue"
@@ -101,7 +102,7 @@ watch(
   },
 )
 
-type TabKey = "tables" | "diff" | "activity" | "logs" | "configuration"
+type TabKey = "tables" | "diff" | "latency" | "activity" | "logs" | "configuration"
 
 const isReplica = computed(() => props.profile.pattern === "source_to_target")
 type TabDef = { key: TabKey; label: string; icon: Component }
@@ -112,6 +113,7 @@ const tabs = computed<TabDef[]>(() => [
         { key: "diff" as const, label: "Verify Record", icon: GitCompareArrows },
       ]
     : []),
+  ...(props.profile.pattern !== "source_to_stream" ? [{ key: "latency" as const, label: "Latency", icon: Timer }] : []),
   { key: "activity", label: "Activity", icon: Activity },
   { key: "logs", label: "Logs", icon: ScrollText },
   { key: "configuration", label: "Configuration", icon: Settings2 },
@@ -469,6 +471,13 @@ const configRows = computed(() => [
           v-else-if="tab === 'activity'"
           :key="`${profile.id}-activity`"
           :profile="profile"
+        />
+
+        <PipelineLatencyPanel
+          v-else-if="tab === 'latency'"
+          :key="`${profile.id}-latency`"
+          :profile="profile"
+          @restart="emit('action', 'restart')"
         />
 
         <PipelineProcessingLog

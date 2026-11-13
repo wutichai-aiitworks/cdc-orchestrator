@@ -39,6 +39,7 @@ pub async fn capability(State(state): State<AppState>) -> Json<CapabilityRespons
             kafka: true,
             logs: true,
             notifications: state.rqlite.is_some(),
+            notification_secrets: state.config.secret_key.is_some(),
             alerts_ws: true,
             metrics: true,
             persistence: state.profiles.persistence_enabled(),
@@ -224,9 +225,76 @@ pub async fn put_logger(
     Ok(Json(v))
 }
 
+/// Rules as the API returns them: a legacy inline webhook secret is never sent back.
+fn redact_rule(mut r: AlertRule) -> AlertRule {
+    if r.webhook_secret.as_deref().is_some_and(|s| !s.is_empty()) {
+        r.webhook_secret = Some(crate::saved_secret::REDACTED.to_string());
+    }
+    r
+}
+
+/// Checks the condition and channel ids, and keeps a stored legacy webhook secret when the
+/// client sends it back redacted or empty (the WebUI used to send `""` and erase it).
+async fn validate_rule(
+    rq: &hyper_cdc_orchestrator::persist::RqliteClient,
+    rule: &mut AlertRule,
+    existing: Option<&AlertRule>,
+) -> Result<(), AppError> {
+    rule.name = rule.name.trim().to_string();
+    if rule.name.is_empty() {
+        return Err(AppError::BadRequest("rule name is required".into()));
+    }
+    let cond = crate::watcher::rules::normalize_condition(&rule.condition_type).to_string();
+    if !crate::watcher::rules::CONDITIONS.contains(&cond.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "unknown condition {:?}; expected one of {}",
+            rule.condition_type,
+            crate::watcher::rules::CONDITIONS.join(", ")
+        )));
+    }
+    rule.condition_type = cond;
+    if rule.connector_filter.trim().is_empty() {
+        rule.connector_filter = "*".into();
+    }
+    globset::Glob::new(rule.connector_filter.trim())
+        .map_err(|e| AppError::BadRequest(format!("filter is not a valid glob: {e}")))?;
+    rule.channel_ids.dedup();
+    if !rule.channel_ids.is_empty() {
+        let known: std::collections::HashSet<String> = rq
+            .list_json::<crate::notify::channel::NotificationChannel>(
+                hyper_cdc_orchestrator::persist::KIND_CHANNEL,
+            )
+            .await?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        if let Some(missing) = rule.channel_ids.iter().find(|id| !known.contains(*id)) {
+            return Err(AppError::BadRequest(format!(
+                "notification channel not found: {missing}"
+            )));
+        }
+    }
+    let incoming = rule.webhook_secret.as_deref().unwrap_or("");
+    if incoming.is_empty() || incoming == crate::saved_secret::REDACTED {
+        rule.webhook_secret = existing.and_then(|e| e.webhook_secret.clone());
+    }
+    if rule.channel_ids.is_empty()
+        && rule
+            .webhook_url
+            .as_deref()
+            .is_none_or(|u| u.trim().is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "choose at least one notification channel".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn list_rules(State(state): State<AppState>) -> Result<Json<Vec<AlertRule>>, AppError> {
     if let Some(rq) = &state.rqlite {
-        return Ok(Json(rq.list_json::<AlertRule>(KIND_RULE).await?));
+        let rules = rq.list_json::<AlertRule>(KIND_RULE).await?;
+        return Ok(Json(rules.into_iter().map(redact_rule).collect()));
     }
     Err(AppError::BadRequest("rqlite is not configured".into()))
 }
@@ -239,7 +307,7 @@ pub async fn get_rule(
         return rq
             .get_json::<AlertRule>(KIND_RULE, &id)
             .await?
-            .map(Json)
+            .map(|r| Json(redact_rule(r)))
             .ok_or_else(|| AppError::NotFound(format!("rule not found: {id}")));
     }
     Err(AppError::BadRequest("rqlite is not configured".into()))
@@ -257,6 +325,7 @@ pub async fn create_rule(
         rule.created_at = Some(Utc::now());
     }
     if let Some(rq) = &state.rqlite {
+        validate_rule(rq, &mut rule, None).await?;
         rq.put_json(KIND_RULE, &rule.id, &rule).await?;
     } else {
         return Err(AppError::BadRequest("rqlite is not configured".into()));
@@ -277,6 +346,8 @@ pub async fn update_rule(
 ) -> Result<Json<Value>, AppError> {
     rule.id = id.clone();
     if let Some(rq) = &state.rqlite {
+        let existing = rq.get_json::<AlertRule>(KIND_RULE, &id).await?;
+        validate_rule(rq, &mut rule, existing.as_ref()).await?;
         rq.put_json(KIND_RULE, &id, &rule).await?;
     } else {
         return Err(AppError::BadRequest("rqlite is not configured".into()));
@@ -574,6 +645,8 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          # TYPE cdc_alert_history_entries gauge\n\
          cdc_alert_history_entries {history_len}\n"
     );
+    drop(snaps);
+    let body = body + &crate::latency::prometheus(&state).await;
     (
         [(
             axum::http::header::CONTENT_TYPE,

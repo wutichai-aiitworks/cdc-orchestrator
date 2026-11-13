@@ -2,18 +2,14 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::audit::{detail_json, emit, new_event};
-use crate::models::{AlertRule, CdcAlertPayload, HistoryEntry, StateTransition, WebhookBody};
+use crate::models::{AlertRule, CdcAlertPayload, HistoryEntry, StateTransition};
+use crate::notify::render::{NotificationEvent, Severity};
 use crate::reconcile::{connector_name_for, sink_connector_name_for};
 use crate::watcher::rules::rules_matching_transition;
 use crate::AppState;
 
 pub async fn handle_transition(state: &AppState, t: &StateTransition, enabled_rules: &[AlertRule]) {
     let matched = rules_matching_transition(enabled_rules, t);
-    let webhook_rules: Vec<&AlertRule> = matched
-        .iter()
-        .copied()
-        .filter(|r| r.channels.iter().any(|c| c == "webhook"))
-        .collect();
 
     let rule_label = if matched.is_empty() {
         None
@@ -32,9 +28,11 @@ pub async fn handle_transition(state: &AppState, t: &StateTransition, enabled_ru
         errors.push(format!("Task {}: {}", te.task_id, te.trace));
     }
 
+    let recovered = crate::watcher::rules::is_recovery(t);
     let event_type = match t.to_state.as_str() {
         "FAILED" => "connector_failed",
         "PAUSED" => "connector_paused",
+        _ if recovered => "connector_recovered",
         _ => "connector_state_changed",
     };
 
@@ -58,21 +56,49 @@ pub async fn handle_transition(state: &AppState, t: &StateTransition, enabled_ru
         let _ = state.alerts_tx.send(json);
     }
 
-    for r in webhook_rules {
-        let Some(ref url) = r.webhook_url else {
-            continue;
+    if !matched.is_empty() {
+        let (severity, title) = match event_type {
+            "connector_failed" => (
+                Severity::Critical,
+                format!("Connector failed: {}", t.connector),
+            ),
+            "connector_paused" => (
+                Severity::Warning,
+                format!("Connector paused: {}", t.connector),
+            ),
+            "connector_recovered" => (
+                Severity::Resolved,
+                format!("Connector recovered: {}", t.connector),
+            ),
+            _ => (
+                Severity::Info,
+                format!(
+                    "Connector {}: {}",
+                    t.to_state.to_ascii_lowercase(),
+                    t.connector
+                ),
+            ),
         };
-        let body = WebhookBody {
-            event: event_type.to_string(),
-            connector: t.connector.clone(),
+        let ev = NotificationEvent {
+            condition: event_type.to_string(),
+            severity,
+            title,
+            summary: format!(
+                "{} → {}",
+                t.from_state.as_deref().unwrap_or("new"),
+                t.to_state
+            ),
+            subject: t.connector.clone(),
+            subject_kind: "connector".into(),
             from: t.from_state.clone(),
             to: t.to_state.clone(),
-            ts: iso,
             errors: errors.clone(),
+            ts: iso,
+            rule: None,
+            link: crate::notify::link(state, "/connectors"),
+            test: false,
         };
-        if let Err(e) = post_webhook(url.as_str(), r.webhook_secret.as_deref(), &body).await {
-            tracing::warn!(rule = %r.id, error = %e, "webhook failed");
-        }
+        crate::notify::fanout(state, &matched, ev).await;
     }
 
     let audit_action = match t.to_state.as_str() {
@@ -106,21 +132,4 @@ pub async fn handle_transition(state: &AppState, t: &StateTransition, enabled_ru
         linked.as_ref().map(|p| p.name.as_str()),
     );
     emit(state, event).await;
-}
-
-async fn post_webhook(url: &str, secret: Option<&str>, body: &WebhookBody) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.post(url).json(body);
-    if let Some(s) = secret {
-        req = req.header("X-Webhook-Secret", s);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("{}", resp.status()))
-    }
 }

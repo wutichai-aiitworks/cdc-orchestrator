@@ -115,6 +115,8 @@ export const useKafkaM1 = () => {
     hide_internal?: boolean
     sort_by?: TopicSortBy
     sort_order?: "asc" | "desc"
+    /** Names only — skips per-topic describe/storage (fast counts). */
+    summary?: boolean
   }) => $fetch<PagedTopics>("/api/cdc/topics", { query: params })
 
   const createTopic = (body: CreateTopicPayload) =>

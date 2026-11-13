@@ -45,6 +45,7 @@ Environment knobs (see `tests/api/helpers.ts`):
 | Profiles: validate, catalog, inspect, trigger preview, CRUD, masking, enable, sub-resources, audit, input validation | `profiles.spec.ts` | |
 | Real replication (sync_once) | `profiles.spec.ts` (E2E) | Capture verified; apply blocked by B-01/B-03 |
 | Test initial sync: sample copy, stop, teardown, failure teardown, mode guard | `profiles.spec.ts` (E2E) | Incremental `bookings.flights` → scratch schema with extra `__deleted` column |
+| Start position (ADR 0014): save-time validation, position read-back, reposition guards; E2E: no-slot refusals, `latest` → `no_data` + marker, resync refused, reposition to latest | `start-position.spec.ts` | Postgres only; seeding/one-shot/gap/marker-reset also verified by hand 2026-11-12. MySQL/SQL Server/Oracle unit-tested in `src/start_position.rs` |
 | Schema Compare: CRUD, counts, preview, schema counts, exec-ddl, injection | `compare.spec.ts` | |
 | Topics: create, search, produce/consume, metadata, configs, guards, delete | `topics.spec.ts` | |
 | ksqlDB (read-only) | `ksqldb.spec.ts` | |

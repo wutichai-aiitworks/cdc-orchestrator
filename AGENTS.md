@@ -34,12 +34,17 @@ Instructions for AI coding agents working with the CDC control plane.
 | `docs/adr/0004-incremental-rolling-window-and-initial-load.md` | Incremental per-table poll strategy (rolling window / full copy), streaming initial load, why not COALESCE/triggers |
 | `docs/adr/0007-rsync-file-sync-sidecar.md` | File sync (rsync over SSH): direct via forwarded key, relay fallback, host-key pinning, macOS rsync detection |
 | `docs/adr/0012-rsync-daemon-over-wireguard.md` | File sync with `rsync://` daemon endpoints (module, RSYNC_PASSWORD, relay only), rsyncd.conf for a tunnel |
+| `docs/adr/0015-notification-channels.md` | Alert channels (webhook/email/LINE/Slack/Discord/Teams), encrypted write-only secrets (`ORCH_SECRET_KEY`), queued delivery + log, conditions, cooldown |
+| `docs/adr/0016-pipeline-latency.md` | Per-pipeline latency: estimate (Kafka/Connect), trigger inbox, opt-in heartbeat probe; `/cdc/latency`, rollups, `latency_above` alert |
+| `docs/adr/0017-mcp-oauth-and-full-api-coverage.md` | mcp-cdc OAuth bridge for claude.ai / ChatGPT (consent with an MCP key), `cdc_api_catalog` / `_get` / `_call`, pipelines by name |
+| `docs/roadmap/gluesync-gap-roadmap.md` | Competitive gap plan vs GlueSync (plan only, R0–R4) |
 | `docs/adr/0008-mcp-per-client-keys-and-hardening.md` | mcp-cdc for other clients: per-client keys/scopes, error shape, sessions, redaction |
 | `docs/adr/0002-native-ui-local-auth.md` | Native WebUI login (`AUTH_MODE=local`), threat model, decisions |
 | `docs/adr/0011-app-mode.md` | `APP_MODE=Production\|Maintenance\|Enhanced` (the one mode variable), corner ribbon, Production-default hardening |
 | `docs/patterns/deployment-mode/SKILL.md` | Reusable version of APP_MODE for other repos: contract, gotchas, templates (Rust/Python/Go/Nuxt/ops), agent prompt |
 | `docs/patterns/break-glass-admin/SKILL.md` | Reusable break-glass admin port (`127.0.0.1:4321`, local login beside SSO, same container): contract, gotchas, templates, agent prompt |
 | `docs/adr/0013-record-diff.md` | Record diff (source vs target by key, per table, async): hash-partitioned scan, canonical values, recheck by key, why not ORDER BY merge |
+| `docs/adr/0014-cdc-start-position.md` | Start position for log-based capture (`latest` / `earliest_retained` / custom LSN·binlog·SCN), one-shot marker, seeding via Connect `PATCH /offsets`, Reposition, why resync is refused |
 | `docs/testing/api-test-plan.md` | How to run tests, coverage map, **known-bug register** (B-xx) and fix order |
 
 ## Demo defaults (compose profile `demo`)

@@ -1723,6 +1723,108 @@ impl Drop for ProfileActionGuard {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct RepositionRequest {
+    pub start_position: crate::models::StartPosition,
+    /// Empty the target tables before the source resumes.
+    #[serde(default)]
+    pub clear_target: bool,
+}
+
+/// `POST /cdc/profiles/{id}/reposition` — move a running log-based pipeline to another
+/// source position (latest, earliest retained, or a custom LSN / binlog / SCN).
+pub async fn profile_reposition(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<RepositionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _slot = ProfileActionGuard::acquire(&state.profile_action_locks, id, "reposition")?;
+    let mut profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let actor = actor_from_headers(&headers);
+    let requested = serde_json::to_value(&body.start_position).unwrap_or_default();
+    let outcome = reconcile::reconcile_reposition(
+        &state,
+        &mut profile,
+        body.start_position.clone(),
+        body.clear_target,
+    )
+    .await;
+    let position = match outcome {
+        Ok(pos) => pos,
+        Err(e) => {
+            // Validation errors return before anything is halted; only mark the
+            // pipeline failed when Connect was already touched.
+            if !matches!(e, AppError::BadRequest(_)) && profile.status != ProfileStatus::Draft {
+                profile.status = ProfileStatus::Failed;
+                profile.last_error = Some(e.to_string_message());
+                let _ = state.profiles.upsert(&profile).await;
+            }
+            let event = new_event(
+                &actor,
+                "profile.reposition",
+                "failure",
+                &detail_json(json!({
+                    "error": e.to_string_message(),
+                    "start_position": requested,
+                    "clear_target": body.clear_target,
+                    "profile": profile_snapshot(&profile),
+                })),
+                Some(profile.id),
+                Some(profile.name.as_str()),
+            );
+            emit(&state, event).await;
+            return Err(e);
+        }
+    };
+    state.profiles.upsert(&profile).await?;
+    let event = new_event(
+        &actor,
+        "profile.reposition",
+        "success",
+        &detail_json(json!({
+            "start_position": requested,
+            "resolved_position": position,
+            "clear_target": body.clear_target,
+            "profile": profile_snapshot(&profile),
+        })),
+        Some(profile.id),
+        Some(profile.name.as_str()),
+    );
+    emit(&state, event).await;
+    profile.redact_secrets();
+    Ok(Json(json!({
+        "profile": profile,
+        "position": position,
+        "timestamp": Utc::now(),
+    })))
+}
+
+/// `GET /cdc/profiles/{id}/position` — the configured start position and the position
+/// the source connector last committed (copyable into a custom start position).
+pub async fn profile_position(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let committed = reconcile::committed_position(&state, &profile).await?;
+    Ok(Json(json!({
+        "profile_id": profile.id,
+        "connector": reconcile::connector_name_for(&profile),
+        "start_position": profile.source.start_position,
+        "committed": committed,
+        "timestamp": Utc::now(),
+    })))
+}
+
 pub async fn profile_action(
     State(state): State<AppState>,
     Path((id, action)): Path<(Uuid, String)>,
@@ -2342,6 +2444,7 @@ fn source_config_from_target(target: TargetConfig) -> SourceConfig {
         incrementing_column: None,
         upsert_key_columns: vec![],
         table_poll: vec![],
+        start_position: Default::default(),
     }
 }
 
@@ -3363,6 +3466,7 @@ fn validate_profile_payload(payload: &ProfileUpsertRequest, strict: bool) -> Res
             payload.source.source_type
         )));
     }
+    crate::start_position::validate_static(&payload.source)?;
     let pattern = payload
         .pattern
         .clone()
@@ -3515,6 +3619,7 @@ fn build_profile(
         tags,
         connector_name: None,
         sink_connector_name: None,
+        latency_probe: Default::default(),
     })
 }
 
@@ -3742,6 +3847,7 @@ mod tests {
                 incrementing_column: None,
                 upsert_key_columns: vec![],
                 table_poll: vec![],
+                start_position: Default::default(),
             },
             target: Some(TargetConfig {
                 name: String::new(),
@@ -3820,6 +3926,7 @@ mod tests {
             incrementing_column: None,
             upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
             table_poll: vec![],
+            start_position: Default::default(),
         };
         let mut incoming = existing.clone();
         incoming.upsert_key_columns = vec![];
@@ -3849,6 +3956,7 @@ mod tests {
             incrementing_column: None,
             upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
             table_poll: vec![],
+            start_position: Default::default(),
         };
         for mode in [
             CaptureMode::SyncOnce,

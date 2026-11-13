@@ -38,6 +38,13 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 # Copy & Sync timeline: run log tails (ANSI strip, URI password mask, error line).
 # Also used by tests to assert generated `table.include.list` patterns match real identifiers.
 regex = "1"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+hex = "0.4"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }
 
 [dev-dependencies]
 

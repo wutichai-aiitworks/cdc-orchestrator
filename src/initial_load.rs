@@ -462,6 +462,7 @@ mod tests {
                 incrementing_column: None,
                 upsert_key_columns: vec!["BRANCH_NO".into(), "PRO_CODE".into()],
                 table_poll: vec![],
+                start_position: Default::default(),
             },
             target: Some(TargetConfig {
                 name: "replica".into(),
@@ -486,6 +487,7 @@ mod tests {
             tags: vec![],
             connector_name: None,
             sink_connector_name: None,
+            latency_probe: Default::default(),
             last_error: None,
             history: vec![],
             created_at: Utc::now(),

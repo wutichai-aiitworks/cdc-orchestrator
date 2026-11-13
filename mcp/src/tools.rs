@@ -8,6 +8,7 @@ use crate::{
 pub fn definitions() -> Vec<ToolDef> {
     let mut defs = base_definitions();
     defs.extend(crate::copy_tools::definitions());
+    defs.extend(crate::ops_tools::definitions());
     defs
 }
 
@@ -235,11 +236,28 @@ fn base_definitions() -> Vec<ToolDef> {
                     "timestamp_column":{"type":"string","description":"Incremental: watermark column such as updated_at"},
                     "incrementing_column":{"type":"string","description":"Incremental: numeric monotonic column for JDBC poll offset (optional when upsert_key_columns + timestamp_column are set)."},
                     "upsert_key_columns":{"type":"string","description":"Incremental replica upsert PK on target, comma-separated (text/composite OK), e.g. BRANCH_NO,PRO_CODE. Requires timestamp_column when incrementing_column is omitted."},
+                    "start_position":{"type":"object","description":"Log-based capture only (ADR 0014). {mode: snapshot_then_stream (default) | latest | earliest_retained | custom, position?: {kind: postgres_lsn, lsn: '0/1A2B3C4D'} | {kind: mysql_binlog, file, pos, gtid_set?} | {kind: sql_server_lsn, commit_lsn} | {kind: oracle_scn, scn}}. Non-default modes copy no rows.","required":["mode"],"properties":{"mode":{"type":"string","enum":["snapshot_then_stream","latest","earliest_retained","custom"]},"position":{"type":"object"}}},
                     "stream_platform":{"type":"string","enum":["redpanda","kafka"],"default":"redpanda"},
                     "validate":{"type":"boolean","default":true},
                     "start":{"type":"boolean","default":false,"description":"Enable and start after create"}
                 }
             }),
+            false,
+        ),
+        td(
+            "cdc_pipeline_position",
+            "Configured start position and the source log position (LSN / binlog / SCN) a pipeline last committed.",
+            json!({"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}),
+            true,
+        ),
+        td(
+            "cdc_pipeline_reposition",
+            "Move a running log-based pipeline to another source position (write). Forward leaves a gap in the target; backward replays (upsert-safe). Confirm with the user first.",
+            json!({"type":"object","required":["id","start_position"],"properties":{
+                "id":{"type":"string"},
+                "start_position":{"type":"object","description":"Log-based capture only (ADR 0014). {mode: snapshot_then_stream (default) | latest | earliest_retained | custom, position?: {kind: postgres_lsn, lsn: '0/1A2B3C4D'} | {kind: mysql_binlog, file, pos, gtid_set?} | {kind: sql_server_lsn, commit_lsn} | {kind: oracle_scn, scn}}. Non-default modes copy no rows.","required":["mode"],"properties":{"mode":{"type":"string","enum":["snapshot_then_stream","latest","earliest_retained","custom"]},"position":{"type":"object"}}},
+                "clear_target":{"type":"boolean","default":false,"description":"Truncate mapped target tables before resuming"}
+            }}),
             false,
         ),
         td(
@@ -422,7 +440,11 @@ pub fn prompt_messages(name: &str, arguments: &Value) -> Result<Value, ApiError>
     Ok(json!([{"role":"user","content":{"type":"text","text": text}}]))
 }
 
-pub async fn call(state: &AppState, call: ToolCall) -> Result<Value, ApiError> {
+pub async fn call(state: &AppState, mut call: ToolCall) -> Result<Value, ApiError> {
+    crate::ops_tools::normalize_pipeline_arg(state, &mut call).await?;
+    if let Some(out) = crate::ops_tools::call(state, &call).await {
+        return out;
+    }
     if let Some(out) = crate::copy_tools::call(state, &call).await {
         return out;
     }
@@ -676,6 +698,37 @@ pub async fn call(state: &AppState, call: ToolCall) -> Result<Value, ApiError> {
             )
             .await
         }
+        "cdc_pipeline_position" => {
+            let id = arg_str(&call.arguments, "id")?;
+            orch(
+                state,
+                Method::GET,
+                &format!("/cdc/profiles/{id}/position"),
+                None,
+            )
+            .await
+        }
+        "cdc_pipeline_reposition" => {
+            guard_write(state)?;
+            let id = arg_str(&call.arguments, "id")?;
+            let start_position = call
+                .arguments
+                .get("start_position")
+                .cloned()
+                .ok_or_else(|| ApiError::Message("start_position is required".into()))?;
+            let clear_target = call
+                .arguments
+                .get("clear_target")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            orch(
+                state,
+                Method::POST,
+                &format!("/cdc/profiles/{id}/reposition"),
+                Some(json!({"start_position": start_position, "clear_target": clear_target})),
+            )
+            .await
+        }
         "cdc_profile_action" => {
             guard_write(state)?;
             let id = arg_str(&call.arguments, "id")?;
@@ -875,18 +928,30 @@ fn help_catalog(state: &AppState) -> Value {
             "Show recent records for bookings.airports_data",
             "Create a replica (source-to-target) pipeline for schema bookings and start it",
             "Check lag for group cdc-connect-cluster",
-            "Configure a Postgres copy from host.docker.internal:5438 db X to cdc-postgres-target db X — don't start it"
+            "Configure a Postgres copy from host.docker.internal:5438 db X to cdc-postgres-target db X — don't start it",
+            "Which pipeline has the highest latency right now?",
+            "Show CollabX Sync latency over the last 24h",
+            "What failed in the last hour?",
+            "Turn on exact latency for CollabX Sync and restart it",
+            "Create a LINE channel and alert me when any connector fails",
+            "Run a record diff for CollabX Sync (find it with cdc_api_catalog)"
         ],
+        "pipelines_by_name": "Any tool that takes a pipeline id also accepts its name.",
         "read_tools": [
             "cdc_overview", "cdc_tables", "cdc_topic_messages", "cdc_topics_list",
-            "cdc_profile_list", "cdc_profile_dlq", "cdc_connector_status", "cdc_kafka_lag",
+            "cdc_profile_list", "cdc_profile_dlq", "cdc_pipeline_position", "cdc_connector_status", "cdc_kafka_lag",
             "cdc_source_validate", "cdc_target_validate", "cdc_logs_tail",
-            "cdc_copy_profile_list", "cdc_copy_test_connection", "cdc_copy_jobs", "cdc_copy_job_logs"
+            "cdc_copy_profile_list", "cdc_copy_test_connection", "cdc_copy_jobs", "cdc_copy_job_logs",
+            "cdc_latency", "cdc_pipeline_latency", "cdc_audit_events", "cdc_pipeline_logs",
+            "cdc_notification_channels_list", "cdc_notification_deliveries",
+            "cdc_api_catalog", "cdc_api_get (any /cdc read)"
         ],
         "write_tools": [
-            "cdc_pipeline_create", "cdc_profile_action", "cdc_connector_action",
+            "cdc_pipeline_create", "cdc_pipeline_reposition", "cdc_profile_action", "cdc_connector_action",
             "cdc_topic_create", "cdc_engine_up",
-            "cdc_pg_copy_create (save only)", "cdc_copy_run (starts a copy)"
+            "cdc_pg_copy_create (save only)", "cdc_copy_run (starts a copy)",
+            "cdc_latency_probe", "cdc_notification_channel_upsert", "cdc_notification_rule_upsert",
+            "cdc_api_call (any /cdc write; confirm destructive actions first)"
         ]
     })
 }
@@ -994,7 +1059,11 @@ async fn pipeline_create(state: &AppState, args: &Value) -> Result<Value, ApiErr
             "tables": tables,
             "timestamp_column": args.get("timestamp_column").and_then(Value::as_str),
             "incrementing_column": args.get("incrementing_column").and_then(Value::as_str),
-            "upsert_key_columns": list_arg(args, "upsert_key_columns")
+            "upsert_key_columns": list_arg(args, "upsert_key_columns"),
+            "start_position": args
+                .get("start_position")
+                .cloned()
+                .unwrap_or_else(|| json!({"mode": "snapshot_then_stream"}))
         },
         "flow": {
             "transforms": [],

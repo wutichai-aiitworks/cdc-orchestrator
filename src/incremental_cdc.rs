@@ -763,6 +763,7 @@ mod tests {
                 incrementing_column: Some("id".into()),
                 upsert_key_columns: vec![],
                 table_poll: vec![],
+                start_position: Default::default(),
             },
             target: Some(TargetConfig {
                 name: "replica".into(),
@@ -797,6 +798,7 @@ mod tests {
             tags: vec![],
             connector_name: None,
             sink_connector_name: None,
+            latency_probe: Default::default(),
         }
     }
 

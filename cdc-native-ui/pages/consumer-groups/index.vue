@@ -177,7 +177,7 @@ onUnmounted(() => { if (searchDebounceTimer) clearTimeout(searchDebounceTimer) }
         <!-- Rows per page -->
         <AppSelect
           :model-value="pageSize"
-          class="w-28"
+          class="w-32"
           @update:model-value="pageSize = Number($event); applyFilters()"
         >
           <option :value="25">25 rows</option>

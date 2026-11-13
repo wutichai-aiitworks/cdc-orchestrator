@@ -8,6 +8,20 @@ Pair with orchestrator OpenAPI (`docs/openapi.yaml`) and setup notes (compendium
 ## Tools
 
 Start with `cdc_help` or `cdc_overview`. Prefer prompt-friendly tools over raw orchestrator JSON.
+Every tool that takes a pipeline accepts its **id or its name** (e.g. `"CollabX Sync"`).
+
+### Health, latency, alerts (ADR 0015, 0016)
+- `cdc_latency` — every running pipeline's end-to-end latency, backlog, throughput, status
+- `cdc_pipeline_latency` — one pipeline over 1h…30d (p50 / p95 / max)
+- `cdc_audit_events`, `cdc_pipeline_logs` — what happened and what failed
+- `cdc_notification_channels_list`, `cdc_notification_deliveries`
+- Write: `cdc_latency_probe` (exact heartbeat latency; `restart=true` applies it),
+  `cdc_notification_channel_upsert` / `_test` / `_delete`
+
+### Anything else (ADR 0017)
+- `cdc_api_catalog` — search all documented `/cdc` operations (embedded from `docs/openapi.yaml`)
+- `cdc_api_get` — call any `/cdc` GET
+- `cdc_api_call` — call any `/cdc` POST / PUT / PATCH / DELETE (write-gated)
 
 ### Read
 - `cdc_help`, `cdc_overview`, `cdc_health`, `cdc_capability`, `cdc_engine_status`, `cdc_cluster`, `cdc_metrics`
@@ -24,6 +38,7 @@ Start with `cdc_help` or `cdc_overview`. Prefer prompt-friendly tools over raw o
 - `cdc_pipeline_create` — prompt-friendly create (host/db/user/pass/schemas/tables; optional `sink_error_policy`, `validate` + `start`)
 - `cdc_engine_up` / `down` / `restart`
 - `cdc_profile_upsert`, `cdc_profile_enable`, `cdc_profile_action`
+- `cdc_pipeline_position` (read) / `cdc_pipeline_reposition` (write) — source log position (LSN / binlog / SCN); `cdc_pipeline_create` also takes `start_position` (ADR 0014)
 - `cdc_connector_validate` / `create` / `update` / `action` / `delete`
 - `cdc_topic_create` / `delete` / `recreate` / `clear_messages`
 - `cdc_notification_rule_upsert` / `delete`
@@ -51,6 +66,47 @@ Start with `cdc_help` or `cdc_overview`. Prefer prompt-friendly tools over raw o
 | `MCP_RATE_LIMIT_RPM` | `300` | Requests per minute **per client** |
 | `MCP_SESSION_TTL_SECS` / `MCP_MAX_SESSIONS` | `86400` / `1000` | Idle session expiry / cap (oldest evicted) |
 | `MCP_CORS_ORIGINS` | unset | Browser origins allowed (comma list) |
+
+| `MCP_OAUTH` | `true` | OAuth bridge for claude.ai / ChatGPT connectors (ADR 0017) |
+| `MCP_PUBLIC_URL` | unset | Public https base URL, e.g. `https://cdc-mcp.example.com` (needed behind a proxy) |
+| `MCP_OAUTH_STORE` | unset (compose: `/data/oauth-store.json`) | Persist OAuth clients + token hashes across restarts |
+| `MCP_OAUTH_ACCESS_TTL_SECS` / `MCP_OAUTH_REFRESH_TTL_SECS` | `3600` / `2592000` | Token lifetimes |
+
+## Connect a client
+
+Every client uses the same endpoint, `https://<your-host>/mcp`. Give each client its own key in
+`MCP_CLIENT_KEYS` (`name:read|write:token`, `openssl rand -hex 24`), so the audit log and
+revocation are per client.
+
+**Claude Code** (header key):
+
+```bash
+claude mcp add --transport http cdc https://cdc-mcp.example.com/mcp \
+  --header "Authorization: Bearer <key>"
+```
+
+Leave out `--header` to use the OAuth flow instead (`/mcp` in Claude Code → authenticate).
+
+**claude.ai and Claude Desktop** (OAuth): Settings → Connectors → Add custom connector →
+URL `https://cdc-mcp.example.com/mcp` → Connect. A page from this server asks for an MCP client
+key; paste one to approve. The connector then acts as that client and with its scope.
+
+**ChatGPT** (OAuth): with developer mode enabled (Settings → Apps & Connectors → Advanced),
+create a connector with the same URL and OAuth authentication, then approve with a key as above.
+Availability depends on the ChatGPT plan.
+
+**Cursor, VS Code, Windsurf and other clients** that accept headers:
+
+```json
+{ "mcpServers": { "cdc": { "url": "https://cdc-mcp.example.com/mcp",
+  "headers": { "Authorization": "Bearer <key>" } } } }
+```
+
+stdio-only clients can bridge with `npx mcp-remote https://cdc-mcp.example.com/mcp --header "Authorization: Bearer <key>"`.
+
+**Exposing the server.** claude.ai and ChatGPT connect from the internet, so put mcp-cdc behind
+https: for example a Cloudflare tunnel hostname → `mcp-cdc:8410`, then set
+`MCP_PUBLIC_URL=https://<that hostname>`. Header clients on the LAN can use `http://host:8410/mcp`.
 
 ### Production notes (ADR 0008)
 

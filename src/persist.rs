@@ -9,6 +9,8 @@ use std::time::Duration;
 
 pub const KIND_PROFILE: &str = "profile";
 pub const KIND_RULE: &str = "rule";
+/// Notification channel (webhook, email, LINE, …) — ADR 0015.
+pub const KIND_CHANNEL: &str = "channel";
 pub const KIND_PROCESSING: &str = "processing";
 pub const KIND_SECRET: &str = "secret";
 pub const KIND_COMPARE: &str = "compare_profile";
@@ -86,6 +88,111 @@ const PIPELINE_LOG_INDEX_PROFILE: &str =
 const PIPELINE_LOG_INDEX_ACTION: &str =
     "CREATE INDEX IF NOT EXISTS idx_cdc_pipeline_log_action ON cdc_pipeline_logs(action)";
 
+/// One final notification delivery result (ADR 0015).
+const DELIVERY_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_notification_deliveries (
+  delivery_id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  channel_id TEXT,
+  channel_name TEXT NOT NULL,
+  channel_type TEXT NOT NULL,
+  rule_id TEXT,
+  rule_name TEXT,
+  condition TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  status_code INTEGER,
+  error TEXT,
+  duration_ms INTEGER NOT NULL,
+  test INTEGER NOT NULL
+)";
+const DELIVERY_INDEX_TS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_notification_deliveries_ts ON cdc_notification_deliveries(timestamp)";
+const DELIVERY_INDEX_CHANNEL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_notification_deliveries_channel ON cdc_notification_deliveries(channel_id)";
+
+/// 5-minute latency rollups per pipeline (ADR 0016). Keyed by (profile_id, bucket).
+const METRICS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_pipeline_metrics (
+  profile_id TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  e2e_p50_ms INTEGER,
+  e2e_p95_ms INTEGER,
+  e2e_max_ms INTEGER,
+  capture_max_ms INTEGER,
+  sink_max_ms INTEGER,
+  lag_max INTEGER,
+  throughput_avg REAL,
+  samples INTEGER NOT NULL,
+  method TEXT NOT NULL,
+  PRIMARY KEY (profile_id, timestamp)
+)";
+const METRICS_INDEX_TS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cdc_pipeline_metrics_ts ON cdc_pipeline_metrics(timestamp)";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MetricsRollup {
+    pub profile_id: String,
+    /// Bucket start (RFC 3339, UTC).
+    pub timestamp: String,
+    pub e2e_p50_ms: Option<i64>,
+    pub e2e_p95_ms: Option<i64>,
+    pub e2e_max_ms: Option<i64>,
+    pub capture_max_ms: Option<i64>,
+    pub sink_max_ms: Option<i64>,
+    pub lag_max: Option<i64>,
+    pub throughput_avg: Option<f64>,
+    pub samples: u32,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeliveryRow {
+    pub delivery_id: String,
+    pub timestamp: String,
+    pub channel_id: Option<String>,
+    pub channel_name: String,
+    pub channel_type: String,
+    pub rule_id: Option<String>,
+    pub rule_name: Option<String>,
+    pub condition: String,
+    pub subject: String,
+    /// `delivered`, `failed` or `dropped` (queue full).
+    pub outcome: String,
+    pub attempts: u32,
+    pub status_code: Option<u16>,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+    pub test: bool,
+}
+
+fn decode_delivery_row(row: &[Value]) -> Result<DeliveryRow, PersistError> {
+    let s = |i: usize| -> Option<String> {
+        row.get(i).and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+    };
+    let n = |i: usize| row.get(i).and_then(Value::as_i64);
+    Ok(DeliveryRow {
+        delivery_id: s(0).ok_or_else(|| PersistError::Internal("delivery missing id".into()))?,
+        timestamp: s(1).unwrap_or_default(),
+        channel_id: s(2),
+        channel_name: s(3).unwrap_or_default(),
+        channel_type: s(4).unwrap_or_default(),
+        rule_id: s(5),
+        rule_name: s(6),
+        condition: s(7).unwrap_or_default(),
+        subject: s(8).unwrap_or_default(),
+        outcome: s(9).unwrap_or_default(),
+        attempts: n(10).unwrap_or(0).max(0) as u32,
+        status_code: n(11).map(|v| v as u16),
+        error: s(12),
+        duration_ms: n(13).unwrap_or(0).max(0) as u64,
+        test: n(14).unwrap_or(0) != 0,
+    })
+}
+
 #[derive(Debug)]
 pub enum PersistError {
     Upstream(String),
@@ -155,6 +262,11 @@ impl RqliteClient {
             TOOL_EVENTS_TABLE_SQL,
             TOOL_EVENTS_INDEX_PROFILE,
             TOOL_EVENTS_INDEX_TS,
+            DELIVERY_TABLE_SQL,
+            DELIVERY_INDEX_TS,
+            DELIVERY_INDEX_CHANNEL,
+            METRICS_TABLE_SQL,
+            METRICS_INDEX_TS,
         ] {
             self.execute(json!([sql])).await?;
         }
@@ -417,6 +529,128 @@ impl RqliteClient {
         .await?;
         self.trim_oldest_by_timestamp("cdc_tool_events", "event_id", max_rows)
             .await
+    }
+
+    pub async fn insert_delivery(&self, d: &DeliveryRow) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "INSERT OR IGNORE INTO cdc_notification_deliveries(delivery_id, timestamp, channel_id, channel_name, channel_type, rule_id, rule_name, condition, subject, outcome, attempts, status_code, error, duration_ms, test) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            d.delivery_id,
+            d.timestamp,
+            d.channel_id,
+            d.channel_name,
+            d.channel_type,
+            d.rule_id,
+            d.rule_name,
+            d.condition,
+            d.subject,
+            d.outcome,
+            d.attempts,
+            d.status_code,
+            d.error,
+            d.duration_ms,
+            i64::from(d.test)
+        ]]))
+        .await
+    }
+
+    pub async fn list_deliveries(
+        &self,
+        limit: usize,
+        channel_id: Option<&str>,
+        rule_id: Option<&str>,
+        outcome: Option<&str>,
+    ) -> Result<Vec<DeliveryRow>, PersistError> {
+        self.query_event_rows(
+            "SELECT delivery_id, timestamp, channel_id, channel_name, channel_type, rule_id, rule_name, condition, subject, outcome, attempts, status_code, error, duration_ms, test \
+             FROM cdc_notification_deliveries",
+            limit,
+            |sql, params| {
+                push_eq_filter(sql, params, "channel_id", channel_id);
+                push_eq_filter(sql, params, "rule_id", rule_id);
+                push_eq_filter(sql, params, "outcome", outcome);
+            },
+            decode_delivery_row,
+        )
+        .await
+    }
+
+    pub async fn trim_deliveries(&self, max_rows: usize) -> Result<(), PersistError> {
+        self.trim_oldest_by_timestamp("cdc_notification_deliveries", "delivery_id", max_rows)
+            .await
+    }
+
+    pub async fn insert_metrics_rollup(&self, m: &MetricsRollup) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "INSERT OR REPLACE INTO cdc_pipeline_metrics(profile_id, timestamp, e2e_p50_ms, e2e_p95_ms, e2e_max_ms, capture_max_ms, sink_max_ms, lag_max, throughput_avg, samples, method) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            m.profile_id,
+            m.timestamp,
+            m.e2e_p50_ms,
+            m.e2e_p95_ms,
+            m.e2e_max_ms,
+            m.capture_max_ms,
+            m.sink_max_ms,
+            m.lag_max,
+            m.throughput_avg,
+            m.samples,
+            m.method
+        ]]))
+        .await
+    }
+
+    /// Rollups for one pipeline since `since` (RFC 3339), oldest first.
+    pub async fn list_metrics_rollups(
+        &self,
+        profile_id: &str,
+        since: &str,
+    ) -> Result<Vec<MetricsRollup>, PersistError> {
+        let rows = self
+            .query(json!([[
+                "SELECT profile_id, timestamp, e2e_p50_ms, e2e_p95_ms, e2e_max_ms, capture_max_ms, sink_max_ms, lag_max, throughput_avg, samples, method \
+                 FROM cdc_pipeline_metrics WHERE profile_id = ? AND timestamp >= ? ORDER BY timestamp ASC LIMIT 10000",
+                profile_id,
+                since
+            ]]))
+            .await?;
+        let i = |row: &[Value], n: usize| row.get(n).and_then(Value::as_i64);
+        Ok(rows
+            .iter()
+            .map(|row| MetricsRollup {
+                profile_id: row
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                timestamp: row
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                e2e_p50_ms: i(row, 2),
+                e2e_p95_ms: i(row, 3),
+                e2e_max_ms: i(row, 4),
+                capture_max_ms: i(row, 5),
+                sink_max_ms: i(row, 6),
+                lag_max: i(row, 7),
+                throughput_avg: row.get(8).and_then(Value::as_f64),
+                samples: i(row, 9).unwrap_or(0).max(0) as u32,
+                method: row
+                    .get(10)
+                    .and_then(Value::as_str)
+                    .unwrap_or("estimate")
+                    .to_string(),
+            })
+            .collect())
+    }
+
+    /// Retention: drop rollups older than `before` (RFC 3339).
+    pub async fn trim_metrics_rollups(&self, before: &str) -> Result<(), PersistError> {
+        self.execute(json!([[
+            "DELETE FROM cdc_pipeline_metrics WHERE timestamp < ?",
+            before
+        ]]))
+        .await
     }
 
     async fn query_event_rows<T, F, G>(

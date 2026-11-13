@@ -398,6 +398,12 @@ paths:
           name: hide_internal
           schema:
             type: boolean
+        - in: query
+          name: summary
+          description: Names and internal flag only (one broker call); partition, size and message fields are omitted. Use for counts.
+          schema:
+            type: boolean
+            default: false
             default: false
         - in: query
           name: sort_by
@@ -1489,6 +1495,78 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProfileResponse"
+  /cdc/profiles/{id}/reposition:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: Move a running log-based pipeline to another source position
+      description: |
+        Halts sink and source, optionally truncates the target, replaces the source
+        connector's stored offset with the resolved position and resumes both (ADR 0014).
+        `latest` jumps to the source's current position (not MySQL yet); `earliest_retained`
+        and `custom` are validated as for `start_position`. Moving forward leaves a gap in
+        the target; moving backward replays changes, which the upserting sink absorbs. The
+        new value is saved as the profile's `start_position` so a later Start keeps the
+        offsets. `snapshot_then_stream` is rejected — use `resync`.
+        Audit: `profile.reposition`.
+      operationId: repositionProfile
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RepositionRequest" }
+      responses:
+        "200":
+          description: Repositioned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile: { type: object, additionalProperties: true }
+                  position: { $ref: "#/components/schemas/LogPosition" }
+                  timestamp: { type: string, format: date-time }
+        "400":
+          description: Not log-based capture, no source connector yet, or the position is not available on the source
+        "404":
+          description: Pipeline not found
+        "409":
+          description: Another action is running on this pipeline
+  /cdc/profiles/{id}/position:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      summary: Configured start position and the source position last committed
+      description: |
+        `committed` is parsed from the source connector's Kafka Connect offsets (null before
+        the first commit, or for trigger / incremental pipelines). Its shape is a
+        `LogPosition`, so it can be pasted into a custom start position or a reposition.
+      operationId: getProfilePosition
+      tags: [Profiles]
+      responses:
+        "200":
+          description: Position
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile_id: { type: string, format: uuid }
+                  connector: { type: string }
+                  start_position: { $ref: "#/components/schemas/StartPosition" }
+                  committed:
+                    nullable: true
+                    allOf: [{ $ref: "#/components/schemas/LogPosition" }]
+                  timestamp: { type: string, format: date-time }
+        "404":
+          description: Pipeline not found
   /cdc/profiles/{id}/split:
     parameters:
       - in: path
@@ -2034,6 +2112,250 @@ paths:
       responses:
         "200":
           description: Deleted
+  /cdc/notifications/channels:
+    get:
+      summary: List notification channels (secrets redacted as ********)
+      description: ADR 0015. `secretsAvailable` is false when ORCH_SECRET_KEY is unset.
+      operationId: listNotificationChannels
+      tags: [Notifications]
+      responses:
+        "200":
+          description: Channels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/NotificationChannel"
+                        - type: object
+                          properties:
+                            target: { type: string, description: Secret-free destination label }
+                  secretsAvailable: { type: boolean }
+                  timestamp: { type: string, format: date-time }
+    post:
+      summary: Create notification channel
+      operationId: createNotificationChannel
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationChannel"
+      responses:
+        "200":
+          description: Created (secrets redacted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannel"
+        "400":
+          description: Invalid settings, missing required secret, or ORCH_SECRET_KEY unset
+        "409":
+          description: A channel with this id exists
+  /cdc/notifications/channels/test:
+    post:
+      summary: Send a sample message through a draft channel (not saved)
+      description: >-
+        One attempt, no retry. With the id of a saved channel, `********` uses the stored
+        secret (refused if the SMTP host/username or a legacy-header webhook host changed).
+      operationId: testDraftNotificationChannel
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationChannel"
+      responses:
+        "200":
+          description: Delivery result (outcome delivered or failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationDelivery"
+  /cdc/notifications/channels/{id}:
+    get:
+      summary: Get notification channel (secrets redacted)
+      operationId: getNotificationChannel
+      tags: [Notifications]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannel"
+        "404":
+          description: Not found
+    put:
+      summary: Update notification channel
+      description: Secret fields — `********` or omitted keeps the stored value, empty string clears it.
+      operationId: updateNotificationChannel
+      tags: [Notifications]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationChannel"
+      responses:
+        "200":
+          description: Updated (secrets redacted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannel"
+    delete:
+      summary: Delete notification channel
+      operationId: deleteNotificationChannel
+      tags: [Notifications]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Deleted
+        "409":
+          description: Still used by one or more rules
+  /cdc/notifications/channels/{id}/test:
+    post:
+      summary: Send a sample message through a saved channel
+      operationId: testNotificationChannel
+      tags: [Notifications]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Delivery result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationDelivery"
+  /cdc/notifications/deliveries:
+    get:
+      summary: Notification delivery log, newest first
+      operationId: listNotificationDeliveries
+      tags: [Notifications]
+      parameters:
+        - { in: query, name: limit, schema: { type: integer, default: 200, maximum: 2000 } }
+        - { in: query, name: channel_id, schema: { type: string } }
+        - { in: query, name: rule_id, schema: { type: string } }
+        - { in: query, name: outcome, schema: { type: string, enum: [delivered, failed, dropped] } }
+      responses:
+        "200":
+          description: Deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/NotificationDelivery" }
+                  count: { type: integer }
+                  timestamp: { type: string, format: date-time }
+  /cdc/latency:
+    get:
+      summary: Current latency of every sampled pipeline (ADR 0016)
+      operationId: listPipelineLatency
+      tags: [Pipelines]
+      responses:
+        "200":
+          description: Latest sample per pipeline
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PipelineLatencyCurrent" }
+                  timestamp: { type: string, format: date-time }
+  /cdc/profiles/{id}/latency:
+    get:
+      summary: Latency history of one pipeline
+      description: Raw 15 s samples while in memory (up to 6 h), 5-minute rollups otherwise (30 days).
+      operationId: getPipelineLatency
+      tags: [Pipelines]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: range, schema: { type: string, enum: ["1h", "6h", "24h", "7d", "30d"], default: "1h" } }
+      responses:
+        "200":
+          description: Current value, probe state and points
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profileId: { type: string, format: uuid }
+                  name: { type: string }
+                  range: { type: string }
+                  resolution: { type: string, enum: [sample, 5m] }
+                  current: { allOf: [{ $ref: "#/components/schemas/PipelineLatencyCurrent" }], nullable: true }
+                  probe:
+                    type: object
+                    properties:
+                      enabled: { type: boolean }
+                      intervalSecs: { type: integer }
+                      unsupportedReason: { type: string, nullable: true }
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        t: { type: string, format: date-time }
+                        e2e_ms: { type: integer, nullable: true, description: "sample value, or rollup p50" }
+                        e2e_p95_ms: { type: integer, nullable: true, description: rollup points only }
+                        capture_ms: { type: integer, nullable: true }
+                        sink_ms: { type: integer, nullable: true }
+                        lag_records: { type: integer, nullable: true }
+                        throughput_rps: { type: number, nullable: true }
+        "404":
+          description: Pipeline not found
+  /cdc/profiles/{id}/latency-probe:
+    put:
+      summary: Turn the heartbeat latency probe on or off
+      description: >-
+        On: creates hyper_cdc.hyper_cdc_heartbeat on the source and adds it to the publication
+        when the publication lists tables. A running pipeline must be restarted to capture and
+        replicate the table (restartRequired). Postgres source (log-based) → Postgres target only.
+      operationId: setPipelineLatencyProbe
+      tags: [Pipelines]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                intervalSecs: { type: integer, minimum: 5, maximum: 300, default: 10 }
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  intervalSecs: { type: integer }
+                  restartRequired: { type: boolean }
+                  notes: { type: array, items: { type: string } }
+        "400":
+          description: Unsupported source/target, or missing privileges on the source
   /cdc/notifications/history:
     get:
       summary: Recent in-memory alert history
@@ -3301,6 +3623,73 @@ components:
             full_copy table runs its own query-mode, mode=bulk JDBC source connector
             (`{connector}-poll-{schema-table}`; the first one takes the pipeline connector
             name when no table uses a watermark) and publishes to the same topic as table mode.
+        start_position:
+          $ref: "#/components/schemas/StartPosition"
+    StartPosition:
+      type: object
+      required: [mode]
+      description: |
+        Where a log-based (`capture_mode=logical`) source starts on its first Start (ADR 0014).
+        One-shot: used while the source connector has no stored offset, or when the value
+        changes (offsets are reset and re-seeded). Afterwards the stored offset wins, so a
+        restart never rewinds. Use `POST /cdc/profiles/{id}/reposition` to move a running
+        pipeline. Non-default values are rejected (400) on trigger / incremental / sync_once
+        pipelines, and `resync` is rejected on them (they never copy rows).
+      properties:
+        mode:
+          type: string
+          enum: [snapshot_then_stream, latest, earliest_retained, custom]
+          default: snapshot_then_stream
+          description: |
+            snapshot_then_stream = copy every row, then stream (Debezium snapshot.mode=initial).
+            latest = no row copy, stream from now (snapshot.mode=no_data).
+            earliest_retained = no row copy, stream from the oldest change the source still
+            serves. PostgreSQL: the replication slot's confirmed_flush_lsn (400 when the slot
+            does not exist — a new slot starts at now). SQL Server: oldest LSN in the CDC
+            tables. Oracle: oldest archived/online redo SCN. MySQL: not supported yet (400).
+            custom = no row copy, stream from `position`, checked against what the source
+            still holds (400 when it is older than retained logs or ahead of the source).
+        position:
+          $ref: "#/components/schemas/LogPosition"
+    LogPosition:
+      type: object
+      required: [kind]
+      description: A change-log position; `kind` must match the source type.
+      properties:
+        kind:
+          type: string
+          enum: [postgres_lsn, mysql_binlog, sql_server_lsn, oracle_scn]
+        lsn:
+          type: string
+          description: "postgres_lsn: X/Y hex as pg_current_wal_lsn() prints it, or decimal."
+          example: 0/1A2B3C4D
+        file:
+          type: string
+          description: "mysql_binlog: binlog file name."
+          example: mysql-bin.000042
+        pos:
+          type: integer
+          minimum: 4
+          description: "mysql_binlog: byte position in the file (4 = first event)."
+        gtid_set:
+          type: string
+          description: "mysql_binlog (optional): executed GTID set; must include gtid_purged."
+        commit_lsn:
+          type: string
+          description: "sql_server_lsn: 0000002a:00000c10:0003 or 0x0000002A00000C100003."
+        scn:
+          type: string
+          description: "oracle_scn: decimal SCN."
+    RepositionRequest:
+      type: object
+      required: [start_position]
+      properties:
+        start_position:
+          $ref: "#/components/schemas/StartPosition"
+        clear_target:
+          type: boolean
+          default: false
+          description: Truncate the mapped target tables (PostgreSQL targets) before the source resumes.
     TablePollRule:
       type: object
       required: [table, strategy]
@@ -4031,19 +4420,94 @@ components:
       properties:
         id: { type: string }
         name: { type: string }
-        conditionType: { type: string }
         conditionValue:
           type: object
           additionalProperties: true
           nullable: true
-        connectorFilter: { type: string }
+        conditionType:
+          type: string
+          enum: [connector_failed, connector_paused, connector_recovered, connector_failed_for, connector_state_changed, dlq_growth, pipeline_failed, latency_above]
+          description: "`connector_paused_N_min` (legacy) is read as connector_paused. connector_failed_for uses conditionValue.minutes; latency_above uses conditionValue {seconds, forMinutes}."
+        connectorFilter: { type: string, description: Glob over the connector, DLQ topic or pipeline name (by condition) }
         channels:
           type: array
           items: { type: string }
-        webhookUrl: { type: string, format: uri, nullable: true }
-        webhookSecret: { type: string, nullable: true, writeOnly: true }
+          description: Legacy (pre-ADR-0015); ignored when channelIds is set
+        channelIds:
+          type: array
+          items: { type: string }
+        cooldownMinutes: { type: integer, minimum: 0, default: 0 }
+        webhookUrl: { type: string, format: uri, nullable: true, description: Legacy; moved to a channel at startup }
+        webhookSecret: { type: string, nullable: true, writeOnly: true, description: "Legacy; returned as ********" }
         enabled: { type: boolean }
         createdAt: { type: string, format: date-time, nullable: true }
+    PipelineLatencyCurrent:
+      type: object
+      properties:
+        profile_id: { type: string, format: uuid }
+        name: { type: string }
+        ts: { type: string, format: date-time }
+        e2e_ms: { type: integer, nullable: true, description: End-to-end latency (ms) }
+        capture_ms: { type: integer, nullable: true }
+        sink_ms: { type: integer, nullable: true, description: "0 when the backlog is younger than the Connect offset-flush interval" }
+        lag_records: { type: integer, nullable: true }
+        throughput_rps: { type: number, nullable: true }
+        last_event_at: { type: string, format: date-time, nullable: true }
+        method: { type: string, enum: [heartbeat, trigger_inbox, estimate] }
+        status: { type: string, enum: [ok, behind, idle, stopped, unknown] }
+        note: { type: string, nullable: true }
+        e2e_p95_1h_ms: { type: integer, nullable: true }
+        probe_enabled: { type: boolean }
+        probe_error: { type: string, nullable: true }
+    NotificationChannel:
+      type: object
+      required: [name, type]
+      description: ADR 0015. Each type reads only its own settings and secrets.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [webhook, email, line, slack, discord, teams] }
+        enabled: { type: boolean, default: true }
+        settings:
+          type: object
+          properties:
+            url: { type: string, format: uri, description: webhook }
+            legacySecretHeader: { type: boolean, description: "webhook: send X-Webhook-Secret instead of X-CDC-Signature" }
+            smtpHost: { type: string }
+            smtpPort: { type: integer, description: "default 587 (starttls), 465 (tls), 25 (none)" }
+            smtpSecurity: { type: string, enum: [starttls, tls, none] }
+            smtpUsername: { type: string }
+            from: { type: string }
+            to: { type: array, items: { type: string } }
+            lineTo: { type: string, description: "LINE user/group/room id (U|C|R + 32 hex)" }
+        secrets:
+          type: object
+          writeOnly: false
+          description: >-
+            webhook: signingSecret · email: smtpPassword · line: channelAccessToken ·
+            slack/discord/teams: webhookUrl. Responses show ******** for stored values.
+          additionalProperties: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        migratedFromRule: { type: string, nullable: true }
+    NotificationDelivery:
+      type: object
+      properties:
+        delivery_id: { type: string }
+        timestamp: { type: string, format: date-time }
+        channel_id: { type: string, nullable: true }
+        channel_name: { type: string }
+        channel_type: { type: string }
+        rule_id: { type: string, nullable: true }
+        rule_name: { type: string, nullable: true }
+        condition: { type: string }
+        subject: { type: string }
+        outcome: { type: string, enum: [delivered, failed, dropped] }
+        attempts: { type: integer }
+        status_code: { type: integer, nullable: true }
+        error: { type: string, nullable: true }
+        duration_ms: { type: integer }
+        test: { type: boolean }
     SchemaCompareConn:
       type: object
       required: [type]

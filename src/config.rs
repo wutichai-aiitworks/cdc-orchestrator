@@ -124,6 +124,17 @@ pub struct AppConfig {
     pub audit_redis_key: String,
     pub audit_redis_max_len: usize,
     pub audit_rqlite_max_rows: usize,
+    /// Encrypts notification channel secrets in rqlite (`ORCH_SECRET_KEY`, ADR 0015).
+    pub secret_key: Option<crate::secretbox::SecretKey>,
+    /// Base URL of the WebUI for links in notifications (`ORCH_PUBLIC_UI_URL`), optional.
+    pub public_ui_url: Option<String>,
+    /// Per-pipeline latency sampling interval (`ORCH_LATENCY_SAMPLE_SECS`, default 15).
+    pub latency_sample_secs: u64,
+    /// Kafka bootstrap for the latency sampler (`ORCH_KAFKA_BOOTSTRAP`, default cdc-message:9092).
+    pub kafka_bootstrap: String,
+    /// Connect `offset.flush.interval.ms`: committed sink offsets trail applied records by up to
+    /// this much, so a younger backlog counts as caught up (`ORCH_CONNECT_OFFSET_FLUSH_MS`).
+    pub connect_offset_flush_ms: i64,
     /// Copy & Sync timeline (ADR 0009): keep events this many days (ORCH_TOOL_EVENTS_RETENTION_DAYS).
     pub tool_events_retention_days: u32,
     /// …and at most this many rows (ORCH_TOOL_EVENTS_MAX_ROWS).
@@ -341,6 +352,36 @@ impl AppConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(200_000)
             .max(1_000);
+        let secret_key = match env::var("ORCH_SECRET_KEY") {
+            Ok(v) if !v.trim().is_empty() => match crate::secretbox::SecretKey::parse(&v) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    eprintln!("FATAL: {e}");
+                    std::process::exit(1);
+                }
+            },
+            _ => None,
+        };
+        let public_ui_url = env::var("ORCH_PUBLIC_UI_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+        let latency_sample_secs = env::var("ORCH_LATENCY_SAMPLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15)
+            .clamp(5, 300);
+        let kafka_bootstrap = env::var("ORCH_KAFKA_BOOTSTRAP")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "cdc-message:9092".to_string());
+        let connect_offset_flush_ms = env::var("ORCH_CONNECT_OFFSET_FLUSH_MS")
+            .or_else(|_| env::var("CDC_CONNECT_OFFSET_FLUSH_INTERVAL_MS"))
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(60_000)
+            .max(0);
         let tool_events_retention_days = env::var("ORCH_TOOL_EVENTS_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
@@ -435,6 +476,11 @@ impl AppConfig {
             audit_redis_key,
             audit_redis_max_len,
             audit_rqlite_max_rows,
+            secret_key,
+            public_ui_url,
+            latency_sample_secs,
+            kafka_bootstrap,
+            connect_offset_flush_ms,
             tool_events_retention_days,
             tool_events_max_rows,
             tool_events_poll_secs,

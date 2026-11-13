@@ -1,0 +1,1451 @@
+[
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/capability",
+  "summary": "Connection fields and options the tool accepts",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/contract",
+  "summary": "Tool contract",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/discover",
+  "summary": "Tool discovery",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/jobs",
+  "summary": "List jobs",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/jobs/{job_id}",
+  "summary": "Get one job",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/jobs/{job_id}/logs",
+  "summary": "Job log output",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/{tool}/jobs/{job_id}/stop",
+  "summary": "Stop a running job",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/profiles",
+  "summary": "List saved tool profiles",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/{tool}/profiles",
+  "summary": "Save a tool profile",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/{tool}/profiles/{id}",
+  "summary": "Delete a tool profile",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/{tool}/profiles/{id}",
+  "summary": "Get a tool profile",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/{tool}/profiles/{id}",
+  "summary": "Replace a tool profile",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/{tool}/profiles/{id}/run",
+  "summary": "Start a job from a saved profile",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/{tool}/test-connection",
+  "summary": "Test a connection from the tool's sidecar",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/{tool}/validate",
+  "summary": "Validate a tool profile without saving (pgcopy, redisshake, mongocopy, pgdump, rsync)",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/acls",
+  "summary": "Delete a Kafka ACL",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/acls",
+  "summary": "List Kafka ACLs",
+  "tag": "Kafka",
+  "query": [
+   "search",
+   "host",
+   "resource"
+  ],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/acls",
+  "summary": "Create a Kafka ACL",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/audit/events",
+  "summary": "Query the sync audit trail (rqlite)",
+  "tag": "Audit",
+  "query": [
+   "action",
+   "profile_id",
+   "outcome",
+   "since",
+   "until"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/brokers",
+  "summary": "List Kafka/Redpanda brokers",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/brokers/{id}",
+  "summary": "Broker detail with disk usage, log directories, and cluster configs",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/brokers/{id}/configs",
+  "summary": "Broker / cluster configuration entries",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/brokers/{id}/configs",
+  "summary": "Update a cluster configuration property",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/brokers/{id}/logdirs",
+  "summary": "Broker log directories (name, error, topics, partitions)",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/brokers/{id}/metrics",
+  "summary": "Broker metrics from Redpanda public_metrics",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/capability",
+  "summary": "Feature capability flags for UI/MCP",
+  "tag": "System",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/cluster",
+  "summary": "Kafka Connect cluster root metadata",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/data/copy",
+  "summary": "One-shot batched copy of tables from source to target",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/compare/profiles",
+  "summary": "List saved schema-compare connection pairs",
+  "tag": "Compare",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/profiles",
+  "summary": "Save a schema-compare connection pair",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/compare/profiles/{id}",
+  "summary": "Delete a saved compare profile",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/compare/profiles/{id}",
+  "summary": "Get a saved compare profile",
+  "tag": "Compare",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/compare/profiles/{id}",
+  "summary": "Replace a saved compare profile",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/schema/counts",
+  "summary": "Row counts for every table in a schema",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/table/count",
+  "summary": "Exact row count for one table",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/table/preview",
+  "summary": "Page through table rows",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/compare/target/exec-ddl",
+  "summary": "Execute one DDL statement on a connection (Schema Compare apply)",
+  "tag": "Compare",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors",
+  "summary": "List connectors (expanded status)",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors",
+  "summary": "Create connector",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/connectors/{name}",
+  "summary": "Delete connector",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors/{name}/{action}",
+  "summary": "pause | resume | restart connector",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/{name}/config",
+  "summary": "Get connector config",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/connectors/{name}/config",
+  "summary": "Replace connector config",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/{name}/status",
+  "summary": "Get connector status",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors/{name}/tasks/{task}/restart",
+  "summary": "Restart a specific connector task",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/{name}/timeline",
+  "summary": "Recent connector state history from watcher transitions",
+  "tag": "Connectors",
+  "query": [
+   "limit"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/{name}/topics",
+  "summary": "Topics a connector has produced to or consumed from",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors/catalog",
+  "summary": "Browse schemas and tables for a source or sink connector",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/plugins",
+  "summary": "List connector plugins installed on the Kafka Connect worker",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors/probe",
+  "summary": "Test database connectivity from a connector name or config",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/connectors/templates",
+  "summary": "Built-in connector config templates for UI quick start",
+  "tag": "Connectors",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/connectors/validate",
+  "summary": "Validate connector config (local checks + Connect plugin validate best-effort)",
+  "tag": "Connectors",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/consumer-groups",
+  "summary": "List consumer groups with pagination and optional search",
+  "tag": "Kafka",
+  "query": [
+   "page",
+   "page_size",
+   "search"
+  ],
+  "write": false
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/consumer-groups/{group}",
+  "summary": "Delete a consumer group",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/consumer-groups/{group}",
+  "summary": "Describe a consumer group (state, members, per-partition lag)",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/consumer-groups/{group}/lag",
+  "summary": "Consumer group lag per partition (alias of /cdc/kafka/groups/{group}/lag)",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/consumer-groups/{group}/reset",
+  "summary": "Reset consumer group offsets (earliest, latest, or timestamp)",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/consumer-groups/{group}/topics/{topic}/offsets",
+  "summary": "Delete a consumer group's committed offsets for one topic",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/engine/down",
+  "summary": "Stop managed containers",
+  "tag": "Engine",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/engine/restart",
+  "summary": "Restart managed containers",
+  "tag": "Engine",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/engine/status",
+  "summary": "List container engine service states",
+  "tag": "Engine",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/engine/up",
+  "summary": "Start managed containers",
+  "tag": "Engine",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/kafka/groups",
+  "summary": "List consumer groups",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/kafka/groups/{group}/lag",
+  "summary": "Describe consumer group lag",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/kafka/topics",
+  "summary": "List Redpanda/Kafka topics",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ksqldb/drop",
+  "summary": "Drop a ksqlDB stream or table",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ksqldb/explain/{query_id}",
+  "summary": "Explain a persistent ksqlDB query",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ksqldb/info",
+  "summary": "ksqlDB server info",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ksqldb/queries",
+  "summary": "List ksqlDB persistent queries",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ksqldb/query",
+  "summary": "Execute a ksqlDB statement or query",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ksqldb/streams",
+  "summary": "List ksqlDB streams",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ksqldb/tables",
+  "summary": "List ksqlDB tables",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ksqldb/terminate",
+  "summary": "Terminate a persistent ksqlDB query",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/latency",
+  "summary": "Current latency of every sampled pipeline (ADR 0016)",
+  "tag": "Pipelines",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/logs",
+  "summary": "List logical log services → containers",
+  "tag": "Logs",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/logs/{service}",
+  "summary": "Snapshot container logs",
+  "tag": "Logs",
+  "query": [
+   "tail"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/logs/{service}/stream",
+  "summary": "SSE stream of container logs",
+  "tag": "Logs",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/logs/loggers",
+  "summary": "List Kafka Connect runtime loggers",
+  "tag": "Logs",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/logs/loggers/{logger}",
+  "summary": "Update a Kafka Connect runtime logger level",
+  "tag": "Logs",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/metrics",
+  "summary": "Prometheus metrics",
+  "tag": "Observability",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/migration-tools/{tool}/contract",
+  "summary": "Tool contract (same as /cdc/{tool}/contract)",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/migration-tools/{tool}/discover",
+  "summary": "Tool discovery (same as /cdc/{tool}/discover)",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/migration-tools/discover",
+  "summary": "Discover enabled one-shot migration tools (pgcopy, pgloader, redisshake, mongocopy, pgdump, rsync)",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/channels",
+  "summary": "List notification channels (secrets redacted as ********)",
+  "tag": "Notifications",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/notifications/channels",
+  "summary": "Create notification channel",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/notifications/channels/{id}",
+  "summary": "Delete notification channel",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/channels/{id}",
+  "summary": "Get notification channel (secrets redacted)",
+  "tag": "Notifications",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/notifications/channels/{id}",
+  "summary": "Update notification channel",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/notifications/channels/{id}/test",
+  "summary": "Send a sample message through a saved channel",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/notifications/channels/test",
+  "summary": "Send a sample message through a draft channel (not saved)",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/deliveries",
+  "summary": "Notification delivery log, newest first",
+  "tag": "Notifications",
+  "query": [
+   "limit",
+   "channel_id",
+   "rule_id",
+   "outcome"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/history",
+  "summary": "Recent in-memory alert history",
+  "tag": "Notifications",
+  "query": [
+   "limit"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/rules",
+  "summary": "List alert rules (DataService keystore)",
+  "tag": "Notifications",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/notifications/rules",
+  "summary": "Create alert rule",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/notifications/rules/{id}",
+  "summary": "Delete alert rule",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/notifications/rules/{id}",
+  "summary": "Get alert rule",
+  "tag": "Notifications",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/notifications/rules/{id}",
+  "summary": "Upsert alert rule",
+  "tag": "Notifications",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/pgdump/jobs/{job_id}",
+  "summary": "Delete a finished pgdump job and its dump file",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/pgdump/jobs/{job_id}",
+  "summary": "Get one pgdump job",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/pgdump/jobs/{job_id}/file",
+  "summary": "Download the pgdump artifact (streamed)",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/pgdump/test-connection",
+  "summary": "Test a Postgres connection from the pgdump sidecar and describe the database",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/pipeline-logs",
+  "summary": "Query pipeline logs across profiles",
+  "tag": "Audit",
+  "query": [
+   "action",
+   "profile_id",
+   "outcome",
+   "level",
+   "phase",
+   "since",
+   "until"
+  ],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/processing-pipelines",
+  "summary": "List Kafka-native processing pipelines",
+  "tag": "Processing",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/processing-pipelines",
+  "summary": "Register a processing pipeline",
+  "tag": "Processing",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/processing-pipelines/{id}",
+  "summary": "Delete a processing pipeline",
+  "tag": "Processing",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/processing-pipelines/{id}",
+  "summary": "Get a processing pipeline",
+  "tag": "Processing",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/processing-pipelines/{id}",
+  "summary": "Update a processing pipeline",
+  "tag": "Processing",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/processing-pipelines/validate",
+  "summary": "Validate a processing pipeline without saving it",
+  "tag": "Processing",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles",
+  "summary": "List CDC profiles",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles",
+  "summary": "Create CDC profile",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/profiles/{id}",
+  "summary": "Delete profile",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}",
+  "summary": "Get profile",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/profiles/{id}",
+  "summary": "Update profile",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/actions/{action}",
+  "summary": "start | pause | resume | restart | stop | resync (reconciles Kafka Connect)",
+  "tag": "Profiles",
+  "query": [
+   "row_limit",
+   "clear_target"
+  ],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/dlq",
+  "summary": "Get the managed sink DLQ topic and current message count",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/duplicate",
+  "summary": "Copy a pipeline as a new Draft under a new name (original untouched)",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/enable",
+  "summary": "Enable/disable profile (enable reconciles Connect)",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/profiles/{id}/initial-load",
+  "summary": "Cancel a running initial load",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/initial-load",
+  "summary": "Progress of the latest initial load",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/initial-load",
+  "summary": "Start a background initial load (streaming copy of every source row)",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/investigate",
+  "summary": "One-shot triage bundle (connector status, offsets, history, recent audit)",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/latency",
+  "summary": "Latency history of one pipeline",
+  "tag": "Pipelines",
+  "query": [
+   "range"
+  ],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/profiles/{id}/latency-probe",
+  "summary": "Turn the heartbeat latency probe on or off",
+  "tag": "Pipelines",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/logs",
+  "summary": "Pipeline log entries for one profile",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/position",
+  "summary": "Configured start position and the source position last committed",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/record-diff",
+  "summary": "Record diff jobs of this pipeline, newest first",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/record-diff",
+  "summary": "Start a record diff of one table (source vs target, by key)",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/profiles/{id}/record-diff/{job_id}",
+  "summary": "Delete a finished record diff and its result files",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/record-diff/{job_id}",
+  "summary": "Status, plan, progress and counts of one record diff",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/record-diff/{job_id}/cancel",
+  "summary": "Cancel a queued or running record diff",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/record-diff/{job_id}/download",
+  "summary": "Download every row of one result kind (streamed)",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/record-diff/{job_id}/rows",
+  "summary": "One page of a succeeded diff's results",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/reposition",
+  "summary": "Move a running log-based pipeline to another source position",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/split",
+  "summary": "Move some tables into a new Draft pipeline with the same source and target",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/tables/sync-status",
+  "summary": "Per-table source / Kafka / target counts and approximate lag",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/cases",
+  "summary": "Create profile from case template",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/source",
+  "summary": "Browse live schemas and tables from a source connection",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/source/table",
+  "summary": "Inspect source table structure, keys, and sample rows",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/source/triggers",
+  "summary": "Create changelog triggers on selected source tables",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/source/triggers/preview",
+  "summary": "Preview changelog CREATE TRIGGER SQL without installing",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/source/triggers/status",
+  "summary": "List changelog triggers on a PostgreSQL source",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/target",
+  "summary": "Browse live schemas and tables from a target connection",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/target/ddl",
+  "summary": "Create target tables (mapping step \"Create table\")",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/catalog/target/table",
+  "summary": "Inspect target table structure, keys, and sample rows",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/validate/lake",
+  "summary": "Validate a lakehouse destination (object storage + catalog)",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/validate/source",
+  "summary": "Validate source connection",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/profiles/validate/target",
+  "summary": "Validate target connection",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/rsync/jobs/{job_id}",
+  "summary": "Delete a finished rsync job record",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/rsync/jobs/{job_id}",
+  "summary": "Get one rsync job",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/rsync/profiles/{id}/run",
+  "summary": "Run (or preview) an rsync profile",
+  "tag": "Migration Tools",
+  "query": [
+   "dry_run"
+  ],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/rsync/staging",
+  "summary": "Relay staging copies on the rsync sidecar",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/rsync/staging/{id}",
+  "summary": "Free a profile's relay staging copy",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/rsync/test-connection",
+  "summary": "Log in to an SSH host from the rsync sidecar and describe it",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/rsync/test-route",
+  "summary": "Check whether a sync would run direct (source → target) or fall back to relay",
+  "tag": "Migration Tools",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/schedule",
+  "summary": "Schedule overview — interval and next run per pipeline",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/schemas",
+  "summary": "List Schema Registry subjects",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/schemas",
+  "summary": "Publish a schema (Avro, JSON Schema, or Protobuf)",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/schemas/{subject}",
+  "summary": "Delete a schema subject",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/schemas/{subject}",
+  "summary": "Get a schema subject version",
+  "tag": "Kafka",
+  "query": [
+   "version"
+  ],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/schemas/{subject}",
+  "summary": "Add a new schema version",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/schemas/{subject}/compatibility",
+  "summary": "Test a candidate schema against the subject's compatibility rule",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/schemas/{subject}/compatibility",
+  "summary": "Set the subject's compatibility level",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/schemas/{subject}/versions/{version}",
+  "summary": "Delete one schema version from a subject",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/topics",
+  "summary": "List topics with pagination, search, sort, and Kafka metadata",
+  "tag": "Kafka",
+  "query": [
+   "page",
+   "page_size",
+   "search",
+   "hide_internal",
+   "summary",
+   "sort_by",
+   "sort_order"
+  ],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/topics",
+  "summary": "Create a Kafka topic",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/topics/{topic}",
+  "summary": "Delete a Kafka topic",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/topics/{topic}/clear-messages",
+  "summary": "Clear all messages from a topic (DELETE cleanup policy only)",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/topics/{topic}/configs",
+  "summary": "Alter topic configs",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/topics/{topic}/copy",
+  "summary": "Copy topic configuration to a new topic",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/topics/{topic}/messages",
+  "summary": "Sample messages from a topic (bounded)",
+  "tag": "Kafka",
+  "query": [
+   "limit",
+   "offset",
+   "partition",
+   "include_meta",
+   "mode",
+   "q"
+  ],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/topics/{topic}/messages",
+  "summary": "Produce a message to a topic",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/topics/{topic}/metadata",
+  "summary": "Topic metadata, partition summary, and configs",
+  "tag": "Kafka",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/topics/{topic}/recreate",
+  "summary": "Recreate a Kafka topic with the same partitions, replication, and core configs",
+  "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ws/alerts",
+  "summary": "WebSocket live alerts",
+  "tag": "Notifications",
+  "query": [],
+  "write": false
+ }
+]

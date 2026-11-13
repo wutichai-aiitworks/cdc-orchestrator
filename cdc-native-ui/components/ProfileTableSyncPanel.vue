@@ -1052,7 +1052,7 @@ defineExpose({ refresh, data, loading })
         <div class="flex flex-wrap items-center gap-3">
           <label class="flex items-center gap-2 text-muted-foreground">
             Rows per page
-            <select v-model.number="pageSize" class="auth-input h-8 w-20 py-0">
+            <select v-model.number="pageSize" class="auth-input h-8 w-24 py-0">
               <option v-for="n in PAGE_SIZES" :key="n" :value="n">{{ n }}</option>
             </select>
           </label>

@@ -96,7 +96,11 @@ pub async fn list_topics_paged(
     State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,
 ) -> Result<Json<PagedTopicsResponse>, AppError> {
-    let mut items = load_topics(&state).await?;
+    let mut items = if query.summary.unwrap_or(false) {
+        parse_topic_list(&rpk(&state, &["topic", "list", "-i"]).await?)
+    } else {
+        load_topics(&state).await?
+    };
     if let Some(search) = query.search.as_ref().map(|s| s.trim().to_ascii_lowercase()) {
         if !search.is_empty() {
             items.retain(|t| t.name.to_ascii_lowercase().contains(&search));

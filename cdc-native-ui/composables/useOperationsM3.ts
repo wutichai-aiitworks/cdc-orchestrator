@@ -1,3 +1,4 @@
+import type { NotificationChannel, NotificationDelivery } from "~/utils/notificationChannels"
 export type AlertHistoryItem = {
   type?: string
   ts?: string
@@ -120,12 +121,19 @@ export type AlertRule = {
   conditionType: string
   conditionValue?: Record<string, any> | null
   connectorFilter: string
+  /** Legacy (pre-ADR-0015) channel kinds; ignored once channelIds is set. */
   channels: string[]
+  channelIds: string[]
+  cooldownMinutes: number
+  /** Legacy inline webhook; moved to a channel by the orchestrator on startup. */
   webhookUrl?: string | null
   webhookSecret?: string | null
   enabled: boolean
   createdAt?: string | null
 }
+
+export type ChannelList = { items: NotificationChannel[]; secretsAvailable: boolean; timestamp: string }
+export type DeliveryList = { items: NotificationDelivery[]; count: number; timestamp: string }
 
 export const useOperationsM3 = () => {
   const fetchLogServices = () => $fetch<Record<string, { service?: string; container?: string }>>("/api/cdc/logs")
@@ -149,6 +157,19 @@ export const useOperationsM3 = () => {
     })
   const deleteAlertRule = (id: string) =>
     $fetch(`/api/cdc/notifications/rules/${encodeURIComponent(id)}`, { method: "DELETE" })
+  const fetchChannels = () => $fetch<ChannelList>("/api/cdc/notifications/channels")
+  const createChannel = (body: NotificationChannel) =>
+    $fetch<NotificationChannel>("/api/cdc/notifications/channels", { method: "POST", body })
+  const updateChannel = (body: NotificationChannel) =>
+    $fetch<NotificationChannel>(`/api/cdc/notifications/channels/${encodeURIComponent(body.id)}`, { method: "PUT", body })
+  const deleteChannel = (id: string) =>
+    $fetch(`/api/cdc/notifications/channels/${encodeURIComponent(id)}`, { method: "DELETE" })
+  const testChannel = (id: string) =>
+    $fetch<NotificationDelivery>(`/api/cdc/notifications/channels/${encodeURIComponent(id)}/test`, { method: "POST" })
+  const testDraftChannel = (body: NotificationChannel) =>
+    $fetch<NotificationDelivery>("/api/cdc/notifications/channels/test", { method: "POST", body })
+  const fetchDeliveries = (query: { limit?: number; channel_id?: string; rule_id?: string; outcome?: string } = {}) =>
+    $fetch<DeliveryList>("/api/cdc/notifications/deliveries", { query })
   const fetchMetrics = () => $fetch<string>("/api/cdc/metrics", { responseType: "text" })
   const fetchAuditEvents = (query: {
     limit?: number
@@ -206,6 +227,13 @@ export const useOperationsM3 = () => {
     updateLogger,
     fetchAlertHistory,
     fetchAlertRules,
+    fetchChannels,
+    createChannel,
+    updateChannel,
+    deleteChannel,
+    testChannel,
+    testDraftChannel,
+    fetchDeliveries,
     createAlertRule,
     updateAlertRule,
     deleteAlertRule,

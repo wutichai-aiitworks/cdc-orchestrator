@@ -45,6 +45,7 @@ import type {
   TableMapping,
   TablePollRule,
 } from "~/composables/useProfilesM3"
+import { latencySortValue, type LatencyCurrent } from "~/utils/latency"
 import { formatApiError } from "~/utils/apiError"
 import { DB_TYPE_OPTIONS, dbIconPath } from "~/utils/dbIcon"
 
@@ -551,7 +552,7 @@ onMounted(() => {
 })
 watch(pipelineViewMode, (mode) => setPref("pipelines.viewMode", mode))
 /** List sort: column + direction; `null` keeps the API order (newest first). */
-type PipelineSortKey = "name" | "capture" | "pattern"
+type PipelineSortKey = "name" | "capture" | "pattern" | "latency"
 const pipelineSortKey = ref<PipelineSortKey | null>(null)
 const pipelineSortDir = ref<"asc" | "desc">("asc")
 const mappingBulkSchema = ref("")
@@ -1446,8 +1447,20 @@ const load = async () => {
   }
 }
 
+const { fetchLatency } = useLatency()
+const latencyById = ref(new Map<string, LatencyCurrent>())
+const refreshLatency = async () => {
+  try {
+    const res = await fetchLatency()
+    latencyById.value = new Map(res.items.map((l) => [l.profile_id, l]))
+  } catch {
+    // Latency is decoration on this page; the status poll reports real errors.
+  }
+}
+
 const refreshPipelineStatuses = async () => {
   if (editing.value || document.hidden) return
+  void refreshLatency()
   try {
     profiles.value = await fetchProfiles()
   } catch {
@@ -2090,6 +2103,8 @@ const pipelineSortValue = (profile: CdcProfile, key: PipelineSortKey) => {
       return captureModeLabel(profile)
     case "pattern":
       return patternLabel(profile)
+    case "latency":
+      return ""
   }
 }
 
@@ -2130,6 +2145,18 @@ const filteredProfiles = computed(() => {
     return haystack.includes(query)
   })
   if (!key) return matches
+  if (key === "latency") {
+    // Numeric; pipelines without a measurement sort last in both directions.
+    const v = (p: CdcProfile) => latencySortValue(latencyById.value.get(p.id))
+    return [...matches].sort((a, b) => {
+      const x = v(a)
+      const y = v(b)
+      if (x === null && y === null) return collator.compare(a.name || "", b.name || "")
+      if (x === null) return 1
+      if (y === null) return -1
+      return (x - y) * dir
+    })
+  }
   // Stable: equal keys keep the API order, and ties on capture/pattern fall back to name.
   return [...matches].sort((a, b) => {
     const primary = collator.compare(pipelineSortValue(a, key), pipelineSortValue(b, key))
@@ -2419,6 +2446,7 @@ const onDetailAction = (action: PipelineDetailAction) => {
 
 onMounted(() => {
   void load()
+  void refreshLatency()
   statusPollTimer = setInterval(() => void refreshPipelineStatuses(), 5000)
 })
 onUnmounted(() => {
@@ -3726,6 +3754,7 @@ onUnmounted(() => {
                     { key: null, label: 'Source → target' },
                     { key: 'capture', label: 'Capture' },
                     { key: 'pattern', label: 'Pattern' },
+                    { key: 'latency', label: 'Latency' },
                   ] as Array<{ key: PipelineSortKey | null; label: string }>)"
                   :key="col.label"
                   :aria-sort="col.key ? pipelineAriaSort(col.key) : undefined"
@@ -3798,6 +3827,10 @@ onUnmounted(() => {
                 </td>
                 <td>{{ captureModeLabel(profile) }}</td>
                 <td>{{ patternLabel(profile) }}</td>
+                <td>
+                  <LatencyChip v-if="profile.status === 'running'" :latency="latencyById.get(profile.id)" />
+                  <span v-else class="text-xs text-muted-foreground">—</span>
+                </td>
                 <td><AppStatusBadge :status="profile.status" /></td>
                 <td>
                   <div class="flex items-center justify-end gap-1" @click.stop>
@@ -3844,6 +3877,7 @@ onUnmounted(() => {
               :route="pipelineRoute(profile)"
               :capture="captureModeLabel(profile)"
               :pattern="patternLabel(profile)"
+              :latency="latencyById.get(profile.id)"
               @select="selectPipeline(profile.id)"
               @edit="openEdit(profile)"
               @delete="pendingDelete = profile"
@@ -3882,6 +3916,7 @@ onUnmounted(() => {
                 :route="pipelineRoute(profile)"
                 :capture="captureModeLabel(profile)"
                 :pattern="patternLabel(profile)"
+              :latency="latencyById.get(profile.id)"
                 @select="selectPipeline(profile.id)"
                 @edit="openEdit(profile)"
                 @delete="pendingDelete = profile"
@@ -3917,6 +3952,7 @@ onUnmounted(() => {
                   :route="pipelineRoute(profile)"
                   :capture="captureModeLabel(profile)"
                   :pattern="patternLabel(profile)"
+              :latency="latencyById.get(profile.id)"
                   @select="selectPipeline(profile.id)"
                   @edit="openEdit(profile)"
                   @delete="pendingDelete = profile"

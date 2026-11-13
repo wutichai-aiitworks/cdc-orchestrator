@@ -402,6 +402,7 @@ mod tests {
                 incrementing_column: None,
                 upsert_key_columns: vec![],
                 table_poll: vec![],
+                start_position: Default::default(),
             },
             target: None,
             lake: Some(LakeDestination {
@@ -440,6 +441,7 @@ mod tests {
             tags: vec![],
             connector_name: None,
             sink_connector_name: None,
+            latency_probe: Default::default(),
         }
     }
 

@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use uuid::Uuid;
 
-use crate::clients::JdbcAdminClient;
+use crate::clients::{JdbcAdminClient, TableRowStream};
 use crate::error::AppError;
 use crate::models::{
     CdcProfile, ProfilePattern, SchemaSelectionMode, SourceTableColumn, TableMapping,
@@ -797,105 +797,8 @@ pub fn plan_columns(
             resolved.target_schema, resolved.target_table
         )));
     }
-    let src_name = |name: &str| {
-        src_cols
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
-            .map(|c| c.name.clone())
-    };
-    let tgt_name = |name: &str| {
-        tgt_cols
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
-            .map(|c| c.name.clone())
-    };
-
-    // Source column → (target column, has transform), from the mapping when it renames.
-    let mapped: HashMap<String, (String, bool)> = resolved
-        .mapping
-        .as_ref()
-        .filter(|m| !m.identical)
-        .map(|m| {
-            m.columns
-                .iter()
-                .filter(|c| c.effective_sources().len() == 1 && !c.target.trim().is_empty())
-                .map(|c| {
-                    (
-                        c.effective_sources()[0].trim().to_ascii_lowercase(),
-                        (
-                            c.target.trim().to_string(),
-                            c.transform.as_deref().is_some_and(|t| !t.trim().is_empty()),
-                        ),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let to_target = |src: &str| -> Option<(String, bool)> {
-        match mapped.get(&src.to_ascii_lowercase()) {
-            Some((t, transformed)) => tgt_name(t).map(|t| (t, *transformed)),
-            None => tgt_name(src).map(|t| (t, false)),
-        }
-    };
-    let to_source = |tgt: &str| -> Option<String> {
-        mapped
-            .iter()
-            .find(|(_, (t, _))| t.eq_ignore_ascii_case(tgt))
-            .and_then(|(s, _)| src_name(s))
-            .or_else(|| src_name(tgt))
-    };
-
-    // Key columns, as source names.
-    let requested = clean(&request.key_columns);
-    let mapping_pk: Vec<String> = resolved
-        .mapping
-        .as_ref()
-        .map(|m| clean(&m.pk_columns))
-        .unwrap_or_default();
-    let (key_source, src_keys): (&str, Vec<String>) = if !requested.is_empty() {
-        let keys = requested
-            .iter()
-            .map(|k| {
-                src_name(k).ok_or_else(|| {
-                    AppError::BadRequest(format!("key column '{k}' is not a source column"))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ("request", keys)
-    } else if !mapping_pk.is_empty() {
-        let keys = mapping_pk
-            .iter()
-            .map(|k| {
-                to_source(k).ok_or_else(|| {
-                    AppError::BadRequest(format!(
-                        "mapping key column '{k}' has no matching source column"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ("mapping", keys)
-    } else if !src_pk.is_empty() {
-        (
-            "source_pk",
-            src_pk.iter().filter_map(|k| src_name(k)).collect(),
-        )
-    } else if !tgt_pk.is_empty() {
-        let keys = tgt_pk
-            .iter()
-            .map(|k| {
-                to_source(k).ok_or_else(|| {
-                    AppError::BadRequest(format!(
-                        "target primary-key column '{k}' has no matching source column"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ("target_pk", keys)
-    } else {
-        return Err(AppError::BadRequest(
-            "neither table has a primary key — choose the key column(s) to compare by".into(),
-        ));
-    };
+    let map = ColumnMap::new(resolved, src_cols, tgt_cols);
+    let (key_source, src_keys) = choose_keys(&map, resolved, request, src_pk, tgt_pk)?;
     let mut seen = HashSet::new();
     let src_keys: Vec<String> = src_keys
         .into_iter()
@@ -904,77 +807,16 @@ pub fn plan_columns(
     if src_keys.is_empty() {
         return Err(AppError::BadRequest("no key columns to compare by".into()));
     }
-    let mut tgt_keys = Vec::with_capacity(src_keys.len());
-    for k in &src_keys {
-        match to_target(k) {
-            Some((_, true)) => {
-                return Err(AppError::BadRequest(format!(
-                    "key column '{k}' is transformed on its way to the target; keys must be copied as-is"
-                )))
-            }
-            Some((t, false)) => tgt_keys.push(t),
-            None => {
-                return Err(AppError::BadRequest(format!(
-                    "key column '{k}' has no matching target column"
-                )))
-            }
-        }
-    }
+    let tgt_keys = src_keys
+        .iter()
+        .map(|k| target_key(&map, k))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Compared columns.
-    let mut warnings = Vec::new();
-    let mut src_compare = Vec::new();
-    let mut tgt_compare = Vec::new();
-    let is_key = |c: &str| src_keys.iter().any(|k| k.eq_ignore_ascii_case(c));
-    if request.compare_all_columns {
-        let mut ordered: Vec<&SourceTableColumn> = src_cols.iter().collect();
-        ordered.sort_by_key(|c| c.position);
-        for col in ordered {
-            if is_key(&col.name) {
-                continue;
-            }
-            match to_target(&col.name) {
-                Some((_, true)) => warnings.push(format!(
-                    "{} skipped: transformed on its way to the target",
-                    col.name
-                )),
-                Some((t, false)) => {
-                    src_compare.push(col.name.clone());
-                    tgt_compare.push(t);
-                }
-                None => warnings.push(format!("{} skipped: no matching target column", col.name)),
-            }
-        }
+    let compared = if request.compare_all_columns {
+        compare_all_columns(&map, &src_keys)
     } else {
-        for c in clean(&request.compare_columns) {
-            let s = src_name(&c).ok_or_else(|| {
-                AppError::BadRequest(format!("compare column '{c}' is not a source column"))
-            })?;
-            if is_key(&s)
-                || src_compare
-                    .iter()
-                    .any(|x: &String| x.eq_ignore_ascii_case(&s))
-            {
-                continue;
-            }
-            match to_target(&s) {
-                Some((t, transformed)) => {
-                    if transformed {
-                        warnings.push(format!(
-                            "{s} is transformed on its way to the target; expect value differences"
-                        ));
-                    }
-                    src_compare.push(s);
-                    tgt_compare.push(t);
-                }
-                None => {
-                    return Err(AppError::BadRequest(format!(
-                        "compare column '{c}' has no matching target column"
-                    )))
-                }
-            }
-        }
-    }
+        compare_requested_columns(&map, &request.compare_columns, &src_keys)?
+    };
 
     Ok(DiffPlan {
         source_schema: resolved.source_schema.clone(),
@@ -984,10 +826,222 @@ pub fn plan_columns(
         key_source: key_source.to_string(),
         source_key_columns: src_keys,
         target_key_columns: tgt_keys,
-        source_compare_columns: src_compare,
-        target_compare_columns: tgt_compare,
-        warnings,
+        source_compare_columns: compared.source,
+        target_compare_columns: compared.target,
+        warnings: compared.warnings,
     })
+}
+
+/// Name lookups across the two tables, following the mapping's renames.
+struct ColumnMap<'a> {
+    src_cols: &'a [SourceTableColumn],
+    tgt_cols: &'a [SourceTableColumn],
+    /// Lowercase source column → (target column, has transform), when the mapping renames.
+    mapped: HashMap<String, (String, bool)>,
+}
+
+impl<'a> ColumnMap<'a> {
+    fn new(
+        resolved: &ResolvedTable,
+        src_cols: &'a [SourceTableColumn],
+        tgt_cols: &'a [SourceTableColumn],
+    ) -> Self {
+        let mapped = resolved
+            .mapping
+            .as_ref()
+            .filter(|m| !m.identical)
+            .map(|m| {
+                m.columns
+                    .iter()
+                    .filter(|c| c.effective_sources().len() == 1 && !c.target.trim().is_empty())
+                    .map(|c| {
+                        let transformed =
+                            c.transform.as_deref().is_some_and(|t| !t.trim().is_empty());
+                        (
+                            c.effective_sources()[0].trim().to_ascii_lowercase(),
+                            (c.target.trim().to_string(), transformed),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            src_cols,
+            tgt_cols,
+            mapped,
+        }
+    }
+
+    fn find(cols: &[SourceTableColumn], name: &str) -> Option<String> {
+        cols.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+            .map(|c| c.name.clone())
+    }
+
+    fn src_name(&self, name: &str) -> Option<String> {
+        Self::find(self.src_cols, name)
+    }
+
+    /// Target column for a source column, and whether the mapping transforms it.
+    fn to_target(&self, src: &str) -> Option<(String, bool)> {
+        match self.mapped.get(&src.to_ascii_lowercase()) {
+            Some((t, transformed)) => Self::find(self.tgt_cols, t).map(|t| (t, *transformed)),
+            None => Self::find(self.tgt_cols, src).map(|t| (t, false)),
+        }
+    }
+
+    fn to_source(&self, tgt: &str) -> Option<String> {
+        self.mapped
+            .iter()
+            .find(|(_, (t, _))| t.eq_ignore_ascii_case(tgt))
+            .and_then(|(s, _)| self.src_name(s))
+            .or_else(|| self.src_name(tgt))
+    }
+
+    /// Source names for `names`, or an error naming the first one without a match.
+    fn resolve_all(
+        &self,
+        names: &[String],
+        lookup: impl Fn(&Self, &str) -> Option<String>,
+        what: &str,
+        missing: &str,
+    ) -> Result<Vec<String>, AppError> {
+        names
+            .iter()
+            .map(|k| {
+                lookup(self, k)
+                    .ok_or_else(|| AppError::BadRequest(format!("{what} '{k}' {missing}")))
+            })
+            .collect()
+    }
+}
+
+/// Key columns as source names, and where they came from: the request, the mapping, the
+/// source primary key, then the target primary key.
+fn choose_keys(
+    map: &ColumnMap,
+    resolved: &ResolvedTable,
+    request: &RecordDiffRequest,
+    src_pk: &[String],
+    tgt_pk: &[String],
+) -> Result<(&'static str, Vec<String>), AppError> {
+    let requested = clean(&request.key_columns);
+    if !requested.is_empty() {
+        let keys = map.resolve_all(
+            &requested,
+            ColumnMap::src_name,
+            "key column",
+            "is not a source column",
+        )?;
+        return Ok(("request", keys));
+    }
+    let mapping_pk: Vec<String> = resolved
+        .mapping
+        .as_ref()
+        .map(|m| clean(&m.pk_columns))
+        .unwrap_or_default();
+    if !mapping_pk.is_empty() {
+        let keys = map.resolve_all(
+            &mapping_pk,
+            ColumnMap::to_source,
+            "mapping key column",
+            "has no matching source column",
+        )?;
+        return Ok(("mapping", keys));
+    }
+    if !src_pk.is_empty() {
+        let keys = src_pk.iter().filter_map(|k| map.src_name(k)).collect();
+        return Ok(("source_pk", keys));
+    }
+    if !tgt_pk.is_empty() {
+        let keys = map.resolve_all(
+            tgt_pk,
+            ColumnMap::to_source,
+            "target primary-key column",
+            "has no matching source column",
+        )?;
+        return Ok(("target_pk", keys));
+    }
+    Err(AppError::BadRequest(
+        "neither table has a primary key — choose the key column(s) to compare by".into(),
+    ))
+}
+
+/// Target column for a key; keys must be copied as-is.
+fn target_key(map: &ColumnMap, k: &str) -> Result<String, AppError> {
+    match map.to_target(k) {
+        Some((_, true)) => Err(AppError::BadRequest(format!(
+            "key column '{k}' is transformed on its way to the target; keys must be copied as-is"
+        ))),
+        Some((t, false)) => Ok(t),
+        None => Err(AppError::BadRequest(format!(
+            "key column '{k}' has no matching target column"
+        ))),
+    }
+}
+
+#[derive(Default)]
+struct Compared {
+    source: Vec<String>,
+    target: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn is_key(keys: &[String], c: &str) -> bool {
+    keys.iter().any(|k| k.eq_ignore_ascii_case(c))
+}
+
+/// Every non-key source column with an untransformed target column, in table order.
+fn compare_all_columns(map: &ColumnMap, keys: &[String]) -> Compared {
+    let mut out = Compared::default();
+    let mut ordered: Vec<&SourceTableColumn> = map.src_cols.iter().collect();
+    ordered.sort_by_key(|c| c.position);
+    for col in ordered.into_iter().filter(|c| !is_key(keys, &c.name)) {
+        match map.to_target(&col.name) {
+            Some((_, true)) => out.warnings.push(format!(
+                "{} skipped: transformed on its way to the target",
+                col.name
+            )),
+            Some((t, false)) => {
+                out.source.push(col.name.clone());
+                out.target.push(t);
+            }
+            None => out
+                .warnings
+                .push(format!("{} skipped: no matching target column", col.name)),
+        }
+    }
+    out
+}
+
+/// The requested compare columns (keys and repeats dropped).
+fn compare_requested_columns(
+    map: &ColumnMap,
+    columns: &[String],
+    keys: &[String],
+) -> Result<Compared, AppError> {
+    let mut out = Compared::default();
+    for c in clean(columns) {
+        let s = map.src_name(&c).ok_or_else(|| {
+            AppError::BadRequest(format!("compare column '{c}' is not a source column"))
+        })?;
+        if is_key(keys, &s) || is_key(&out.source, &s) {
+            continue;
+        }
+        let Some((t, transformed)) = map.to_target(&s) else {
+            return Err(AppError::BadRequest(format!(
+                "compare column '{c}' has no matching target column"
+            )));
+        };
+        if transformed {
+            out.warnings.push(format!(
+                "{s} is transformed on its way to the target; expect value differences"
+            ));
+        }
+        out.source.push(s);
+        out.target.push(t);
+    }
+    Ok(out)
 }
 
 // ── Job runner ───────────────────────────────────────────────────────────────
@@ -1425,65 +1479,10 @@ async fn scan_side(
         )));
     }
     // Disk writes happen on a blocking thread; batches cross a bounded channel.
-    let (tx, mut rx) = mpsc::channel::<Vec<Vec<Value>>>(4);
-    let writer = tokio::task::spawn_blocking(move || -> Result<ScanResult, AppError> {
-        fs::create_dir_all(&dir).map_err(|e| io_err("create bucket dir", e))?;
-        let mut files = (0..buckets)
-            .map(|b| {
-                File::create(dir.join(format!("{b:04}.ndjson")))
-                    .map(|f| BufWriter::with_capacity(16 * 1024, f))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io_err("create bucket", e))?;
-        let mut result = ScanResult {
-            rows: 0,
-            null_keys: 0,
-        };
-        while let Some(batch) = rx.blocking_recv() {
-            for row in batch {
-                result.rows += 1;
-                let raw: Vec<Option<String>> = row.iter().map(as_text).collect();
-                let (key_raw, values) = raw.split_at(key_len.min(raw.len()));
-                let Some(key) = norm.key(key_raw) else {
-                    result.null_keys += 1;
-                    continue;
-                };
-                let b = bucket_of(&key, buckets);
-                let line =
-                    serde_json::to_string(&BucketRow(key, key_raw.to_vec(), values.to_vec()))
-                        .map_err(|e| AppError::Internal(format!("record diff encode: {e}")))?;
-                files[b]
-                    .write_all(line.as_bytes())
-                    .and_then(|_| files[b].write_all(b"\n"))
-                    .map_err(|e| io_err("write bucket", e))?;
-            }
-        }
-        for f in &mut files {
-            f.flush().map_err(|e| io_err("flush bucket", e))?;
-        }
-        Ok(result)
-    });
-
-    let mut read_err = None;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            read_err = Some(AppError::BadRequest("record diff cancelled".into()));
-            break;
-        }
-        match stream.next_batch(SCAN_BATCH).await {
-            Ok(rows) if rows.is_empty() => break,
-            Ok(rows) => {
-                read.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                if tx.send(rows).await.is_err() {
-                    break; // writer failed; its error is reported below
-                }
-            }
-            Err(e) => {
-                read_err = Some(e);
-                break;
-            }
-        }
-    }
+    let (tx, rx) = mpsc::channel::<Vec<Vec<Value>>>(4);
+    let writer =
+        tokio::task::spawn_blocking(move || write_buckets(rx, &dir, buckets, key_len, norm));
+    let read_err = pump_batches(&mut stream, &tx, read, cancel).await;
     drop(tx);
     let written = writer
         .await
@@ -1494,10 +1493,80 @@ async fn scan_side(
     }
 }
 
+/// Reads the stream into `tx` until it ends, the job is cancelled or the writer goes away.
+/// Returns the read error (or cancellation), if any.
+async fn pump_batches(
+    stream: &mut TableRowStream,
+    tx: &mpsc::Sender<Vec<Vec<Value>>>,
+    read: &AtomicU64,
+    cancel: &AtomicBool,
+) -> Option<AppError> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Some(AppError::BadRequest("record diff cancelled".into()));
+        }
+        let rows = match stream.next_batch(SCAN_BATCH).await {
+            Ok(rows) if rows.is_empty() => return None,
+            Ok(rows) => rows,
+            Err(e) => return Some(e),
+        };
+        read.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        if tx.send(rows).await.is_err() {
+            return None; // writer failed; its error is reported by the caller
+        }
+    }
+}
+
+/// Blocking: hashes each received row into one of `buckets` NDJSON files under `dir`.
+fn write_buckets(
+    mut rx: mpsc::Receiver<Vec<Vec<Value>>>,
+    dir: &Path,
+    buckets: usize,
+    key_len: usize,
+    norm: Normalizer,
+) -> Result<ScanResult, AppError> {
+    fs::create_dir_all(dir).map_err(|e| io_err("create bucket dir", e))?;
+    let mut files = (0..buckets)
+        .map(|b| {
+            File::create(dir.join(format!("{b:04}.ndjson")))
+                .map(|f| BufWriter::with_capacity(16 * 1024, f))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io_err("create bucket", e))?;
+    let mut result = ScanResult {
+        rows: 0,
+        null_keys: 0,
+    };
+    while let Some(batch) = rx.blocking_recv() {
+        for row in batch {
+            result.rows += 1;
+            let raw: Vec<Option<String>> = row.iter().map(as_text).collect();
+            let (key_raw, values) = raw.split_at(key_len.min(raw.len()));
+            let Some(key) = norm.key(key_raw) else {
+                result.null_keys += 1;
+                continue;
+            };
+            let b = bucket_of(&key, buckets);
+            let line = serde_json::to_string(&BucketRow(key, key_raw.to_vec(), values.to_vec()))
+                .map_err(|e| AppError::Internal(format!("record diff encode: {e}")))?;
+            write_line(&mut files[b], &line).map_err(|e| io_err("write bucket", e))?;
+        }
+    }
+    for f in &mut files {
+        f.flush().map_err(|e| io_err("flush bucket", e))?;
+    }
+    Ok(result)
+}
+
+fn write_line(w: &mut BufWriter<File>, line: &str) -> std::io::Result<()> {
+    w.write_all(line.as_bytes())?;
+    w.write_all(b"\n")
+}
+
 // ── Compare ──────────────────────────────────────────────────────────────────
 
 /// Candidate line written by compare: raw keys of both sides plus raw values.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Candidate {
     /// Raw key (canonical, before options) from the side the row was found on.
     key: Vec<Option<String>>,
@@ -1518,92 +1587,125 @@ fn compare_buckets(
     cancel: &AtomicBool,
     live: &LiveProgress,
 ) -> Result<DiffCounts, AppError> {
-    let open = |kind: DiffKind| -> Result<BufWriter<File>, AppError> {
-        File::create(work.join(cand_file(kind)))
-            .map(BufWriter::new)
-            .map_err(|e| io_err("create candidates", e))
-    };
-    let mut out_src = open(DiffKind::SourceOnly)?;
-    let mut out_tgt = open(DiffKind::TargetOnly)?;
-    let mut out_mis = open(DiffKind::Mismatched)?;
+    let mut out = CandidateWriters::create(work)?;
     let mut counts = DiffCounts::default();
-    let emit = |w: &mut BufWriter<File>, c: &Candidate| -> Result<(), AppError> {
-        let line = serde_json::to_string(c).map_err(|e| AppError::Internal(e.to_string()))?;
-        w.write_all(line.as_bytes())
-            .and_then(|_| w.write_all(b"\n"))
-            .map_err(|e| io_err("write candidates", e))
-    };
-
     for b in 0..buckets {
         cancelled(cancel)?;
-        let src_path = work.join("src").join(format!("{b:04}.ndjson"));
-        let tgt_path = work.join("tgt").join(format!("{b:04}.ndjson"));
-        let mut source: HashMap<String, BucketRow> = HashMap::new();
-        for line in read_lines(&src_path)? {
-            let row: BucketRow = serde_json::from_str(&line.map_err(|e| io_err("read bucket", e))?)
-                .map_err(|e| AppError::Internal(format!("record diff bucket: {e}")))?;
-            if source.contains_key(&row.0) {
-                counts.source_duplicate_keys += 1;
-            } else {
-                source.insert(row.0.clone(), row);
-            }
-        }
-        let mut target_seen: HashSet<String> = HashSet::new();
-        for line in read_lines(&tgt_path)? {
-            let row: BucketRow = serde_json::from_str(&line.map_err(|e| io_err("read bucket", e))?)
-                .map_err(|e| AppError::Internal(format!("record diff bucket: {e}")))?;
-            if !target_seen.insert(row.0.clone()) {
-                counts.target_duplicate_keys += 1;
-                continue;
-            }
-            match source.remove(&row.0) {
-                Some(src) => {
-                    if values_differ(norm, &src.2, &row.2) {
-                        counts.mismatched += 1;
-                        emit(
-                            &mut out_mis,
-                            &Candidate {
-                                key: src.1,
-                                source: src.2,
-                                target: row.2,
-                            },
-                        )?;
-                    } else {
-                        counts.matched += 1;
-                    }
-                }
-                None => {
-                    counts.target_only += 1;
-                    emit(
-                        &mut out_tgt,
-                        &Candidate {
-                            key: row.1,
-                            source: vec![],
-                            target: row.2,
-                        },
-                    )?;
-                }
-            }
-        }
-        for (_, src) in source {
-            counts.source_only += 1;
-            emit(
-                &mut out_src,
-                &Candidate {
-                    key: src.1,
-                    source: src.2,
-                    target: vec![],
-                },
-            )?;
-        }
-        let _ = fs::remove_file(&src_path);
-        let _ = fs::remove_file(&tgt_path);
+        compare_bucket(work, b, norm, &mut counts, &mut out)?;
         live.buckets_done.fetch_add(1, Ordering::Relaxed);
     }
-    for w in [&mut out_src, &mut out_tgt, &mut out_mis] {
-        w.flush().map_err(|e| io_err("flush candidates", e))?;
-    }
+    out.flush()?;
     Ok(counts)
+}
+
+/// Candidate files, one per difference kind.
+struct CandidateWriters {
+    source_only: BufWriter<File>,
+    target_only: BufWriter<File>,
+    mismatched: BufWriter<File>,
+}
+
+impl CandidateWriters {
+    fn create(work: &Path) -> Result<Self, AppError> {
+        let open = |kind: DiffKind| -> Result<BufWriter<File>, AppError> {
+            File::create(work.join(cand_file(kind)))
+                .map(BufWriter::new)
+                .map_err(|e| io_err("create candidates", e))
+        };
+        Ok(Self {
+            source_only: open(DiffKind::SourceOnly)?,
+            target_only: open(DiffKind::TargetOnly)?,
+            mismatched: open(DiffKind::Mismatched)?,
+        })
+    }
+
+    fn emit(&mut self, kind: DiffKind, c: &Candidate) -> Result<(), AppError> {
+        let w = match kind {
+            DiffKind::SourceOnly => &mut self.source_only,
+            DiffKind::TargetOnly => &mut self.target_only,
+            DiffKind::Mismatched => &mut self.mismatched,
+        };
+        let line = serde_json::to_string(c).map_err(|e| AppError::Internal(e.to_string()))?;
+        write_line(w, &line).map_err(|e| io_err("write candidates", e))
+    }
+
+    fn flush(&mut self) -> Result<(), AppError> {
+        for w in [
+            &mut self.source_only,
+            &mut self.target_only,
+            &mut self.mismatched,
+        ] {
+            w.flush().map_err(|e| io_err("flush candidates", e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Compares bucket `b` of both sides, then deletes the bucket files.
+fn compare_bucket(
+    work: &Path,
+    b: usize,
+    norm: Normalizer,
+    counts: &mut DiffCounts,
+    out: &mut CandidateWriters,
+) -> Result<(), AppError> {
+    let src_path = work.join("src").join(format!("{b:04}.ndjson"));
+    let tgt_path = work.join("tgt").join(format!("{b:04}.ndjson"));
+    let mut source: HashMap<String, BucketRow> = HashMap::new();
+    for line in read_lines(&src_path)? {
+        let row = parse_bucket_row(line)?;
+        if source.contains_key(&row.0) {
+            counts.source_duplicate_keys += 1;
+        } else {
+            source.insert(row.0.clone(), row);
+        }
+    }
+    let mut target_seen: HashSet<String> = HashSet::new();
+    for line in read_lines(&tgt_path)? {
+        let row = parse_bucket_row(line)?;
+        if !target_seen.insert(row.0.clone()) {
+            counts.target_duplicate_keys += 1;
+            continue;
+        }
+        let Some(src) = source.remove(&row.0) else {
+            counts.target_only += 1;
+            let c = Candidate {
+                key: row.1,
+                source: vec![],
+                target: row.2,
+            };
+            out.emit(DiffKind::TargetOnly, &c)?;
+            continue;
+        };
+        if !values_differ(norm, &src.2, &row.2) {
+            counts.matched += 1;
+            continue;
+        }
+        counts.mismatched += 1;
+        let c = Candidate {
+            key: src.1,
+            source: src.2,
+            target: row.2,
+        };
+        out.emit(DiffKind::Mismatched, &c)?;
+    }
+    for (_, src) in source {
+        counts.source_only += 1;
+        let c = Candidate {
+            key: src.1,
+            source: src.2,
+            target: vec![],
+        };
+        out.emit(DiffKind::SourceOnly, &c)?;
+    }
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&tgt_path);
+    Ok(())
+}
+
+fn parse_bucket_row(line: std::io::Result<String>) -> Result<BucketRow, AppError> {
+    serde_json::from_str(&line.map_err(|e| io_err("read bucket", e))?)
+        .map_err(|e| AppError::Internal(format!("record diff bucket: {e}")))
 }
 
 fn read_lines(path: &Path) -> Result<std::io::Lines<BufReader<File>>, AppError> {
@@ -1704,85 +1806,102 @@ async fn recheck_kind(
     } else {
         0
     };
-    let plan = ctx.plan;
     let key_names = match kind {
-        DiffKind::TargetOnly => &plan.target_key_columns,
-        _ => &plan.source_key_columns,
+        DiffKind::TargetOnly => &ctx.plan.target_key_columns,
+        _ => &ctx.plan.source_key_columns,
     };
 
     let mut lines = read_lines(candidates)?;
     loop {
         cancelled(ctx.cancel)?;
-        let mut chunk: Vec<Candidate> = Vec::with_capacity(RECHECK_CHUNK);
-        for line in lines.by_ref().take(RECHECK_CHUNK) {
-            let c: Candidate =
-                serde_json::from_str(&line.map_err(|e| io_err("read candidates", e))?)
-                    .map_err(|e| AppError::Internal(format!("record diff candidate: {e}")))?;
-            chunk.push(c);
-        }
+        let chunk = read_candidates(&mut lines)?;
         if chunk.is_empty() {
             break;
         }
         // Only the first `limit` candidates are rechecked.
         let verify_n = (limit.saturating_sub(checked) as usize).min(chunk.len());
         let (verify, rest) = chunk.split_at(verify_n);
-        let mut lines_out: Vec<Value> = Vec::with_capacity(chunk.len());
-
-        if !verify.is_empty() {
-            let keys: Vec<Vec<Option<String>>> = verify.iter().map(|c| c.key.clone()).collect();
-            let (src_now, tgt_now) = tokio::try_join!(
-                lookup_side(ctx, true, &keys),
-                lookup_side(ctx, false, &keys)
-            )?;
-            for c in verify {
-                let Some(k) = ctx.norm.key(&c.key) else {
-                    continue;
-                };
-                let (in_src, in_tgt) = (src_now.get(&k), tgt_now.get(&k));
-                let still = match kind {
-                    DiffKind::SourceOnly => in_src.is_some() && in_tgt.is_none(),
-                    DiffKind::TargetOnly => in_tgt.is_some() && in_src.is_none(),
-                    DiffKind::Mismatched => match (in_src, in_tgt) {
-                        (Some(s), Some(t)) => values_differ(ctx.norm, s, t),
-                        _ => false,
-                    },
-                };
-                if !still {
-                    resolved += 1;
-                    continue;
-                }
-                let fresh = match kind {
-                    DiffKind::Mismatched => Candidate {
-                        key: c.key.clone(),
-                        source: in_src.cloned().unwrap_or_default(),
-                        target: in_tgt.cloned().unwrap_or_default(),
-                    },
-                    _ => Candidate {
-                        key: c.key.clone(),
-                        source: c.source.clone(),
-                        target: c.target.clone(),
-                    },
-                };
-                lines_out.push(result_line(ctx, kind, key_names, &fresh, "confirmed"));
-            }
-            checked += verify.len() as u64;
-            ctx.live
-                .recheck_done
-                .fetch_add(verify.len() as u64, Ordering::Relaxed);
-        }
+        let mut lines_out = verify_candidates(ctx, kind, key_names, verify, &mut resolved).await?;
+        checked += verify.len() as u64;
         for c in rest {
             unverified += 1;
             lines_out.push(result_line(ctx, kind, key_names, c, "unverified"));
         }
         for v in lines_out {
             reported += 1;
-            out.write_all(v.to_string().as_bytes())
-                .and_then(|_| out.write_all(b"\n"))
-                .map_err(|e| io_err("write result", e))?;
+            write_line(&mut out, &v.to_string()).map_err(|e| io_err("write result", e))?;
         }
     }
     out.flush().map_err(|e| io_err("flush result", e))?;
     Ok((reported, resolved, unverified))
+}
+
+/// Up to RECHECK_CHUNK candidates from the candidate file.
+fn read_candidates(
+    lines: &mut std::io::Lines<BufReader<File>>,
+) -> Result<Vec<Candidate>, AppError> {
+    lines
+        .take(RECHECK_CHUNK)
+        .map(|line| {
+            serde_json::from_str(&line.map_err(|e| io_err("read candidates", e))?)
+                .map_err(|e| AppError::Internal(format!("record diff candidate: {e}")))
+        })
+        .collect()
+}
+
+/// Re-reads `verify` on both sides; returns "confirmed" result lines and counts the rest
+/// in `resolved`.
+async fn verify_candidates(
+    ctx: &RecheckCtx<'_>,
+    kind: DiffKind,
+    key_names: &[String],
+    verify: &[Candidate],
+    resolved: &mut u64,
+) -> Result<Vec<Value>, AppError> {
+    let mut lines_out = Vec::with_capacity(verify.len());
+    if verify.is_empty() {
+        return Ok(lines_out);
+    }
+    let keys: Vec<Vec<Option<String>>> = verify.iter().map(|c| c.key.clone()).collect();
+    let (src_now, tgt_now) = tokio::try_join!(
+        lookup_side(ctx, true, &keys),
+        lookup_side(ctx, false, &keys)
+    )?;
+    for c in verify {
+        let Some(k) = ctx.norm.key(&c.key) else {
+            continue;
+        };
+        match still_different(ctx.norm, kind, c, src_now.get(&k), tgt_now.get(&k)) {
+            Some(fresh) => lines_out.push(result_line(ctx, kind, key_names, &fresh, "confirmed")),
+            None => *resolved += 1,
+        }
+    }
+    ctx.live
+        .recheck_done
+        .fetch_add(verify.len() as u64, Ordering::Relaxed);
+    Ok(lines_out)
+}
+
+/// The candidate as it stands now, if the difference is still there.
+fn still_different(
+    norm: Normalizer,
+    kind: DiffKind,
+    c: &Candidate,
+    in_src: Option<&Vec<Option<String>>>,
+    in_tgt: Option<&Vec<Option<String>>>,
+) -> Option<Candidate> {
+    match kind {
+        DiffKind::SourceOnly => (in_src.is_some() && in_tgt.is_none()).then(|| c.clone()),
+        DiffKind::TargetOnly => (in_tgt.is_some() && in_src.is_none()).then(|| c.clone()),
+        DiffKind::Mismatched => {
+            let (s, t) = in_src.zip(in_tgt)?;
+            values_differ(norm, s, t).then(|| Candidate {
+                key: c.key.clone(),
+                source: s.clone(),
+                target: t.clone(),
+            })
+        }
+    }
 }
 
 fn result_line(

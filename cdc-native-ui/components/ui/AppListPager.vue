@@ -29,7 +29,7 @@ watch(totalPages, (pages) => {
       <span>Showing {{ first }}–{{ last }} of {{ total }} {{ noun }}</span>
       <AppSelect
         :model-value="pageSize"
-        class="w-28"
+        class="w-32"
         aria-label="Rows per page"
         @update:model-value="pageSize = Number($event); page = 1"
       >

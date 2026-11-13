@@ -14,11 +14,15 @@ mod initial_load;
 mod kafka_admin;
 mod kafka_topics;
 mod lake;
+mod latency;
+mod latency_handlers;
 mod migration_tools;
 mod migration_tools_handlers;
 mod models;
 mod mongocopy;
 mod mongocopy_handlers;
+mod notification_handlers;
+mod notify;
 mod ops;
 mod pgcopy;
 mod pgcopy_handlers;
@@ -37,7 +41,9 @@ mod rsync;
 mod rsync_handlers;
 mod saved_secret;
 mod schedule;
+mod secretbox;
 mod split;
+mod start_position;
 mod store;
 mod tool_events;
 mod tool_sidecar;
@@ -111,6 +117,10 @@ pub struct AppState {
     /// Pipelines with a lifecycle action (start / resync / …) in flight on this instance.
     /// A second overlapping action is refused with 409 instead of racing the first one.
     pub profile_action_locks: handlers::ProfileActionLocks,
+    /// Notification queue, cooldowns and delivery log (ADR 0015).
+    pub notifier: notify::Notifier,
+    /// Per-pipeline latency samples, probes and alert state (ADR 0016).
+    pub latency: latency::LatencyStore,
 }
 
 async fn open_rqlite(config: &AppConfig) -> Option<RqliteClient> {
@@ -206,6 +216,7 @@ async fn main() {
     let rqlite_for_wireguard = rqlite.clone();
     let record_diffs = record_diff::RecordDiffs::from_env();
     record_diffs.restore().await;
+    let (notifier, notify_rx) = notify::Notifier::new();
     let state = AppState {
         config: config.clone(),
         http: Client::builder()
@@ -235,6 +246,8 @@ async fn main() {
         tool_events_mem: tool_events::MemoryLog::default(),
         wireguard_tunnels: wireguard::TunnelStore::new(rqlite_for_wireguard),
         profile_action_locks: handlers::ProfileActionLocks::default(),
+        notifier,
+        latency: latency::LatencyStore::default(),
     };
 
     let legacy = Router::new()
@@ -353,6 +366,11 @@ async fn main() {
             "/profiles/:id/actions/:action",
             post(handlers::profile_action),
         )
+        .route(
+            "/profiles/:id/reposition",
+            post(handlers::profile_reposition),
+        )
+        .route("/profiles/:id/position", get(handlers::profile_position))
         .route(
             "/profiles/:id/initial-load",
             post(handlers::start_initial_load)
@@ -572,6 +590,11 @@ async fn main() {
             post(handlers::profile_action),
         )
         .route(
+            "/profiles/:id/reposition",
+            post(handlers::profile_reposition),
+        )
+        .route("/profiles/:id/position", get(handlers::profile_position))
+        .route(
             "/profiles/:id/initial-load",
             post(handlers::start_initial_load)
                 .get(handlers::get_initial_load)
@@ -629,6 +652,37 @@ async fn main() {
                 .delete(ops::delete_rule),
         )
         .route("/notifications/history", get(ops::alert_history))
+        .route(
+            "/notifications/channels",
+            get(notification_handlers::list_channels).post(notification_handlers::create_channel),
+        )
+        .route(
+            "/notifications/channels/test",
+            post(notification_handlers::test_draft_channel),
+        )
+        .route(
+            "/notifications/channels/:id",
+            get(notification_handlers::get_channel)
+                .put(notification_handlers::update_channel)
+                .delete(notification_handlers::delete_channel),
+        )
+        .route(
+            "/notifications/channels/:id/test",
+            post(notification_handlers::test_channel),
+        )
+        .route(
+            "/notifications/deliveries",
+            get(notification_handlers::list_deliveries),
+        )
+        .route("/latency", get(latency_handlers::list_latency))
+        .route(
+            "/profiles/:id/latency",
+            get(latency_handlers::profile_latency),
+        )
+        .route(
+            "/profiles/:id/latency-probe",
+            put(latency_handlers::set_latency_probe),
+        )
         .route("/audit/events", get(ops::list_audit_events))
         .route("/tool-events", get(tool_events::list_events))
         .route(
@@ -1033,6 +1087,10 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    // Move pre-ADR-0015 rule webhooks into channels before the watcher can fire.
+    notify::migrate_legacy_rules(&state).await;
+    let _notify_worker = notify::spawn_worker(state.clone(), notify_rx);
+    let _latency = latency::spawn_sampler(state.clone());
     let _watcher = watcher::spawn_watcher(Arc::new(state.clone()));
     let _pruner = watcher::spawn_changelog_pruner(Arc::new(state.clone()));
     let _refresher = watcher::spawn_refresh_scheduler(Arc::new(state.clone()));

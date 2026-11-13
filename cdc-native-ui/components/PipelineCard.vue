@@ -9,6 +9,7 @@ defineProps<{
   capture: string
   pattern: string
   selected?: boolean
+  latency?: import("~/utils/latency").LatencyCurrent | null
 }>()
 
 const emit = defineEmits<{ select: []; edit: []; delete: []; tag: [tag: string] }>()
@@ -27,7 +28,10 @@ const emit = defineEmits<{ select: []; edit: []; delete: []; tag: [tag: string] 
         <p class="truncate font-medium text-foreground" :title="profile.name">{{ profile.name }}</p>
         <p v-if="profile.description" class="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{{ profile.description }}</p>
       </div>
-      <AppStatusBadge :status="profile.status" />
+      <div class="flex shrink-0 flex-col items-end gap-1">
+        <AppStatusBadge :status="profile.status" />
+        <LatencyChip v-if="profile.status === 'running'" :latency="latency" />
+      </div>
     </header>
 
     <div class="flex items-center gap-1.5">

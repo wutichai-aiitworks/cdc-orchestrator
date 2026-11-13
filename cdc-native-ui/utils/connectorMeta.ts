@@ -135,6 +135,30 @@ const parseJdbcUrl = (raw: string) => {
   if (url.startsWith("jdbc:postgresql://")) return hostPath(url.slice("jdbc:postgresql://".length), "postgres", "5432")
   if (url.startsWith("jdbc:mysql://")) return hostPath(url.slice("jdbc:mysql://".length), "mysql", "3306")
   if (url.startsWith("jdbc:mariadb://")) return hostPath(url.slice("jdbc:mariadb://".length), "mariadb", "3306")
+  // Oracle thin: @host:port/service, @//host:port/service, @host:port:SID, or a TNS
+  // descriptor @(DESCRIPTION=...(HOST=h)(PORT=p)...(SERVICE_NAME=s)).
+  if (url.toLowerCase().startsWith("jdbc:oracle:")) {
+    const at = url.indexOf("@")
+    const rest = at >= 0 ? url.slice(at + 1).trim() : ""
+    if (rest.startsWith("(")) {
+      const pick = (key: string) => new RegExp(`\\(${key}\\s*=\\s*([^)\\s]+)\\)`, "i").exec(rest)?.[1] || ""
+      return {
+        databaseType: "oracle" as DatabaseType,
+        host: pick("HOST"),
+        port: pick("PORT") || "1521",
+        database: pick("SERVICE_NAME") || pick("SID"),
+        schema: undefined,
+      }
+    }
+    const m = /^(?:\/\/)?([^:/?]+)(?::(\d+))?(?:[/:]([^?]+))?/.exec(rest)
+    return {
+      databaseType: "oracle" as DatabaseType,
+      host: m?.[1] || "",
+      port: m?.[2] || "1521",
+      database: m?.[3] || "",
+      schema: undefined,
+    }
+  }
   if (url.startsWith("jdbc:sqlserver://")) {
     const rest = url.slice("jdbc:sqlserver://".length)
     const [hostport, params = ""] = rest.split(";", 2)
