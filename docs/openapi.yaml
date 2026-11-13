@@ -404,7 +404,6 @@ paths:
           schema:
             type: boolean
             default: false
-            default: false
         - in: query
           name: sort_by
           schema:
