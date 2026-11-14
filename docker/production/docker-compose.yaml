@@ -1,0 +1,655 @@
+# Hyper CDC — production stack (pull-only, images built and pushed by Woodpecker).
+#
+# Self-contained: this folder is all a production host needs. No `build:` keys and no
+# paths outside this directory, so `up` can never rebuild a local image in place of the
+# digest-pinned release from CI.
+#
+#   .env        config + secrets (from .env.example; never committed)
+#   images.env  release manifest from Woodpecker (.ci-status/images.env, attached to the
+#               Discord release message); every line is <ns>/<image>:<tag>@sha256:<digest>
+#
+# Deploy with ./deploy.sh (preflight → pull → ordered up → health wait). Raw equivalent:
+#   docker compose --env-file .env --env-file images.env pull
+#   docker compose --env-file .env --env-file images.env up -d --no-build
+#
+# Project name must stay `cdc-stack`: the orchestrator filters containers by this compose
+# label, and it keeps volume names (cdc-stack_*) identical to the dev stack so an existing
+# host migrates without losing rqlite / Redpanda / Connect state.
+#
+# Profiles: `agent` = mcp-cdc + cdc-vector. Enabled by COMPOSE_PROFILES=agent in .env.
+name: cdc-stack
+
+networks:
+  server_zone:
+    external: true
+    name: server_zone
+
+volumes:
+  cdc-redpanda-data:
+  cdc-redis-data:
+  cdc-rqlite-data:
+  cdc-mcp-data:
+  cdc-pgcopydb-data:
+  cdc-redisshake-data:
+  cdc-pgloader-data:
+  cdc-mongocopy-data:
+  cdc-pgdump-data:
+  cdc-rsync-data:
+
+# Docker secrets (files under ./secrets/, created by ./deploy.sh secrets). Mounted per
+# service at /run/secrets/<ENV_NAME>; config/secret-env.sh exports them before exec.
+secrets:
+  admin_password:
+    file: ./secrets/admin_password
+  admin_session_secret:
+    file: ./secrets/admin_session_secret
+  authelia_client_secret:
+    file: ./secrets/authelia_client_secret
+  mcp_bearer_token:
+    file: ./secrets/mcp_bearer_token
+  mcp_client_keys:
+    file: ./secrets/mcp_client_keys
+  o2_password:
+    file: ./secrets/o2_password
+  orch_api_token:
+    file: ./secrets/orch_api_token
+  orch_jdbc_admin_token:
+    file: ./secrets/orch_jdbc_admin_token
+  orch_mongocopy_token:
+    file: ./secrets/orch_mongocopy_token
+  orch_pgcopy_token:
+    file: ./secrets/orch_pgcopy_token
+  orch_pgdump_token:
+    file: ./secrets/orch_pgdump_token
+  orch_pgloader_token:
+    file: ./secrets/orch_pgloader_token
+  orch_redis_shake_token:
+    file: ./secrets/orch_redis_shake_token
+  orch_rsync_token:
+    file: ./secrets/orch_rsync_token
+  orch_secret_key:
+    file: ./secrets/orch_secret_key
+  orch_wireguard_token:
+    file: ./secrets/orch_wireguard_token
+  session_secret:
+    file: ./secrets/session_secret
+  sso_app_secret:
+    file: ./secrets/sso_app_secret
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: ${CDC_LOG_MAX_SIZE:-20m}
+      max-file: "${CDC_LOG_MAX_FILE:-5}"
+
+services:
+  # ══════════════════════════════ Core ══════════════════════════════
+
+  # ── Message bus (Redpanda: Kafka API + Schema Registry) ──────────
+  cdc-message:
+    image: ${CDC_REDPANDA_IMAGE:-docker.redpanda.com/redpandadata/redpanda:v24.2.4}
+    container_name: cdc-message
+    <<: [*restart, *logging]
+    # --overprovisioned: required on VMs (EC2) and shared hosts — stops Seastar pinning cores
+    # and busy-polling. Bare flag only: Seastar rejects --overprovisioned=true/false.
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "${CDC_REDPANDA_SMP:-1}"
+      - --memory
+      - "${CDC_REDPANDA_MEMORY:-2G}"
+      - --reserve-memory
+      - "${CDC_REDPANDA_RESERVE_MEMORY:-256M}"
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://cdc-message:9092,external://127.0.0.1:${CDC_KAFKA_HOST_PORT:-19092}
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://cdc-message:8082,external://127.0.0.1:18082
+      - --schema-registry-addr
+      - 0.0.0.0:8081
+    ports:
+      - "${CDC_HOST_BIND:-127.0.0.1}:${CDC_KAFKA_HOST_PORT:-19092}:19092"
+      - "${CDC_HOST_BIND:-127.0.0.1}:${CDC_SCHEMA_REGISTRY_HOST_PORT:-18081}:8081"
+    volumes:
+      - cdc-redpanda-data:/var/lib/redpanda/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy'"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # ── Debezium Kafka Connect (custom image: Debezium + JDBC fork) ──
+  cdc-connect:
+    image: ${CDC_CONNECT_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-connect:${CDC_VERSION:-latest}}
+    container_name: cdc-connect
+    <<: [*restart, *logging]
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    ports:
+      - "${CDC_HOST_BIND:-127.0.0.1}:${CDC_CONNECT_HOST_PORT:-28083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: cdc-message:9092
+      GROUP_ID: cdc-connect-cluster
+      CONFIG_STORAGE_TOPIC: _cdc_connect_configs
+      OFFSET_STORAGE_TOPIC: _cdc_connect_offsets
+      STATUS_STORAGE_TOPIC: _cdc_connect_statuses
+      # Single broker: internal topics must stay RF=1.
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      CONNECT_KEY_CONVERTER_AUTO_REGISTER_SCHEMAS: "true"
+      CONNECT_VALUE_CONVERTER_AUTO_REGISTER_SCHEMAS: "true"
+      CONNECT_KEY_CONVERTER_ENHANCED_AVRO_SCHEMA_SUPPORT: "true"
+      CONNECT_VALUE_CONVERTER_ENHANCED_AVRO_SCHEMA_SUPPORT: "true"
+      CONNECT_REST_ADVERTISED_HOST_NAME: cdc-connect
+      CONNECT_REST_PORT: "8083"
+      CONNECT_TOPIC_CREATION_ENABLE: "true"
+      HEAP_OPTS: "${CDC_CONNECT_HEAP_OPTS:--Xms1g -Xmx2g}"
+      # Oracle thin driver: avoid ORA-01882 by using the UTC offset instead of a region name.
+      KAFKA_OPTS: "-Doracle.jdbc.timezoneAsRegion=false"
+      # Production tuning (was docker-compose.prod.yaml, Phase 2).
+      CONNECT_PRODUCER_COMPRESSION_TYPE: "${CDC_CONNECT_PRODUCER_COMPRESSION_TYPE:-lz4}"
+      CONNECT_PRODUCER_BATCH_SIZE: "${CDC_CONNECT_PRODUCER_BATCH_SIZE:-131072}"
+      CONNECT_PRODUCER_LINGER_MS: "${CDC_CONNECT_PRODUCER_LINGER_MS:-20}"
+      CONNECT_CONSUMER_MAX_POLL_RECORDS: "${CDC_CONNECT_CONSUMER_MAX_POLL_RECORDS:-500}"
+      OFFSET_FLUSH_INTERVAL_MS: "${CDC_CONNECT_OFFSET_FLUSH_INTERVAL_MS:-60000}"
+      OFFSET_FLUSH_TIMEOUT_MS: "${CDC_CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}"
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # ── JDBC Type 4 control-plane admin (catalog / DDL / preview / diff) ──
+  cdc-jdbc-admin:
+    image: ${CDC_JDBC_ADMIN_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-jdbc-admin:${CDC_VERSION:-latest}}
+    container_name: cdc-jdbc-admin
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "java", "-Xms64m", "-Xmx256m", "-jar", "/app/jdbc-admin.jar"]
+    secrets:
+      - { source: orch_jdbc_admin_token, target: ORCH_JDBC_ADMIN_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      JDBC_ADMIN_HOST: 0.0.0.0
+      JDBC_ADMIN_PORT: "8084"
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8084/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ── Configuration store (rqlite) — pipelines, drafts, audit, channels ──
+  cdc-rqlite:
+    image: ${CDC_RQLITE_IMAGE:-rqlite/rqlite:8.36.16}
+    container_name: cdc-rqlite
+    hostname: cdc-rqlite
+    <<: [*restart, *logging]
+    command:
+      - rqlited
+      - -node-id=1
+      - -http-addr=0.0.0.0:4001
+      - -http-adv-addr=cdc-rqlite:4001
+      - -raft-addr=0.0.0.0:4002
+      - -raft-adv-addr=cdc-rqlite:4002
+      - -bootstrap-expect=1
+      - /rqlite/file/data
+    ports:
+      - "${CDC_HOST_BIND:-127.0.0.1}:${CDC_RQLITE_HOST_PORT:-14001}:4001"
+    volumes:
+      - cdc-rqlite-data:/rqlite/file
+    networks: [server_zone]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- --post-data='[\"SELECT 1\"]' --header='Content-Type: application/json' 'http://127.0.0.1:4001/db/execute?level=strong' | grep -q '\"results\"'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ── Redis (audit stream / cache helpers; not durable by design) ──
+  cdc-redis:
+    image: ${CDC_REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: cdc-redis
+    <<: [*restart, *logging]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${CDC_HOST_BIND:-127.0.0.1}:${CDC_REDIS_HOST_PORT:-26379}:6379"
+    volumes:
+      - cdc-redis-data:/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Control plane ────────────────────────────────────────────────
+  cdc-orchestrator:
+    image: ${CDC_ORCHESTRATOR_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-orchestrator:${CDC_VERSION:-latest}}
+    container_name: cdc-orchestrator
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "/usr/local/bin/hyper-cdc-orchestrator"]
+    secrets:
+      - { source: orch_api_token, target: ORCH_API_TOKEN }
+      - { source: orch_secret_key, target: ORCH_SECRET_KEY }
+      - { source: orch_jdbc_admin_token, target: ORCH_JDBC_ADMIN_TOKEN }
+      - { source: orch_pgcopy_token, target: ORCH_PGCOPY_TOKEN }
+      - { source: orch_redis_shake_token, target: ORCH_REDIS_SHAKE_TOKEN }
+      - { source: orch_pgloader_token, target: ORCH_PGLOADER_TOKEN }
+      - { source: orch_mongocopy_token, target: ORCH_MONGOCOPY_TOKEN }
+      - { source: orch_pgdump_token, target: ORCH_PGDUMP_TOKEN }
+      - { source: orch_rsync_token, target: ORCH_RSYNC_TOKEN }
+      - { source: orch_wireguard_token, target: ORCH_WIREGUARD_TOKEN }
+    <<: [*restart, *logging]
+    depends_on:
+      cdc-connect:
+        condition: service_healthy
+      cdc-jdbc-admin:
+        condition: service_healthy
+      cdc-message:
+        condition: service_healthy
+      cdc-rqlite:
+        condition: service_healthy
+    ports:
+      - "${CDC_ORCHESTRATOR_BIND:-127.0.0.1}:${CDC_ORCHESTRATOR_PORT:-9788}:9788"
+    # Explicit list (no env_file): the orchestrator only sees its own settings, not the UI's
+    # SSO secret or MCP keys.
+    environment:
+      ORCH_HOST: 0.0.0.0
+      ORCH_PORT: 9788
+      RUST_LOG: ${RUST_LOG:-info}
+      APP_MODE: ${APP_MODE:-Production}
+      ORCH_ENABLED: ${ORCH_ENABLED:-true}
+      ORCH_REQUIRE_AUTH: ${ORCH_REQUIRE_AUTH:-true}
+      ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-true}
+      ORCH_STRICT_PERSISTENCE: ${ORCH_STRICT_PERSISTENCE:-true}
+      ORCH_CORS_ORIGINS: ${ORCH_CORS_ORIGINS:-}
+      ORCH_PUBLIC_UI_URL: ${ORCH_PUBLIC_UI_URL:-}
+      # Engine control via the Docker API (socket mounted below).
+      ORCH_ENGINE_PROVIDER: docker_api
+      ORCH_CONTAINER_PROJECT_NAME: cdc-stack
+      ORCH_MANAGED_CONTAINERS: ${ORCH_MANAGED_CONTAINERS:-cdc-message,cdc-connect,cdc-jdbc-admin,cdc-redis,cdc-rqlite}
+      ORCH_REDPANDA_CONTAINER: cdc-message
+      ORCH_CONTAINER_CONNECT: cdc-connect
+      ORCH_CONTAINER_KAFKA: cdc-message
+      ORCH_CONTAINER_VECTOR: cdc-vector
+      ORCH_CONTAINER_REDIS: cdc-redis
+      ORCH_COMMAND_TIMEOUT_SECS: ${ORCH_COMMAND_TIMEOUT_SECS:-30}
+      ORCH_POLL_INTERVAL_MS: ${ORCH_POLL_INTERVAL_MS:-30000}
+      ORCH_HISTORY_CAPACITY: ${ORCH_HISTORY_CAPACITY:-500}
+      ORCH_STOP_DELETES_CONNECTOR: ${ORCH_STOP_DELETES_CONNECTOR:-false}
+      # In-compose endpoints.
+      ORCH_CONNECT_BASE_URL: http://cdc-connect:8083
+      ORCH_SCHEMA_REGISTRY_URL: http://cdc-message:8081
+      ORCH_KAFKA_BOOTSTRAP: cdc-message:9092
+      ORCH_CONNECT_OFFSET_FLUSH_MS: ${CDC_CONNECT_OFFSET_FLUSH_INTERVAL_MS:-60000}
+      ORCH_LATENCY_SAMPLE_SECS: ${ORCH_LATENCY_SAMPLE_SECS:-15}
+      ORCH_KSQL_URL: ${ORCH_KSQL_URL:-http://cdc-ksqldb:8088}
+      ORCH_KSQL_ENABLED: ${ORCH_KSQL_ENABLED:-false}
+      ORCH_RQLITE_URL: http://cdc-rqlite:4001
+      ORCH_RQLITE_USER: ${ORCH_RQLITE_USER:-}
+      ORCH_RQLITE_PASS: ${ORCH_RQLITE_PASS:-}
+      ORCH_JDBC_ADMIN_URL: http://cdc-jdbc-admin:8084
+      ORCH_TOOL_EVENTS_RETENTION_DAYS: ${ORCH_TOOL_EVENTS_RETENTION_DAYS:-365}
+      ORCH_TOOL_EVENTS_MAX_ROWS: ${ORCH_TOOL_EVENTS_MAX_ROWS:-200000}
+      ORCH_TOOL_EVENTS_POLL_SECS: ${ORCH_TOOL_EVENTS_POLL_SECS:-15}
+      ORCH_AUDIT_REDIS_URL: redis://cdc-redis:6379/1
+      ORCH_AUDIT_REDIS_KEY: ${ORCH_AUDIT_REDIS_KEY:-cdc:audit:events}
+      ORCH_AUDIT_REDIS_MAX_LEN: ${ORCH_AUDIT_REDIS_MAX_LEN:-100000}
+      ORCH_POLL_AUDIT_CHECK_SECS: ${ORCH_POLL_AUDIT_CHECK_SECS:-10}
+      ORCH_AUDIT_RQLITE_MAX_ROWS: ${ORCH_AUDIT_RQLITE_MAX_ROWS:-200000}
+      ORCH_RECORD_DIFF_CONCURRENCY: ${ORCH_RECORD_DIFF_CONCURRENCY:-2}
+      # Sidecars (each has its own shared token with the orchestrator).
+      ORCH_PGCOPY_URL: http://cdc-pgcopydb:8085
+      ORCH_REDIS_SHAKE_URL: http://cdc-redisshake:8086
+      ORCH_PGLOADER_URL: http://cdc-pgloader:8087
+      ORCH_MONGOCOPY_URL: http://cdc-mongocopy:8088
+      ORCH_PGDUMP_URL: http://cdc-pgdump:8089
+      ORCH_RSYNC_URL: http://cdc-rsync:8090
+      ORCH_WIREGUARD_URL: http://cdc-wireguard:8091
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      server_zone:
+        aliases:
+          - hyper-cdc-orchestrator
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9788/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  # ── Native WebUI (Nuxt) ──────────────────────────────────────────
+  cdc-native-ui:
+    image: ${CDC_NATIVE_UI_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-webui:${CDC_VERSION:-latest}}
+    container_name: cdc-native-ui
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "node", "/app/start-ui.mjs"]
+    command: ["./.output/server/index.mjs"]
+    secrets:
+      - { source: orch_api_token, target: ORCHESTRATOR_TOKEN }
+      - { source: admin_password, target: ADMIN_PASSWORD }
+      - { source: session_secret, target: SESSION_SECRET }
+      - { source: admin_session_secret, target: ADMIN_SESSION_SECRET }
+      - { source: sso_app_secret, target: SSO_APP_SECRET }
+      - { source: authelia_client_secret, target: AUTHELIA_CLIENT_SECRET }
+    <<: [*restart, *logging]
+    depends_on:
+      cdc-orchestrator:
+        condition: service_healthy
+    ports:
+      - "${CDC_NATIVE_UI_BIND:-0.0.0.0}:${CDC_NATIVE_UI_HOST_PORT:-4320}:3000"
+      # Break-glass admin (ADR 0002): loopback only, never 0.0.0.0.
+      # Remote: ssh -L 4321:127.0.0.1:4321 <host>
+      - "127.0.0.1:${CDC_NATIVE_UI_ADMIN_PORT:-4321}:3001"
+    environment:
+      APP_NAME: ${APP_NAME:-CDC WebUI}
+      APP_MODE: ${APP_MODE:-Production}
+      ORCHESTRATOR_URL: http://cdc-orchestrator:9788
+      PUBLIC_ORCHESTRATOR_URL: ${PUBLIC_ORCHESTRATOR_URL:-http://127.0.0.1:9788}
+      AUTH_MODE: ${AUTH_MODE:-sso}
+      # Production never runs open (AUTH_MODE=none refuses to start with this false).
+      ALLOW_OPEN_AUTH: "false"
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME in .env}
+      ADMIN_PORT: "3001"
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      SSO_PROVIDER: ${SSO_PROVIDER:-supertokens_gateway}
+      SSO_APP_ID: ${SSO_APP_ID:-}
+      SSO_LOGIN_URL: ${SSO_LOGIN_URL:-}
+      SSO_CALLBACK_URL: ${SSO_CALLBACK_URL:-}
+      SSO_EXCHANGE_URL: ${SSO_EXCHANGE_URL:-}
+      SSO_TOKEN_URL: ${SSO_TOKEN_URL:-}
+      SSO_EXCHANGE_TIMEOUT_MS: ${SSO_EXCHANGE_TIMEOUT_MS:-12000}
+      AUTHELIA_AUTHORIZE_URL: ${AUTHELIA_AUTHORIZE_URL:-}
+      AUTHELIA_CLIENT_ID: ${AUTHELIA_CLIENT_ID:-}
+      AUTHELIA_SCOPES: ${AUTHELIA_SCOPES:-openid profile email groups}
+      AUTHELIA_TOKEN_URL: ${AUTHELIA_TOKEN_URL:-}
+      AUTHELIA_USERINFO_URL: ${AUTHELIA_USERINFO_URL:-}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+    networks: [server_zone]
+    healthcheck:
+      # node:slim has no curl; a TCP connect to the Nitro listener is enough.
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  # ══════════════════════════════ Sidecars ══════════════════════════════
+  # Internal only: nothing is published to the host. Each sidecar authenticates the
+  # orchestrator with its own token.
+
+  cdc-pgcopydb:
+    image: ${CDC_PGCOPY_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-pgcopydb:${CDC_VERSION:-latest}}
+    container_name: cdc-pgcopydb
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_pgcopy_token, target: PGCOPY_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      PGCOPY_API_HOST: 0.0.0.0
+      PGCOPY_API_PORT: "8085"
+      PGCOPY_WORK_ROOT: /var/lib/pgcopydb
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-pgcopydb-data:/var/lib/pgcopydb
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8085/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # WireGuard gateway (ADR 0010): userspace wireguard-go, no NET_ADMIN / TUN. Dials out to
+  # each site's UDP port; tools reach site DBs via forwards 21000-21999 on server_zone only.
+  cdc-wireguard:
+    image: ${CDC_WIREGUARD_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-wireguard:${CDC_VERSION:-latest}}
+    container_name: cdc-wireguard
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "/usr/local/bin/cdc-wireguard"]
+    secrets:
+      - { source: orch_wireguard_token, target: WIREGUARD_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      WG_FORWARD_HOST: cdc-wireguard
+      WG_FORWARD_PORT_MIN: ${WG_FORWARD_PORT_MIN:-21000}
+      WG_FORWARD_PORT_MAX: ${WG_FORWARD_PORT_MAX:-21999}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+    networks: [server_zone]
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  cdc-redisshake:
+    image: ${CDC_REDIS_SHAKE_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-redisshake:${CDC_VERSION:-latest}}
+    container_name: cdc-redisshake
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_redis_shake_token, target: REDIS_SHAKE_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      REDIS_SHAKE_API_HOST: 0.0.0.0
+      REDIS_SHAKE_API_PORT: "8086"
+      REDIS_SHAKE_WORK_ROOT: /var/lib/redisshake
+      REDIS_SHAKE_MAX_CONCURRENT_JOBS: ${REDIS_SHAKE_MAX_CONCURRENT_JOBS:-1}
+      REDIS_SHAKE_RETAIN_JOBS: ${REDIS_SHAKE_RETAIN_JOBS:-15}
+      REDIS_SHAKE_CLEANUP_STAGING: ${REDIS_SHAKE_CLEANUP_STAGING:-true}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-redisshake-data:/var/lib/redisshake
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8086/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  cdc-pgloader:
+    image: ${CDC_PGLOADER_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-pgloader:${CDC_VERSION:-latest}}
+    container_name: cdc-pgloader
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_pgloader_token, target: PGLOADER_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      PGLOADER_API_HOST: 0.0.0.0
+      PGLOADER_API_PORT: "8087"
+      PGLOADER_WORK_ROOT: /var/lib/pgloader
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-pgloader-data:/var/lib/pgloader
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8087/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  cdc-mongocopy:
+    image: ${CDC_MONGOCOPY_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-mongocopy:${CDC_VERSION:-latest}}
+    container_name: cdc-mongocopy
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "docker-entrypoint.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_mongocopy_token, target: MONGOCOPY_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      MONGOCOPY_API_HOST: 0.0.0.0
+      MONGOCOPY_API_PORT: "8088"
+      MONGOCOPY_WORK_ROOT: /var/lib/mongocopy
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-mongocopy-data:/var/lib/mongocopy
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8088/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  cdc-pgdump:
+    image: ${CDC_PGDUMP_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-pgdump:${CDC_VERSION:-latest}}
+    container_name: cdc-pgdump
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_pgdump_token, target: PGDUMP_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      PGDUMP_API_HOST: 0.0.0.0
+      PGDUMP_API_PORT: "8089"
+      PGDUMP_WORK_ROOT: /var/lib/pgdump
+      PGDUMP_MAX_CONCURRENT: ${PGDUMP_MAX_CONCURRENT:-2}
+      PGDUMP_MIN_FREE_MB: ${PGDUMP_MIN_FREE_MB:-1024}
+      PGDUMP_TIMEOUT_SECONDS: ${PGDUMP_TIMEOUT_SECONDS:-0}
+      PGDUMP_RETENTION_HOURS: ${PGDUMP_RETENTION_HOURS:-72}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-pgdump-data:/var/lib/pgdump
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8089/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # File sync over SSH / rsync:// (ADR 0007, 0012). Needs outbound SSH to source/target.
+  cdc-rsync:
+    image: ${CDC_RSYNC_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-rsync:${CDC_VERSION:-latest}}
+    container_name: cdc-rsync
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_rsync_token, target: RSYNC_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      RSYNC_API_HOST: 0.0.0.0
+      RSYNC_API_PORT: "8090"
+      RSYNC_WORK_ROOT: /var/lib/rsync
+      RSYNC_MAX_CONCURRENT: ${RSYNC_MAX_CONCURRENT:-2}
+      RSYNC_MIN_FREE_MB: ${RSYNC_MIN_FREE_MB:-1024}
+      RSYNC_TIMEOUT_SECONDS: ${RSYNC_TIMEOUT_SECONDS:-0}
+      RSYNC_RETENTION_HOURS: ${RSYNC_RETENTION_HOURS:-168}
+      RSYNC_STAGING_RETENTION_DAYS: ${RSYNC_STAGING_RETENTION_DAYS:-14}
+      RSYNC_SSH_TIMEOUT_SECONDS: ${RSYNC_SSH_TIMEOUT_SECONDS:-15}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-rsync-data:/var/lib/rsync
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ══════════════════════════════ AI agent (profile: agent) ══════════════════════════════
+
+  # MCP server (ADR 0008 keys/scopes, ADR 0017 OAuth for claude.ai / ChatGPT).
+  mcp-cdc:
+    image: ${MCP_CDC_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-mcp:${CDC_VERSION:-latest}}
+    container_name: mcp-cdc
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "/usr/local/bin/mcp-cdc"]
+    secrets:
+      - { source: orch_api_token, target: CDC_ORCHESTRATOR_TOKEN }
+      - { source: mcp_client_keys, target: MCP_CLIENT_KEYS }
+      - { source: mcp_bearer_token, target: MCP_BEARER_TOKEN }
+    profiles: ["agent"]
+    <<: [*restart, *logging]
+    depends_on:
+      cdc-orchestrator:
+        condition: service_healthy
+    ports:
+      - "${MCP_CDC_BIND:-127.0.0.1}:${MCP_CDC_PORT:-8410}:8410"
+    environment:
+      MCP_BIND_ADDR: 0.0.0.0:8410
+      MCP_RATE_LIMIT_RPM: ${MCP_RATE_LIMIT_RPM:-300}
+      MCP_CORS_ORIGINS: ${MCP_CORS_ORIGINS:-}
+      CDC_ORCHESTRATOR_URL: http://cdc-orchestrator:9788
+      ALLOW_WRITE_TOOLS: ${ALLOW_WRITE_TOOLS:-false}
+      MCP_OAUTH: ${MCP_OAUTH:-false}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
+      MCP_OAUTH_STORE: /data/oauth-store.json
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-mcp-data:/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8410/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+  # Copy & Sync job logs → OpenObserve (production config: no Kafka console tap).
+  cdc-vector:
+    image: ${CDC_VECTOR_IMAGE:-timberio/vector:0.41.1-alpine}
+    container_name: cdc-vector
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "/usr/local/bin/vector"]
+    secrets:
+      - { source: o2_password, target: O2_PASSWORD }
+    profiles: ["agent"]
+    <<: [*restart, *logging]
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    command: ["--config", "/etc/vector/vector.toml"]
+    environment:
+      O2_URL: ${O2_URL:-http://openobserve-core:5080}
+      O2_ORG: ${O2_ORG:-default}
+      O2_STREAM: ${O2_STREAM:-cdc-copy}
+      O2_USER: ${O2_USER:-}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - ./config/vector.toml:/etc/vector/vector.toml:ro
+      - cdc-pgcopydb-data:/var/lib/pgcopydb:ro
+      - cdc-redisshake-data:/var/lib/redisshake:ro
+      - cdc-pgloader-data:/var/lib/pgloader:ro
+      - cdc-mongocopy-data:/var/lib/mongocopy:ro
+    networks: [server_zone]

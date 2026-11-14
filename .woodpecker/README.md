@@ -96,8 +96,9 @@ CDC_PGCOPY_IMAGE=<ns>/cdc-pgcopydb:v1.2.3@sha256:…
 ```
 
 The file is printed in the step log and attached to the Discord message. To deploy a
-release, paste it into `docker/.env.production` (see `.env.production.example`), then
-`docker compose … pull` and `up -d --no-build`.
+release, copy it to the production host and run
+`docker/production/deploy.sh up --images images-<version>.env` (pull-only stack,
+ordered rollout with health gates, rollback history; see `docker/production/README.md`).
 
 ## Images
 

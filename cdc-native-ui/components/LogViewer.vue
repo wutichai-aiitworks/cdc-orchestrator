@@ -656,7 +656,7 @@ useEventListener(window, "keydown", (e: KeyboardEvent) => {
         @scroll.passive="onScroll"
       >
         <div
-          class="sticky top-0 z-10 flex border-b border-l-2 border-border border-l-transparent bg-muted/90 py-1 font-body text-[10px] font-semibold uppercase tracking-wider text-muted-foreground backdrop-blur"
+          class="sticky top-0 z-10 flex border-b border-l-2 border-border border-l-transparent bg-muted py-1 font-body text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
         >
           <span class="w-[6.75rem] shrink-0 pl-3">Time {{ prefs.utc ? "(UTC)" : "" }}</span>
           <span class="w-14 shrink-0">Level</span>

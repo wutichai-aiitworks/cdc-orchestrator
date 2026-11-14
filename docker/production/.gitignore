@@ -1,0 +1,7 @@
+# Host-specific: config, credentials and the deployed release manifest.
+.env
+images.env
+.deploy/
+# Secret files are never committed; only the README that documents them.
+secrets/*
+!secrets/README.md

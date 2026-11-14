@@ -30,6 +30,7 @@ Instructions for AI coding agents working with the CDC control plane.
 | `docs/openapi.yaml` | Full `/cdc/*` API |
 | `mcp/README.md` | MCP crate / tool list |
 | `INSTALL.md` | Compose install (`--mcp --demo`) + `docker/` layout |
+| `docker/production/README.md` | Production deploy: pull-only stack from Woodpecker images (`images.env`), `.env` reference, `deploy.sh up/rollback` |
 | `.woodpecker/README.md` | CI workflows, published images, required secrets |
 | `docs/adr/0004-incremental-rolling-window-and-initial-load.md` | Incremental per-table poll strategy (rolling window / full copy), streaming initial load, why not COALESCE/triggers |
 | `docs/adr/0007-rsync-file-sync-sidecar.md` | File sync (rsync over SSH): direct via forwarded key, relay fallback, host-key pinning, macOS rsync detection |
