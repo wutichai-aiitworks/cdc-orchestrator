@@ -564,12 +564,99 @@ pub fn platform_label(p: &str) -> &'static str {
     }
 }
 
+// ── shared table helpers ────────────────────────────────────────────────────────────────
+
+type Row = HashMap<String, Value>;
+
+fn login_or(ctx: &Ctx, fallback: &str) -> String {
+    if ctx.username.is_empty() {
+        fallback.to_string()
+    } else {
+        ctx.username.clone()
+    }
+}
+
+/// Selected tables that are not in `found`, as `schema.table` (keys compared by `key`).
+fn absent_tables(
+    ctx: &Ctx,
+    found: &HashSet<(String, String)>,
+    key: impl Fn(&str, &str) -> (String, String),
+) -> Vec<String> {
+    ctx.tables
+        .iter()
+        .filter(|(sc, t)| !found.contains(&key(sc, t)))
+        .map(|(sc, t)| format!("{sc}.{t}"))
+        .collect()
+}
+
+fn tables_exist_check(id: &'static str, absent: &[String]) -> Option<Check> {
+    (!absent.is_empty()).then(|| {
+        check(
+            id,
+            "Tables exist",
+            Status::Fail,
+            format!(
+                "Not found (or not visible to the login): {}",
+                absent.join(", ")
+            ),
+        )
+    })
+}
+
+fn no_pk_tables(rows: &[Row]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| b(row.get("has_pk")) == Some(false))
+        .map(|row| format!("{}.{}", s(row.get("schema")), s(row.get("name"))))
+        .collect()
+}
+
+fn no_pk_warning(id: &'static str, no_pk: &[String]) -> Check {
+    check(
+        id,
+        "Primary keys",
+        Status::Warn,
+        format!(
+            "No primary key: {}. Events have no key, so the target cannot upsert or delete them.",
+            no_pk.join(", ")
+        ),
+    )
+}
+
+fn is_rds(platform: &str) -> bool {
+    matches!(platform, "amazon_rds" | "amazon_aurora")
+}
+
 // ── PostgreSQL ──────────────────────────────────────────────────────────────────────────
 
 fn eval_pg(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
-    let mut checks = Vec::new();
+    let (settings, mut params) = pg_settings(r);
+    let platform = pg_platform(r, &settings);
+    let user = quote_pg(if ctx.username.is_empty() {
+        "cdc_user"
+    } else {
+        &ctx.username
+    });
+    let slots = r.rows("slots");
+    let mut checks = vec![
+        pg_version(r, &mut params),
+        pg_wal_level(r, &settings, platform),
+    ];
+    checks.extend(pg_slots(ctx, r, &settings, &slots, platform));
+    checks.extend(pg_senders(r, &settings));
+    checks.extend(pg_slot_lag(&slots));
+    checks.extend(pg_wal_keep(&settings));
+    checks.push(pg_login(r, platform, &user));
+    checks.push(pg_publication(ctx, r));
+    if !ctx.tables.is_empty() {
+        checks.extend(pg_tables(ctx, r, &user));
+    }
+    checks.extend(pg_own_slot(ctx, &slots));
+    (platform.into(), checks, params)
+}
+
+fn pg_settings(r: &Res) -> (HashMap<String, String>, Vec<Param>) {
     let mut params = Vec::new();
-    let settings: HashMap<String, String> = r
+    let settings = r
         .rows("settings")
         .into_iter()
         .map(|row| {
@@ -587,7 +674,11 @@ fn eval_pg(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
             (s(row.get("name")), val)
         })
         .collect();
-    let platform = if r.ok("aurora") {
+    (settings, params)
+}
+
+fn pg_platform(r: &Res, settings: &HashMap<String, String>) -> &'static str {
+    if r.ok("aurora") {
         "amazon_aurora"
     } else if settings.contains_key("rds.logical_replication") {
         "amazon_rds"
@@ -599,174 +690,172 @@ fn eval_pg(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
         "self_managed"
     } else {
         "unknown"
-    };
-    let user = quote_pg(if ctx.username.is_empty() {
-        "cdc_user"
-    } else {
-        &ctx.username
-    });
+    }
+}
 
-    // version / role of the server
+/// server_version_num: 10+ is major*10000 + minor (170007 = 17.7); 9.x is 90624 = 9.6.24.
+fn pg_human_version(v: i64) -> String {
+    if v >= 100000 {
+        format!("{}.{}", v / 10000, v % 10000)
+    } else {
+        format!("{}.{}.{}", v / 10000, v % 10000 / 100, v % 100)
+    }
+}
+
+fn pg_version(r: &Res, params: &mut Vec<Param>) -> Check {
     let info = r.first("info");
-    let ver = info.as_ref().and_then(|i| n(i.get("version_num")));
+    let Some(v) = info.as_ref().and_then(|i| n(i.get("version_num"))) else {
+        return unknown("pg.version", "PostgreSQL version", r.err("info"), "");
+    };
     let in_recovery = info
         .as_ref()
         .and_then(|i| b(i.get("in_recovery")))
         .unwrap_or(false);
-    if let Some(v) = ver {
-        params.insert(
-            0,
-            Param {
-                name: "server_version_num".into(),
-                value: v.to_string(),
-            },
-        );
-        params.insert(
-            1,
-            Param {
-                name: "pg_is_in_recovery".into(),
-                value: in_recovery.to_string(),
-            },
-        );
-        // server_version_num: 10+ is major*10000 + minor (170007 = 17.7); 9.x is 90624 = 9.6.24.
-        let human = if v >= 100000 {
-            format!("{}.{}", v / 10000, v % 10000)
-        } else {
-            format!("{}.{}.{}", v / 10000, v % 10000 / 100, v % 100)
-        };
-        if v < 100000 {
-            checks.push(
-                check(
-                    "pg.version",
-                    "PostgreSQL version",
-                    Status::Fail,
-                    format!("PostgreSQL {human} has no pgoutput plugin; CDC needs 10 or later."),
-                )
-                .val(human)
-                .want(">= 10"),
-            );
-        } else if in_recovery && v < 160000 {
-            checks.push(check("pg.version", "Primary server", Status::Fail, "This is a standby. Logical decoding runs on the primary (or on a PostgreSQL 16+ standby). Point the pipeline at the primary.").val(format!("{human} standby")));
-        } else {
-            checks.push(
-                check(
-                    "pg.version",
-                    "PostgreSQL version",
-                    Status::Pass,
-                    format!(
-                        "PostgreSQL {human}{} supports logical decoding.",
-                        if in_recovery { " standby" } else { "" }
-                    ),
-                )
-                .val(human),
-            );
-        }
-    } else {
-        checks.push(unknown(
+    params.insert(
+        0,
+        Param {
+            name: "server_version_num".into(),
+            value: v.to_string(),
+        },
+    );
+    params.insert(
+        1,
+        Param {
+            name: "pg_is_in_recovery".into(),
+            value: in_recovery.to_string(),
+        },
+    );
+    let human = pg_human_version(v);
+    if v < 100000 {
+        return check(
             "pg.version",
             "PostgreSQL version",
-            r.err("info"),
-            "",
-        ));
+            Status::Fail,
+            format!("PostgreSQL {human} has no pgoutput plugin; CDC needs 10 or later."),
+        )
+        .val(human)
+        .want(">= 10");
     }
+    if in_recovery && v < 160000 {
+        return check("pg.version", "Primary server", Status::Fail, "This is a standby. Logical decoding runs on the primary (or on a PostgreSQL 16+ standby). Point the pipeline at the primary.").val(format!("{human} standby"));
+    }
+    let standby = if in_recovery { " standby" } else { "" };
+    check(
+        "pg.version",
+        "PostgreSQL version",
+        Status::Pass,
+        format!("PostgreSQL {human}{standby} supports logical decoding."),
+    )
+    .val(human)
+}
 
-    // wal_level
+fn pg_wal_fix(platform: &str) -> String {
+    match platform {
+        "amazon_rds" | "amazon_aurora" => "-- Amazon RDS / Aurora: in the DB (cluster) parameter group set\n--   rds.logical_replication = 1\n-- then reboot the instance (or writer). wal_level becomes logical.".to_string(),
+        "google_cloud_sql" => "-- Cloud SQL: set the database flag cloudsql.logical_decoding = on (restarts the instance).".into(),
+        "azure" => "-- Azure Database for PostgreSQL: Server parameters → wal_level = LOGICAL, then restart.".into(),
+        _ => "ALTER SYSTEM SET wal_level = logical;\n-- restart PostgreSQL (wal_level only changes at server start)".into(),
+    }
+}
+
+fn pg_wal_level(r: &Res, settings: &HashMap<String, String>, platform: &str) -> Check {
     match settings.get("wal_level") {
-        Some(w) if w == "logical" => checks.push(
-            check(
-                "pg.wal_level",
-                "wal_level = logical",
-                Status::Pass,
-                "Write-ahead log carries the row data logical decoding needs.",
-            )
-            .val(w)
-            .want("logical"),
-        ),
-        Some(w) => {
-            let fix = match platform {
-                "amazon_rds" | "amazon_aurora" => "-- Amazon RDS / Aurora: in the DB (cluster) parameter group set\n--   rds.logical_replication = 1\n-- then reboot the instance (or writer). wal_level becomes logical.".to_string(),
-                "google_cloud_sql" => "-- Cloud SQL: set the database flag cloudsql.logical_decoding = on (restarts the instance).".into(),
-                "azure" => "-- Azure Database for PostgreSQL: Server parameters → wal_level = LOGICAL, then restart.".into(),
-                _ => "ALTER SYSTEM SET wal_level = logical;\n-- restart PostgreSQL (wal_level only changes at server start)".into(),
-            };
-            checks.push(check("pg.wal_level", "wal_level = logical", Status::Fail, format!("wal_level is '{w}'. Logical replication slots cannot be created until it is 'logical' (needs a restart).")).val(w).want("logical").fix(fix));
-        }
-        None => checks.push(unknown(
+        Some(w) if w == "logical" => check(
+            "pg.wal_level",
+            "wal_level = logical",
+            Status::Pass,
+            "Write-ahead log carries the row data logical decoding needs.",
+        )
+        .val(w)
+        .want("logical"),
+        Some(w) => check("pg.wal_level", "wal_level = logical", Status::Fail, format!("wal_level is '{w}'. Logical replication slots cannot be created until it is 'logical' (needs a restart).")).val(w).want("logical").fix(pg_wal_fix(platform)),
+        None => unknown(
             "pg.wal_level",
             "wal_level = logical",
             r.err("settings"),
             "",
-        )),
+        ),
     }
+}
 
-    // slots and senders
-    let slots = r.rows("slots");
-    let max_slots = settings
+fn pg_slot_fix(platform: &str) -> String {
+    if is_rds(platform) {
+        "-- Parameter group: raise max_replication_slots (and max_wal_senders), then reboot.\n-- Or drop an unused slot: SELECT pg_drop_replication_slot('<name>');".to_string()
+    } else {
+        "ALTER SYSTEM SET max_replication_slots = 10;\nALTER SYSTEM SET max_wal_senders = 10;\n-- restart PostgreSQL\n-- or drop an unused slot: SELECT pg_drop_replication_slot('<name>');".into()
+    }
+}
+
+fn pg_slots(
+    ctx: &Ctx,
+    r: &Res,
+    settings: &HashMap<String, String>,
+    slots: &[Row],
+    platform: &str,
+) -> Option<Check> {
+    let Some(max) = settings
         .get("max_replication_slots")
-        .and_then(|v| v.parse::<i64>().ok());
-    let our_slot_exists = ctx
+        .and_then(|v| v.parse::<i64>().ok())
+    else {
+        let unreadable =
+            r.err("slots").is_some() || !settings.contains_key("max_replication_slots");
+        return unreadable.then(|| {
+            unknown(
+                "pg.slots",
+                "Free replication slot",
+                r.err("slots"),
+                "Grant pg_read_all_settings / pg_monitor to read it.",
+            )
+        });
+    };
+    let ours = ctx
         .slot
         .as_ref()
         .is_some_and(|name| slots.iter().any(|row| s(row.get("slot_name")) == *name));
-    if let Some(max) = max_slots {
-        let used = slots.len() as i64;
-        let free = max - used;
-        let status = if free >= 1 || our_slot_exists {
-            Status::Pass
-        } else {
-            Status::Fail
-        };
-        let mut c = check(
-            "pg.slots",
-            "Free replication slot",
+    let used = slots.len() as i64;
+    let ok = max - used >= 1 || ours;
+    let status = if ok { Status::Pass } else { Status::Fail };
+    let mine = if ours {
+        " (one is this pipeline's)"
+    } else {
+        ""
+    };
+    let c = check(
+        "pg.slots",
+        "Free replication slot",
+        status,
+        format!("{used} of {max} replication slots in use{mine}."),
+    )
+    .val(format!("{used}/{max}"))
+    .want("at least 1 free");
+    Some(if ok { c } else { c.fix(pg_slot_fix(platform)) })
+}
+
+fn pg_senders(r: &Res, settings: &HashMap<String, String>) -> Option<Check> {
+    let max = settings
+        .get("max_wal_senders")
+        .and_then(|v| v.parse::<i64>().ok())?;
+    let row = r.first("senders")?;
+    let active = n(row.get("n")).unwrap_or(0);
+    let status = if max - active >= 1 {
+        Status::Pass
+    } else {
+        Status::Warn
+    };
+    Some(
+        check(
+            "pg.senders",
+            "Free WAL sender",
             status,
-            format!(
-                "{used} of {max} replication slots in use{}.",
-                if our_slot_exists {
-                    " (one is this pipeline's)"
-                } else {
-                    ""
-                }
-            ),
+            format!("{active} of {max} WAL senders busy."),
         )
-        .val(format!("{used}/{max}"))
-        .want("at least 1 free");
-        if status == Status::Fail {
-            c = c.fix(if matches!(platform, "amazon_rds" | "amazon_aurora") { "-- Parameter group: raise max_replication_slots (and max_wal_senders), then reboot.\n-- Or drop an unused slot: SELECT pg_drop_replication_slot('<name>');".to_string() } else { "ALTER SYSTEM SET max_replication_slots = 10;\nALTER SYSTEM SET max_wal_senders = 10;\n-- restart PostgreSQL\n-- or drop an unused slot: SELECT pg_drop_replication_slot('<name>');".into() });
-        }
-        checks.push(c);
-    } else if r.err("slots").is_some() || !settings.contains_key("max_replication_slots") {
-        checks.push(unknown(
-            "pg.slots",
-            "Free replication slot",
-            r.err("slots"),
-            "Grant pg_read_all_settings / pg_monitor to read it.",
-        ));
-    }
-    if let (Some(max), Some(row)) = (
-        settings
-            .get("max_wal_senders")
-            .and_then(|v| v.parse::<i64>().ok()),
-        r.first("senders"),
-    ) {
-        let active = n(row.get("n")).unwrap_or(0);
-        let status = if max - active >= 1 {
-            Status::Pass
-        } else {
-            Status::Warn
-        };
-        checks.push(
-            check(
-                "pg.senders",
-                "Free WAL sender",
-                status,
-                format!("{active} of {max} WAL senders busy."),
-            )
-            .val(format!("{active}/{max}"))
-            .want("at least 1 free"),
-        );
-    }
-    // WAL kept by inactive slots
+        .val(format!("{active}/{max}"))
+        .want("at least 1 free"),
+    )
+}
+
+/// WAL kept by inactive slots.
+fn pg_slot_lag(slots: &[Row]) -> Option<Check> {
     let lagging: Vec<String> = slots
         .iter()
         .filter(|row| b(row.get("active")) == Some(false))
@@ -776,367 +865,370 @@ fn eval_pg(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
                 .then(|| format!("{} ({})", s(row.get("slot_name")), fmt_bytes(bytes)))
         })
         .collect();
-    if !lagging.is_empty() {
-        checks.push(
-            check(
-                "pg.slot_lag",
-                "Inactive slots holding WAL",
-                Status::Warn,
-                format!(
-                    "Inactive slot(s) keep WAL on disk: {}. An abandoned slot can fill the disk.",
-                    lagging.join(", ")
-                ),
-            )
-            .fix("-- If a slot is no longer used:\nSELECT pg_drop_replication_slot('<name>');"),
-        );
-    }
-    if settings
+    (!lagging.is_empty()).then(|| {
+        check(
+            "pg.slot_lag",
+            "Inactive slots holding WAL",
+            Status::Warn,
+            format!(
+                "Inactive slot(s) keep WAL on disk: {}. An abandoned slot can fill the disk.",
+                lagging.join(", ")
+            ),
+        )
+        .fix("-- If a slot is no longer used:\nSELECT pg_drop_replication_slot('<name>');")
+    })
+}
+
+fn pg_wal_keep(settings: &HashMap<String, String>) -> Option<Check> {
+    settings
         .get("max_slot_wal_keep_size")
         .is_some_and(|v| v == "-1")
-    {
-        checks.push(check("pg.wal_keep", "WAL kept for slots is unbounded", Status::Info, "max_slot_wal_keep_size = -1: a stopped pipeline keeps WAL until it resumes. Consider a cap (PostgreSQL 13+) with disk alerts.").val("-1"));
-    }
+        .then(|| check("pg.wal_keep", "WAL kept for slots is unbounded", Status::Info, "max_slot_wal_keep_size = -1: a stopped pipeline keeps WAL until it resumes. Consider a cap (PostgreSQL 13+) with disk alerts.").val("-1"))
+}
 
-    // login privileges
-    match r.first("role") {
-        Some(row) => {
-            let sup = b(row.get("superuser")).unwrap_or(false);
-            let repl = b(row.get("replication")).unwrap_or(false);
-            let cloud = b(row.get("cloud_replication")).unwrap_or(false);
-            if sup || repl || cloud {
-                let how = if sup {
-                    "superuser"
-                } else if repl {
-                    "REPLICATION attribute"
-                } else {
-                    "cloud replication role"
-                };
-                checks.push(
-                    check(
-                        "pg.login",
-                        "Login may replicate",
-                        Status::Pass,
-                        format!("The login has the {how}."),
-                    )
-                    .val(how),
-                );
-            } else {
-                let fix = match platform {
-                    "amazon_rds" | "amazon_aurora" => format!("GRANT rds_replication TO {user};"),
-                    "google_cloud_sql" => format!("ALTER USER {user} WITH REPLICATION;"),
-                    "azure" => format!("ALTER ROLE {user} WITH REPLICATION;"),
-                    _ => format!("ALTER ROLE {user} WITH REPLICATION;"),
-                };
-                checks.push(check("pg.login", "Login may replicate", Status::Fail, "The login has neither the REPLICATION attribute nor superuser, so it cannot open a replication slot.").fix(fix));
-            }
-        }
-        None => checks.push(unknown(
+/// Which attribute lets the login replicate, if any.
+fn pg_replication_grant(row: &Row) -> Option<&'static str> {
+    if b(row.get("superuser")).unwrap_or(false) {
+        Some("superuser")
+    } else if b(row.get("replication")).unwrap_or(false) {
+        Some("REPLICATION attribute")
+    } else if b(row.get("cloud_replication")).unwrap_or(false) {
+        Some("cloud replication role")
+    } else {
+        None
+    }
+}
+
+fn pg_login(r: &Res, platform: &str, user: &str) -> Check {
+    let Some(row) = r.first("role") else {
+        return unknown("pg.login", "Login may replicate", r.err("role"), "");
+    };
+    if let Some(how) = pg_replication_grant(&row) {
+        return check(
             "pg.login",
             "Login may replicate",
-            r.err("role"),
-            "",
-        )),
+            Status::Pass,
+            format!("The login has the {how}."),
+        )
+        .val(how);
     }
+    let fix = match platform {
+        "amazon_rds" | "amazon_aurora" => format!("GRANT rds_replication TO {user};"),
+        "google_cloud_sql" => format!("ALTER USER {user} WITH REPLICATION;"),
+        _ => format!("ALTER ROLE {user} WITH REPLICATION;"),
+    };
+    check("pg.login", "Login may replicate", Status::Fail, "The login has neither the REPLICATION attribute nor superuser, so it cannot open a replication slot.").fix(fix)
+}
 
-    // publication (the connector never creates it: publication.autocreate.mode = disabled)
-    let pub_name = quote_pg(&ctx.publication);
-    let wanted: Vec<String> = ctx
-        .tables
-        .iter()
+fn pg_table_list<'a>(tables: impl Iterator<Item = &'a (String, String)>) -> Vec<String> {
+    tables
         .map(|(sc, t)| format!("{}.{}", quote_pg(sc), quote_pg(t)))
-        .collect();
+        .collect()
+}
+
+/// The connector never creates the publication (publication.autocreate.mode = disabled).
+fn pg_publication(ctx: &Ctx, r: &Res) -> Check {
+    let pub_name = quote_pg(&ctx.publication);
     match (r.first("publication"), r.err("publication")) {
-        (Some(row), _) => {
-            let all = b(row.get("puballtables")).unwrap_or(false);
-            let dml_ok = b(row.get("pubupdate")).unwrap_or(true)
-                && b(row.get("pubdelete")).unwrap_or(true)
-                && b(row.get("pubinsert")).unwrap_or(true);
-            let in_pub: HashSet<(String, String)> = r
-                .rows("pub_tables")
-                .into_iter()
-                .map(|row| (s(row.get("schemaname")), s(row.get("tablename"))))
-                .collect();
-            let missing: Vec<&(String, String)> = if all {
-                vec![]
-            } else {
-                ctx.tables.iter().filter(|t| !in_pub.contains(*t)).collect()
-            };
-            if !missing.is_empty() {
-                let list = missing
-                    .iter()
-                    .map(|(sc, t)| format!("{}.{}", quote_pg(sc), quote_pg(t)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                checks.push(check("pg.publication", "Publication covers the tables", Status::Fail, format!("Publication {} exists but lacks {} of the selected table(s); their changes would not be captured.", ctx.publication, missing.len())).val(format!("{} table(s) missing", missing.len())).fix(format!("ALTER PUBLICATION {pub_name} ADD TABLE {list};")));
-            } else if !dml_ok {
-                checks.push(check("pg.publication", "Publication publishes all changes", Status::Warn, format!("Publication {} skips some of INSERT/UPDATE/DELETE.", ctx.publication)).fix(format!("ALTER PUBLICATION {pub_name} SET (publish = 'insert, update, delete, truncate');")));
-            } else {
-                checks.push(
-                    check(
-                        "pg.publication",
-                        "Publication ready",
-                        Status::Pass,
-                        if all {
-                            format!("Publication {} covers all tables.", ctx.publication)
-                        } else if ctx.tables.is_empty() {
-                            format!(
-                                "Publication {} exists ({} table(s)).",
-                                ctx.publication,
-                                in_pub.len()
-                            )
-                        } else {
-                            format!(
-                                "Publication {} includes every selected table.",
-                                ctx.publication
-                            )
-                        },
-                    )
-                    .val(ctx.publication.clone()),
-                );
-            }
-        }
+        (Some(row), _) => pg_publication_found(ctx, r, &row, &pub_name),
         (None, None) => {
+            let wanted = pg_table_list(ctx.tables.iter());
             let target = if wanted.is_empty() {
                 "<schema.table>, …".to_string()
             } else {
                 wanted.join(", ")
             };
-            checks.push(check("pg.publication", "Publication exists", Status::Fail, format!("Publication {} does not exist. The connector does not create it (autocreate is off), so Start would fail.", ctx.publication)).want(ctx.publication.clone()).fix(format!("-- As the owner of the tables (or a superuser):\nCREATE PUBLICATION {pub_name} FOR TABLE {target};")));
+            check("pg.publication", "Publication exists", Status::Fail, format!("Publication {} does not exist. The connector does not create it (autocreate is off), so Start would fail.", ctx.publication)).want(ctx.publication.clone()).fix(format!("-- As the owner of the tables (or a superuser):\nCREATE PUBLICATION {pub_name} FOR TABLE {target};"))
         }
-        (None, Some(e)) => {
-            checks.push(unknown("pg.publication", "Publication exists", Some(e), ""))
-        }
+        (None, Some(e)) => unknown("pg.publication", "Publication exists", Some(e), ""),
     }
+}
 
-    // tables
-    if !ctx.tables.is_empty() {
-        let rows = r.rows("tables");
-        if rows.is_empty() && r.err("tables").is_some() {
-            checks.push(unknown("pg.tables", "Selected tables", r.err("tables"), ""));
-        } else {
-            let found: HashSet<(String, String)> = rows
-                .iter()
-                .map(|row| (s(row.get("schema")), s(row.get("name"))))
-                .collect();
-            let absent: Vec<String> = ctx
-                .tables
-                .iter()
-                .filter(|t| !found.contains(*t))
-                .map(|(sc, t)| format!("{sc}.{t}"))
-                .collect();
-            if !absent.is_empty() {
-                checks.push(check(
-                    "pg.tables_exist",
-                    "Tables exist",
-                    Status::Fail,
-                    format!(
-                        "Not found (or not visible to the login): {}",
-                        absent.join(", ")
-                    ),
-                ));
-            }
-            let no_select: Vec<String> = rows
-                .iter()
-                .filter(|row| b(row.get("can_select")) == Some(false))
-                .map(|row| {
-                    format!(
-                        "{}.{}",
-                        quote_pg(&s(row.get("schema"))),
-                        quote_pg(&s(row.get("name")))
-                    )
-                })
-                .collect();
-            if no_select.is_empty() {
-                checks.push(check(
-                    "pg.select",
-                    "Read access to tables",
-                    Status::Pass,
-                    format!(
-                        "The login can SELECT all {} table(s) (needed for the snapshot).",
-                        rows.len()
-                    ),
-                ));
-            } else {
-                checks.push(
-                    check(
-                        "pg.select",
-                        "Read access to tables",
-                        Status::Fail,
-                        format!("No SELECT on: {}", no_select.join(", ")),
-                    )
-                    .fix(format!(
-                        "GRANT SELECT ON {} TO {user};",
-                        no_select.join(", ")
-                    )),
-                );
-            }
-            let no_identity: Vec<String> = rows
-                .iter()
-                .filter(|row| {
-                    !b(row.get("has_pk")).unwrap_or(true)
-                        && matches!(s(row.get("replident")).as_str(), "d" | "n")
-                })
-                .map(|row| {
-                    format!(
-                        "{}.{}",
-                        quote_pg(&s(row.get("schema"))),
-                        quote_pg(&s(row.get("name")))
-                    )
-                })
-                .collect();
-            if no_identity.is_empty() {
-                checks.push(check(
-                    "pg.identity",
-                    "Row identity for updates/deletes",
-                    Status::Pass,
-                    "Every table has a primary key or a replica identity.",
-                ));
-            } else {
-                checks.push(check("pg.identity", "Row identity for updates/deletes", Status::Fail, format!("No primary key and no replica identity: {}. Once these tables are in a publication, UPDATE and DELETE on them fail in your application.", no_identity.join(", "))).fix(no_identity.iter().map(|t| format!("ALTER TABLE {t} REPLICA IDENTITY FULL;  -- or add a primary key")).collect::<Vec<_>>().join("\n")));
-            }
-        }
+fn pg_publication_found(ctx: &Ctx, r: &Res, row: &Row, pub_name: &str) -> Check {
+    let all = b(row.get("puballtables")).unwrap_or(false);
+    let dml_ok = b(row.get("pubupdate")).unwrap_or(true)
+        && b(row.get("pubdelete")).unwrap_or(true)
+        && b(row.get("pubinsert")).unwrap_or(true);
+    let in_pub: HashSet<(String, String)> = r
+        .rows("pub_tables")
+        .into_iter()
+        .map(|row| (s(row.get("schemaname")), s(row.get("tablename"))))
+        .collect();
+    let missing: Vec<&(String, String)> = if all {
+        vec![]
+    } else {
+        ctx.tables.iter().filter(|t| !in_pub.contains(*t)).collect()
+    };
+    if !missing.is_empty() {
+        let list = pg_table_list(missing.iter().copied()).join(", ");
+        return check("pg.publication", "Publication covers the tables", Status::Fail, format!("Publication {} exists but lacks {} of the selected table(s); their changes would not be captured.", ctx.publication, missing.len())).val(format!("{} table(s) missing", missing.len())).fix(format!("ALTER PUBLICATION {pub_name} ADD TABLE {list};"));
     }
+    if !dml_ok {
+        return check(
+            "pg.publication",
+            "Publication publishes all changes",
+            Status::Warn,
+            format!(
+                "Publication {} skips some of INSERT/UPDATE/DELETE.",
+                ctx.publication
+            ),
+        )
+        .fix(format!(
+            "ALTER PUBLICATION {pub_name} SET (publish = 'insert, update, delete, truncate');"
+        ));
+    }
+    let detail = if all {
+        format!("Publication {} covers all tables.", ctx.publication)
+    } else if ctx.tables.is_empty() {
+        format!(
+            "Publication {} exists ({} table(s)).",
+            ctx.publication,
+            in_pub.len()
+        )
+    } else {
+        format!(
+            "Publication {} includes every selected table.",
+            ctx.publication
+        )
+    };
+    check("pg.publication", "Publication ready", Status::Pass, detail).val(ctx.publication.clone())
+}
 
-    // existing slot for this pipeline
-    if let Some(name) = &ctx.slot {
-        if let Some(row) = slots.iter().find(|row| s(row.get("slot_name")) == *name) {
-            let plugin = s(row.get("plugin"));
-            let st = if plugin.is_empty() || plugin == "pgoutput" {
-                Status::Info
-            } else {
-                Status::Warn
-            };
-            checks.push(
-                check(
-                    "pg.own_slot",
-                    "This pipeline's slot",
-                    st,
-                    format!(
-                        "Slot {name} exists ({}, plugin {plugin}). Start resumes from it.",
-                        if b(row.get("active")) == Some(true) {
-                            "active"
-                        } else {
-                            "inactive"
-                        }
-                    ),
-                )
-                .val(name.clone()),
-            );
-        }
+fn pg_qualified(row: &Row) -> String {
+    format!(
+        "{}.{}",
+        quote_pg(&s(row.get("schema"))),
+        quote_pg(&s(row.get("name")))
+    )
+}
+
+fn pg_tables(ctx: &Ctx, r: &Res, user: &str) -> Vec<Check> {
+    let rows = r.rows("tables");
+    if rows.is_empty() && r.err("tables").is_some() {
+        return vec![unknown("pg.tables", "Selected tables", r.err("tables"), "")];
     }
-    (platform.into(), checks, params)
+    let found: HashSet<(String, String)> = rows
+        .iter()
+        .map(|row| (s(row.get("schema")), s(row.get("name"))))
+        .collect();
+    let absent = absent_tables(ctx, &found, |a, t| (a.to_string(), t.to_string()));
+    let mut out: Vec<Check> = tables_exist_check("pg.tables_exist", &absent)
+        .into_iter()
+        .collect();
+    out.push(pg_select(&rows, user));
+    out.push(pg_identity(&rows));
+    out
+}
+
+fn pg_select(rows: &[Row], user: &str) -> Check {
+    let no_select: Vec<String> = rows
+        .iter()
+        .filter(|row| b(row.get("can_select")) == Some(false))
+        .map(pg_qualified)
+        .collect();
+    if no_select.is_empty() {
+        return check(
+            "pg.select",
+            "Read access to tables",
+            Status::Pass,
+            format!(
+                "The login can SELECT all {} table(s) (needed for the snapshot).",
+                rows.len()
+            ),
+        );
+    }
+    check(
+        "pg.select",
+        "Read access to tables",
+        Status::Fail,
+        format!("No SELECT on: {}", no_select.join(", ")),
+    )
+    .fix(format!(
+        "GRANT SELECT ON {} TO {user};",
+        no_select.join(", ")
+    ))
+}
+
+fn pg_lacks_identity(row: &Row) -> bool {
+    !b(row.get("has_pk")).unwrap_or(true) && matches!(s(row.get("replident")).as_str(), "d" | "n")
+}
+
+fn pg_identity(rows: &[Row]) -> Check {
+    let no_identity: Vec<String> = rows
+        .iter()
+        .filter(|row| pg_lacks_identity(row))
+        .map(pg_qualified)
+        .collect();
+    if no_identity.is_empty() {
+        return check(
+            "pg.identity",
+            "Row identity for updates/deletes",
+            Status::Pass,
+            "Every table has a primary key or a replica identity.",
+        );
+    }
+    let fix = no_identity
+        .iter()
+        .map(|t| format!("ALTER TABLE {t} REPLICA IDENTITY FULL;  -- or add a primary key"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    check("pg.identity", "Row identity for updates/deletes", Status::Fail, format!("No primary key and no replica identity: {}. Once these tables are in a publication, UPDATE and DELETE on them fail in your application.", no_identity.join(", "))).fix(fix)
+}
+
+/// An existing slot for this pipeline.
+fn pg_own_slot(ctx: &Ctx, slots: &[Row]) -> Option<Check> {
+    let name = ctx.slot.as_ref()?;
+    let row = slots.iter().find(|row| s(row.get("slot_name")) == *name)?;
+    let plugin = s(row.get("plugin"));
+    let st = if plugin.is_empty() || plugin == "pgoutput" {
+        Status::Info
+    } else {
+        Status::Warn
+    };
+    let state = if b(row.get("active")) == Some(true) {
+        "active"
+    } else {
+        "inactive"
+    };
+    Some(
+        check(
+            "pg.own_slot",
+            "This pipeline's slot",
+            st,
+            format!("Slot {name} exists ({state}, plugin {plugin}). Start resumes from it."),
+        )
+        .val(name.clone()),
+    )
 }
 
 // ── MySQL / MariaDB ─────────────────────────────────────────────────────────────────────
 
 fn eval_my(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
-    let mut checks = Vec::new();
-    let mut params = Vec::new();
-    let maria = ctx.engine == "mariadb";
     let Some(v) = r.first("vars") else {
-        checks.push(unknown("my.vars", "Binary log settings", r.err("vars"), ""));
-        return ("unknown".into(), checks, params);
+        let checks = vec![unknown("my.vars", "Binary log settings", r.err("vars"), "")];
+        return ("unknown".into(), checks, Vec::new());
     };
-    for k in [
-        "version",
-        "comment",
-        "log_bin",
-        "binlog_format",
-        "binlog_row_image",
-        "server_id",
-    ] {
-        params.push(Param {
-            name: if k == "comment" {
-                "version_comment".into()
-            } else {
-                k.into()
-            },
-            value: s(v.get(k)),
-        });
+    let mut params = my_params(&v);
+    let platform = my_platform(r, &v);
+    let rds = is_rds(platform);
+    let mut checks = vec![
+        my_log_bin(&v, rds),
+        my_format(&v, rds),
+        my_row_image(&v, rds),
+    ];
+    checks.extend(my_server_id(&v, rds));
+    checks.extend(my_retention(r, rds));
+    checks.extend(my_gtid(r, &mut params));
+    checks.push(my_grants(r, ctx.engine == "mariadb", &my_user_lit(ctx, r)));
+    if !ctx.tables.is_empty() {
+        checks.extend(my_tables(ctx, r));
     }
-    let basedir = s(v.get("basedir"));
-    let platform = if r.ok("aurora") {
+    (platform.into(), checks, params)
+}
+
+fn my_params(v: &Row) -> Vec<Param> {
+    [
+        ("version", "version"),
+        ("comment", "version_comment"),
+        ("log_bin", "log_bin"),
+        ("binlog_format", "binlog_format"),
+        ("binlog_row_image", "binlog_row_image"),
+        ("server_id", "server_id"),
+    ]
+    .into_iter()
+    .map(|(k, name)| Param {
+        name: name.into(),
+        value: s(v.get(k)),
+    })
+    .collect()
+}
+
+fn my_platform(r: &Res, v: &Row) -> &'static str {
+    if r.ok("aurora") {
         "amazon_aurora"
-    } else if basedir.contains("rdsdbbin") {
+    } else if s(v.get("basedir")).contains("rdsdbbin") {
         "amazon_rds"
     } else if s(v.get("comment")).to_ascii_lowercase().contains("google") {
         "google_cloud_sql"
     } else {
         "self_managed"
-    };
-    let rds = matches!(platform, "amazon_rds" | "amazon_aurora");
-    let user_lit = match r.first("user").map(|u| s(u.get("u"))) {
-        Some(u) if u.contains('@') => {
-            let (n, h) = u.split_once('@').unwrap();
-            format!("'{}'@'{}'", n.replace('\'', "''"), h.replace('\'', "''"))
-        }
-        _ => format!(
-            "'{}'@'%'",
-            if ctx.username.is_empty() {
-                "cdc_user"
-            } else {
-                &ctx.username
-            }
-        ),
-    };
-    let cnf = |line: &str| {
-        if rds {
-            format!("-- RDS/Aurora: set {line} in the DB (cluster) parameter group, then reboot.")
-        } else {
-            format!(
-                "-- my.cnf [mysqld]: {line}  (restart)\nSET PERSIST {};",
-                line.replace(" = ", " = '").to_string() + "'"
-            )
-        }
-    };
-
-    match b(v.get("log_bin")) {
-        Some(true) => checks.push(check("my.log_bin", "Binary log on", Status::Pass, "The server writes a binary log.").val("ON")),
-        Some(false) => checks.push(check("my.log_bin", "Binary log on", Status::Fail, "The binary log is off; CDC reads changes from it.").val("OFF").want("ON").fix(if rds { "-- RDS: turn on automated backups (retention ≥ 1 day); that enables the binary log.\n-- Aurora: set binlog_format in the cluster parameter group and reboot the writer.".to_string() } else { "-- my.cnf [mysqld]:\n--   log_bin = mysql-bin\n--   server_id = 1\n-- restart MySQL".into() })),
-        None => checks.push(unknown("my.log_bin", "Binary log on", None, "")),
     }
+}
+
+fn my_user_lit(ctx: &Ctx, r: &Res) -> String {
+    let current = r.first("user").map(|u| s(u.get("u")));
+    match current.as_deref().and_then(|u| u.split_once('@')) {
+        Some((n, h)) => format!("'{}'@'{}'", n.replace('\'', "''"), h.replace('\'', "''")),
+        None => format!("'{}'@'%'", login_or(ctx, "cdc_user")),
+    }
+}
+
+fn my_cnf(rds: bool, line: &str) -> String {
+    if rds {
+        format!("-- RDS/Aurora: set {line} in the DB (cluster) parameter group, then reboot.")
+    } else {
+        format!(
+            "-- my.cnf [mysqld]: {line}  (restart)\nSET PERSIST {};",
+            line.replace(" = ", " = '").to_string() + "'"
+        )
+    }
+}
+
+fn my_log_bin(v: &Row, rds: bool) -> Check {
+    match b(v.get("log_bin")) {
+        Some(true) => check("my.log_bin", "Binary log on", Status::Pass, "The server writes a binary log.").val("ON"),
+        Some(false) => check("my.log_bin", "Binary log on", Status::Fail, "The binary log is off; CDC reads changes from it.").val("OFF").want("ON").fix(if rds { "-- RDS: turn on automated backups (retention ≥ 1 day); that enables the binary log.\n-- Aurora: set binlog_format in the cluster parameter group and reboot the writer.".to_string() } else { "-- my.cnf [mysqld]:\n--   log_bin = mysql-bin\n--   server_id = 1\n-- restart MySQL".into() }),
+        None => unknown("my.log_bin", "Binary log on", None, ""),
+    }
+}
+
+fn my_format(v: &Row, rds: bool) -> Check {
     let fmt = s(v.get("binlog_format")).to_ascii_uppercase();
-    checks.push(if fmt == "ROW" {
-        check(
+    if fmt == "ROW" {
+        return check(
             "my.format",
             "binlog_format = ROW",
             Status::Pass,
             "Row events carry the changed values.",
         )
-        .val(fmt)
-    } else {
-        check(
-            "my.format",
-            "binlog_format = ROW",
-            Status::Fail,
-            format!("binlog_format is {fmt}; statement/mixed events do not carry row values."),
-        )
-        .val(fmt)
-        .want("ROW")
-        .fix(cnf("binlog_format = ROW"))
-    });
+        .val(fmt);
+    }
+    check(
+        "my.format",
+        "binlog_format = ROW",
+        Status::Fail,
+        format!("binlog_format is {fmt}; statement/mixed events do not carry row values."),
+    )
+    .val(fmt)
+    .want("ROW")
+    .fix(my_cnf(rds, "binlog_format = ROW"))
+}
+
+fn my_row_image(v: &Row, rds: bool) -> Check {
     let img = s(v.get("binlog_row_image")).to_ascii_uppercase();
-    checks.push(if img == "FULL" {
-        check(
+    if img == "FULL" {
+        return check(
             "my.row_image",
             "binlog_row_image = FULL",
             Status::Pass,
             "Events carry every column.",
         )
-        .val(img)
-    } else {
-        check(
-            "my.row_image",
-            "binlog_row_image = FULL",
-            Status::Fail,
-            format!("binlog_row_image is {img}; updates would miss unchanged columns."),
-        )
-        .val(img)
-        .want("FULL")
-        .fix(cnf("binlog_row_image = FULL"))
-    });
-    match n(v.get("server_id")) {
-        Some(0) => checks.push(
+        .val(img);
+    }
+    check(
+        "my.row_image",
+        "binlog_row_image = FULL",
+        Status::Fail,
+        format!("binlog_row_image is {img}; updates would miss unchanged columns."),
+    )
+    .val(img)
+    .want("FULL")
+    .fix(my_cnf(rds, "binlog_row_image = FULL"))
+}
+
+fn my_server_id(v: &Row, rds: bool) -> Option<Check> {
+    match n(v.get("server_id"))? {
+        0 => Some(
             check(
                 "my.server_id",
                 "server_id set",
@@ -1144,9 +1236,9 @@ fn eval_my(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
                 "server_id = 0 disables replication clients.",
             )
             .val("0")
-            .fix(cnf("server_id = 1")),
+            .fix(my_cnf(rds, "server_id = 1")),
         ),
-        Some(id) => checks.push(
+        id => Some(
             check(
                 "my.server_id",
                 "server_id set",
@@ -1155,170 +1247,145 @@ fn eval_my(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
             )
             .val(id.to_string()),
         ),
-        None => {}
     }
-    // retention
+}
+
+const RDS_BINLOG_HOURS: &str = "CALL mysql.rds_set_configuration('binlog retention hours', 72);";
+
+fn my_retention(r: &Res, rds: bool) -> Option<Check> {
     let secs = r.first("retention").and_then(|x| n(x.get("seconds")));
     let days = r.first("retention_days").and_then(|x| n(x.get("days")));
     let ret = secs
         .filter(|s| *s > 0)
         .or_else(|| days.filter(|d| *d > 0).map(|d| d * 86400));
     match ret {
-        Some(s) if s < 86400 => checks.push(check("my.retention", "Binlog retention", Status::Warn, format!("Binary logs are kept {}h. A pipeline stopped longer than that must resnapshot.", s / 3600)).val(format!("{}h", s / 3600)).want(">= 24h").fix(if rds { "CALL mysql.rds_set_configuration('binlog retention hours', 72);".to_string() } else { "SET PERSIST binlog_expire_logs_seconds = 259200;  -- 3 days".into() })),
-        Some(s) => checks.push(check("my.retention", "Binlog retention", Status::Pass, format!("Binary logs are kept {} day(s).", s / 86400)).val(format!("{}d", s / 86400))),
-        None if rds => checks.push(check("my.retention", "Binlog retention", Status::Warn, "On RDS the binlog is purged quickly unless 'binlog retention hours' is set.").fix("CALL mysql.rds_set_configuration('binlog retention hours', 72);")),
-        None => {}
+        Some(s) if s < 86400 => Some(check("my.retention", "Binlog retention", Status::Warn, format!("Binary logs are kept {}h. A pipeline stopped longer than that must resnapshot.", s / 3600)).val(format!("{}h", s / 3600)).want(">= 24h").fix(if rds { RDS_BINLOG_HOURS.to_string() } else { "SET PERSIST binlog_expire_logs_seconds = 259200;  -- 3 days".into() })),
+        Some(s) => Some(check("my.retention", "Binlog retention", Status::Pass, format!("Binary logs are kept {} day(s).", s / 86400)).val(format!("{}d", s / 86400))),
+        None if rds => Some(check("my.retention", "Binlog retention", Status::Warn, "On RDS the binlog is purged quickly unless 'binlog retention hours' is set.").fix(RDS_BINLOG_HOURS)),
+        None => None,
     }
-    if let Some(g) = r.first("gtid") {
-        let mode = s(g.get("gtid_mode"));
-        params.push(Param {
-            name: "gtid_mode".into(),
-            value: mode.clone(),
-        });
-        checks.push(
-            check(
-                "my.gtid",
-                "GTID mode",
-                Status::Info,
-                if mode.eq_ignore_ascii_case("ON") {
-                    "GTIDs on: the pipeline can fail over between replicas."
-                } else {
-                    "GTIDs off: fine for a single server; turn on for replica failover."
-                },
-            )
-            .val(mode),
+}
+
+fn my_gtid(r: &Res, params: &mut Vec<Param>) -> Option<Check> {
+    let g = r.first("gtid")?;
+    let mode = s(g.get("gtid_mode"));
+    params.push(Param {
+        name: "gtid_mode".into(),
+        value: mode.clone(),
+    });
+    let detail = if mode.eq_ignore_ascii_case("ON") {
+        "GTIDs on: the pipeline can fail over between replicas."
+    } else {
+        "GTIDs off: fine for a single server; turn on for replica failover."
+    };
+    Some(check("my.gtid", "GTID mode", Status::Info, detail).val(mode))
+}
+
+fn my_has(privs: &HashSet<String>, maria: bool, p: &str) -> bool {
+    privs.contains("ALL PRIVILEGES")
+        || privs.contains(p)
+        || (maria && p == "REPLICATION CLIENT" && privs.contains("BINLOG MONITOR"))
+}
+
+fn my_grants(r: &Res, maria: bool, user_lit: &str) -> Check {
+    if !r.ok("grants") {
+        return unknown(
+            "my.grants",
+            "Replication privileges",
+            r.err("grants"),
+            "Run SHOW GRANTS as the login to confirm.",
         );
     }
-    // privileges
     let privs: HashSet<String> = r
         .rows("grants")
         .into_iter()
         .map(|row| s(row.get("privilege")).to_ascii_uppercase())
         .collect();
-    if r.ok("grants") {
-        let mut needed = vec![
+    let needed: &[&str] = if maria {
+        &["SELECT", "RELOAD", "SHOW DATABASES", "REPLICATION SLAVE"]
+    } else {
+        &[
             "SELECT",
             "RELOAD",
             "SHOW DATABASES",
             "REPLICATION SLAVE",
             "REPLICATION CLIENT",
-        ];
-        if maria {
-            needed.retain(|p| *p != "REPLICATION CLIENT");
-        }
-        let has = |p: &str| {
-            privs.contains("ALL PRIVILEGES")
-                || privs.contains(p)
-                || (maria && p == "REPLICATION CLIENT" && privs.contains("BINLOG MONITOR"))
-        };
-        let missing: Vec<&str> = needed.into_iter().filter(|p| !has(p)).collect();
-        if missing.is_empty() {
-            checks.push(check(
-                "my.grants",
-                "Replication privileges",
-                Status::Pass,
-                "The login has SELECT, RELOAD, SHOW DATABASES and replication privileges.",
-            ));
-        } else {
-            let mut list = missing.clone();
-            if maria && !has("BINLOG MONITOR") {
-                list.push("BINLOG MONITOR");
-            }
-            checks.push(check("my.grants", "Replication privileges", Status::Warn, format!("Global grants do not show: {}. (Privileges given through roles are not visible here — confirm with SHOW GRANTS.)", missing.join(", "))).fix(format!("GRANT {} ON *.* TO {user_lit};", list.join(", "))));
-        }
-    } else {
-        checks.push(unknown(
+        ]
+    };
+    let missing: Vec<&str> = needed
+        .iter()
+        .copied()
+        .filter(|p| !my_has(&privs, maria, p))
+        .collect();
+    if missing.is_empty() {
+        return check(
             "my.grants",
             "Replication privileges",
-            r.err("grants"),
-            "Run SHOW GRANTS as the login to confirm.",
-        ));
+            Status::Pass,
+            "The login has SELECT, RELOAD, SHOW DATABASES and replication privileges.",
+        );
     }
-    // tables
-    if !ctx.tables.is_empty() {
-        let rows = r.rows("tables");
+    let mut list = missing.clone();
+    if maria && !my_has(&privs, maria, "BINLOG MONITOR") {
+        list.push("BINLOG MONITOR");
+    }
+    check("my.grants", "Replication privileges", Status::Warn, format!("Global grants do not show: {}. (Privileges given through roles are not visible here — confirm with SHOW GRANTS.)", missing.join(", "))).fix(format!("GRANT {} ON *.* TO {user_lit};", list.join(", ")))
+}
+
+fn my_tables(ctx: &Ctx, r: &Res) -> Vec<Check> {
+    let rows = r.rows("tables");
+    let mut out = Vec::new();
+    if r.ok("tables") {
         let found: HashSet<(String, String)> = rows
             .iter()
             .map(|row| (s(row.get("schema")), s(row.get("name"))))
             .collect();
-        let absent: Vec<String> = ctx
-            .tables
-            .iter()
-            .filter(|t| !found.contains(*t))
-            .map(|(sc, t)| format!("{sc}.{t}"))
-            .collect();
-        if !absent.is_empty() && r.ok("tables") {
-            checks.push(check(
-                "my.tables_exist",
-                "Tables exist",
-                Status::Fail,
-                format!(
-                    "Not found (or not visible to the login): {}",
-                    absent.join(", ")
-                ),
-            ));
-        }
-        let non_innodb: Vec<String> = rows
-            .iter()
-            .filter(|row| !s(row.get("engine")).eq_ignore_ascii_case("InnoDB"))
-            .map(|row| {
-                format!(
-                    "{}.{} ({})",
-                    s(row.get("schema")),
-                    s(row.get("name")),
-                    s(row.get("engine"))
-                )
-            })
-            .collect();
-        if !non_innodb.is_empty() {
-            checks.push(check(
-                "my.engine",
-                "Transactional tables",
-                Status::Warn,
-                format!(
-                    "Not InnoDB: {}. The snapshot is not consistent for them.",
-                    non_innodb.join(", ")
-                ),
-            ));
-        }
-        let no_pk: Vec<String> = rows
-            .iter()
-            .filter(|row| b(row.get("has_pk")) == Some(false))
-            .map(|row| format!("{}.{}", s(row.get("schema")), s(row.get("name"))))
-            .collect();
-        if !no_pk.is_empty() {
-            checks.push(check("my.pk", "Primary keys", Status::Warn, format!("No primary key: {}. Events have no key, so the target cannot upsert or delete them.", no_pk.join(", "))));
-        } else if !rows.is_empty() {
-            checks.push(check(
-                "my.pk",
-                "Primary keys",
-                Status::Pass,
-                "Every selected table has a primary key.",
-            ));
-        }
+        let absent = absent_tables(ctx, &found, |a, t| (a.to_string(), t.to_string()));
+        out.extend(tables_exist_check("my.tables_exist", &absent));
     }
-    (platform.into(), checks, params)
+    let non_innodb: Vec<String> = rows
+        .iter()
+        .filter(|row| !s(row.get("engine")).eq_ignore_ascii_case("InnoDB"))
+        .map(|row| {
+            format!(
+                "{}.{} ({})",
+                s(row.get("schema")),
+                s(row.get("name")),
+                s(row.get("engine"))
+            )
+        })
+        .collect();
+    if !non_innodb.is_empty() {
+        out.push(check(
+            "my.engine",
+            "Transactional tables",
+            Status::Warn,
+            format!(
+                "Not InnoDB: {}. The snapshot is not consistent for them.",
+                non_innodb.join(", ")
+            ),
+        ));
+    }
+    let no_pk = no_pk_tables(&rows);
+    if !no_pk.is_empty() {
+        out.push(no_pk_warning("my.pk", &no_pk));
+    } else if !rows.is_empty() {
+        out.push(check(
+            "my.pk",
+            "Primary keys",
+            Status::Pass,
+            "Every selected table has a primary key.",
+        ));
+    }
+    out
 }
 
 // ── SQL Server ──────────────────────────────────────────────────────────────────────────
 
 fn eval_ms(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
-    let mut checks = Vec::new();
-    let mut params = Vec::new();
     let srv = r.first("server");
     let engine_edition = srv.as_ref().and_then(|x| n(x.get("engine_edition")));
-    if let Some(x) = &srv {
-        for (k, name) in [
-            ("version", "ProductVersion"),
-            ("edition", "Edition"),
-            ("engine_edition", "EngineEdition"),
-        ] {
-            params.push(Param {
-                name: name.into(),
-                value: s(x.get(k)),
-            });
-        }
-    }
+    let mut params = ms_params(srv.as_ref());
     let platform = match engine_edition {
         Some(5) | Some(8) | Some(9) => "azure",
         Some(_) => "self_managed",
@@ -1329,258 +1396,241 @@ fn eval_ms(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
     } else {
         ctx.database.clone()
     };
-    match engine_edition {
-        Some(4) => checks.push(
-            check(
-                "ms.edition",
-                "Edition supports CDC",
-                Status::Fail,
-                "SQL Server Express has no CDC (no SQL Server Agent).",
-            )
-            .val(
-                srv.as_ref()
-                    .map(|x| s(x.get("edition")))
-                    .unwrap_or_default(),
-            ),
-        ),
-        Some(e) => {
-            let major = srv
-                .as_ref()
-                .map(|x| s(x.get("version")))
-                .and_then(|v| v.split('.').next().and_then(|m| m.parse::<i64>().ok()))
-                .unwrap_or(0);
-            let ed = srv
-                .as_ref()
-                .map(|x| s(x.get("edition")))
-                .unwrap_or_default();
-            if e == 2 && major > 0 && major < 13 {
-                checks.push(
-                    check(
-                        "ms.edition",
-                        "Edition supports CDC",
-                        Status::Fail,
-                        "CDC on Standard edition needs SQL Server 2016 SP1 or later.",
-                    )
-                    .val(ed),
-                );
-            } else {
-                checks.push(
-                    check(
-                        "ms.edition",
-                        "Edition supports CDC",
-                        Status::Pass,
-                        format!("{ed} supports change data capture."),
-                    )
-                    .val(ed),
-                );
-            }
-        }
-        None => checks.push(unknown(
-            "ms.edition",
-            "Edition supports CDC",
-            r.err("server"),
-            "",
-        )),
-    }
-    match r.first("db") {
-        Some(row) => {
-            params.push(Param {
-                name: "recovery_model".into(),
-                value: s(row.get("recovery_model")),
-            });
-            params.push(Param {
-                name: "snapshot_isolation".into(),
-                value: s(row.get("snapshot_isolation")),
-            });
-            if b(row.get("is_cdc_enabled")) == Some(true) {
-                checks.push(
-                    check(
-                        "ms.db_cdc",
-                        "CDC enabled on the database",
-                        Status::Pass,
-                        format!("Change data capture is on for {db}."),
-                    )
-                    .val("on"),
-                );
-            } else {
-                let fix = if platform == "azure" {
-                    format!(
-                        "USE {};\nEXEC sys.sp_cdc_enable_db;  -- as db_owner",
-                        quote_ms(&db)
-                    )
-                } else {
-                    format!(
-                        "USE {};\nEXEC sys.sp_cdc_enable_db;  -- as sysadmin",
-                        quote_ms(&db)
-                    )
-                };
-                checks.push(
-                    check(
-                        "ms.db_cdc",
-                        "CDC enabled on the database",
-                        Status::Fail,
-                        format!("Change data capture is off for {db}."),
-                    )
-                    .val("off")
-                    .want("on")
-                    .fix(fix),
-                );
-            }
-        }
-        None => checks.push(unknown(
-            "ms.db_cdc",
-            "CDC enabled on the database",
-            r.err("db"),
-            "",
-        )),
-    }
-    // capture job runs under SQL Server Agent (Azure SQL Database has its own scheduler)
-    if engine_edition == Some(5) {
-        checks.push(check(
-            "ms.agent",
-            "Capture job scheduler",
-            Status::Info,
-            "Azure SQL Database runs the CDC capture itself (no SQL Server Agent).",
-        ));
-    } else {
-        match r.first("agent") {
-            Some(row) => {
-                let st = s(row.get("status"));
-                if st.eq_ignore_ascii_case("Running") {
-                    checks.push(check("ms.agent", "SQL Server Agent running", Status::Pass, "The CDC capture and cleanup jobs can run.").val(st));
-                } else {
-                    checks.push(check("ms.agent", "SQL Server Agent running", Status::Fail, format!("SQL Server Agent is {st}; the capture job does not run, so no changes reach the change tables.")).val(st).want("Running").fix("-- Start SQL Server Agent and set it to start automatically\n-- (SQL Server Configuration Manager, or: net start SQLSERVERAGENT)"));
-                }
-            }
-            None => checks.push(unknown("ms.agent", "SQL Server Agent running", r.err("agent").or(Some("no service row")), "Needs VIEW SERVER STATE to read sys.dm_server_services; or check in SSMS that SQL Server Agent runs.")),
-        }
-    }
-    if let Some(row) = r.first("perms") {
-        let sysadmin = b(row.get("sysadmin")) == Some(true);
-        let owner = b(row.get("db_owner")) == Some(true);
-        let cdc_sel = b(row.get("cdc_select"));
-        if sysadmin || owner || cdc_sel == Some(true) {
-            checks.push(check(
-                "ms.perms",
-                "Read the change tables",
-                Status::Pass,
-                if sysadmin {
-                    "The login is sysadmin."
-                } else if owner {
-                    "The login is db_owner."
-                } else {
-                    "The login can SELECT the cdc schema."
-                },
-            ));
-        } else {
-            let login = if ctx.username.is_empty() {
-                "cdc_user".to_string()
-            } else {
-                ctx.username.clone()
-            };
-            checks.push(check("ms.perms", "Read the change tables", Status::Warn, "The login is neither db_owner nor allowed to SELECT the cdc schema; it may not read the change tables (unless a gating role grants it).").fix(format!("USE {};\nGRANT SELECT ON SCHEMA::cdc TO {};\nGRANT SELECT ON SCHEMA::dbo TO {};  -- each captured schema", quote_ms(&db), quote_ms(&login), quote_ms(&login))));
-        }
-    }
+    let mut checks = vec![
+        ms_edition(r, srv.as_ref(), engine_edition),
+        ms_db_cdc(r, &db, platform, &mut params),
+        ms_agent(r, engine_edition),
+    ];
+    checks.extend(ms_perms(ctx, r, &db));
     if !ctx.tables.is_empty() {
-        let rows = r.rows("tables");
-        if rows.is_empty() && r.err("tables").is_some() {
-            checks.push(unknown(
-                "ms.tables",
-                "Tables tracked by CDC",
-                r.err("tables"),
-                "",
-            ));
-        } else {
-            let found: HashSet<(String, String)> = rows
-                .iter()
-                .map(|row| {
-                    (
-                        s(row.get("schema")).to_lowercase(),
-                        s(row.get("name")).to_lowercase(),
-                    )
-                })
-                .collect();
-            let absent: Vec<String> = ctx
-                .tables
-                .iter()
-                .filter(|(a, t)| !found.contains(&(a.to_lowercase(), t.to_lowercase())))
-                .map(|(a, t)| format!("{a}.{t}"))
-                .collect();
-            if !absent.is_empty() {
-                checks.push(check(
-                    "ms.tables_exist",
-                    "Tables exist",
-                    Status::Fail,
-                    format!(
-                        "Not found (or not visible to the login): {}",
-                        absent.join(", ")
-                    ),
-                ));
-            }
-            let untracked: Vec<(String, String)> = rows
-                .iter()
-                .filter(|row| b(row.get("tracked")) == Some(false))
-                .map(|row| (s(row.get("schema")), s(row.get("name"))))
-                .collect();
-            if untracked.is_empty() {
-                checks.push(check(
-                    "ms.tables",
-                    "Tables tracked by CDC",
-                    Status::Pass,
-                    format!("All {} table(s) have a capture instance.", rows.len()),
-                ));
-            } else {
-                let fix = format!("USE {};\n{}", quote_ms(&db), untracked.iter().map(|(a, t)| format!("EXEC sys.sp_cdc_enable_table @source_schema = N{}, @source_name = N{}, @role_name = NULL, @supports_net_changes = 0;", lit(a), lit(t))).collect::<Vec<_>>().join("\n"));
-                checks.push(
-                    check(
-                        "ms.tables",
-                        "Tables tracked by CDC",
-                        Status::Fail,
-                        format!(
-                            "No capture instance: {}",
-                            untracked
-                                .iter()
-                                .map(|(a, t)| format!("{a}.{t}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    )
-                    .fix(fix),
-                );
-            }
-            let no_pk: Vec<String> = rows
-                .iter()
-                .filter(|row| b(row.get("has_pk")) == Some(false))
-                .map(|row| format!("{}.{}", s(row.get("schema")), s(row.get("name"))))
-                .collect();
-            if !no_pk.is_empty() {
-                checks.push(check("ms.pk", "Primary keys", Status::Warn, format!("No primary key: {}. Events have no key, so the target cannot upsert or delete them.", no_pk.join(", "))));
-            }
-        }
+        checks.extend(ms_tables(ctx, r, &db));
     }
     (platform.into(), checks, params)
 }
 
+fn ms_params(srv: Option<&Row>) -> Vec<Param> {
+    let Some(x) = srv else { return Vec::new() };
+    [
+        ("version", "ProductVersion"),
+        ("edition", "Edition"),
+        ("engine_edition", "EngineEdition"),
+    ]
+    .into_iter()
+    .map(|(k, name)| Param {
+        name: name.into(),
+        value: s(x.get(k)),
+    })
+    .collect()
+}
+
+fn ms_edition(r: &Res, srv: Option<&Row>, engine_edition: Option<i64>) -> Check {
+    let Some(e) = engine_edition else {
+        return unknown("ms.edition", "Edition supports CDC", r.err("server"), "");
+    };
+    let ed = srv.map(|x| s(x.get("edition"))).unwrap_or_default();
+    if e == 4 {
+        return check(
+            "ms.edition",
+            "Edition supports CDC",
+            Status::Fail,
+            "SQL Server Express has no CDC (no SQL Server Agent).",
+        )
+        .val(ed);
+    }
+    let major = srv
+        .map(|x| s(x.get("version")))
+        .and_then(|v| v.split('.').next().and_then(|m| m.parse::<i64>().ok()))
+        .unwrap_or(0);
+    if e == 2 && major > 0 && major < 13 {
+        return check(
+            "ms.edition",
+            "Edition supports CDC",
+            Status::Fail,
+            "CDC on Standard edition needs SQL Server 2016 SP1 or later.",
+        )
+        .val(ed);
+    }
+    check(
+        "ms.edition",
+        "Edition supports CDC",
+        Status::Pass,
+        format!("{ed} supports change data capture."),
+    )
+    .val(ed)
+}
+
+fn ms_db_cdc(r: &Res, db: &str, platform: &str, params: &mut Vec<Param>) -> Check {
+    let Some(row) = r.first("db") else {
+        return unknown("ms.db_cdc", "CDC enabled on the database", r.err("db"), "");
+    };
+    params.push(Param {
+        name: "recovery_model".into(),
+        value: s(row.get("recovery_model")),
+    });
+    params.push(Param {
+        name: "snapshot_isolation".into(),
+        value: s(row.get("snapshot_isolation")),
+    });
+    if b(row.get("is_cdc_enabled")) == Some(true) {
+        return check(
+            "ms.db_cdc",
+            "CDC enabled on the database",
+            Status::Pass,
+            format!("Change data capture is on for {db}."),
+        )
+        .val("on");
+    }
+    let who = if platform == "azure" {
+        "db_owner"
+    } else {
+        "sysadmin"
+    };
+    check(
+        "ms.db_cdc",
+        "CDC enabled on the database",
+        Status::Fail,
+        format!("Change data capture is off for {db}."),
+    )
+    .val("off")
+    .want("on")
+    .fix(format!(
+        "USE {};\nEXEC sys.sp_cdc_enable_db;  -- as {who}",
+        quote_ms(db)
+    ))
+}
+
+/// The capture job runs under SQL Server Agent (Azure SQL Database has its own scheduler).
+fn ms_agent(r: &Res, engine_edition: Option<i64>) -> Check {
+    if engine_edition == Some(5) {
+        return check(
+            "ms.agent",
+            "Capture job scheduler",
+            Status::Info,
+            "Azure SQL Database runs the CDC capture itself (no SQL Server Agent).",
+        );
+    }
+    let Some(row) = r.first("agent") else {
+        return unknown("ms.agent", "SQL Server Agent running", r.err("agent").or(Some("no service row")), "Needs VIEW SERVER STATE to read sys.dm_server_services; or check in SSMS that SQL Server Agent runs.");
+    };
+    let st = s(row.get("status"));
+    if st.eq_ignore_ascii_case("Running") {
+        return check(
+            "ms.agent",
+            "SQL Server Agent running",
+            Status::Pass,
+            "The CDC capture and cleanup jobs can run.",
+        )
+        .val(st);
+    }
+    check("ms.agent", "SQL Server Agent running", Status::Fail, format!("SQL Server Agent is {st}; the capture job does not run, so no changes reach the change tables.")).val(st).want("Running").fix("-- Start SQL Server Agent and set it to start automatically\n-- (SQL Server Configuration Manager, or: net start SQLSERVERAGENT)")
+}
+
+/// Why the login can read the change tables, if it can.
+fn ms_reader(row: &Row) -> Option<&'static str> {
+    if b(row.get("sysadmin")) == Some(true) {
+        Some("The login is sysadmin.")
+    } else if b(row.get("db_owner")) == Some(true) {
+        Some("The login is db_owner.")
+    } else if b(row.get("cdc_select")) == Some(true) {
+        Some("The login can SELECT the cdc schema.")
+    } else {
+        None
+    }
+}
+
+fn ms_perms(ctx: &Ctx, r: &Res, db: &str) -> Option<Check> {
+    let row = r.first("perms")?;
+    if let Some(why) = ms_reader(&row) {
+        return Some(check(
+            "ms.perms",
+            "Read the change tables",
+            Status::Pass,
+            why,
+        ));
+    }
+    let login = quote_ms(&login_or(ctx, "cdc_user"));
+    Some(check("ms.perms", "Read the change tables", Status::Warn, "The login is neither db_owner nor allowed to SELECT the cdc schema; it may not read the change tables (unless a gating role grants it).").fix(format!("USE {};\nGRANT SELECT ON SCHEMA::cdc TO {login};\nGRANT SELECT ON SCHEMA::dbo TO {login};  -- each captured schema", quote_ms(db))))
+}
+
+fn ms_tables(ctx: &Ctx, r: &Res, db: &str) -> Vec<Check> {
+    let rows = r.rows("tables");
+    if rows.is_empty() && r.err("tables").is_some() {
+        return vec![unknown(
+            "ms.tables",
+            "Tables tracked by CDC",
+            r.err("tables"),
+            "",
+        )];
+    }
+    let found: HashSet<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                s(row.get("schema")).to_lowercase(),
+                s(row.get("name")).to_lowercase(),
+            )
+        })
+        .collect();
+    let absent = absent_tables(ctx, &found, |a, t| (a.to_lowercase(), t.to_lowercase()));
+    let mut out: Vec<Check> = tables_exist_check("ms.tables_exist", &absent)
+        .into_iter()
+        .collect();
+    out.push(ms_tracked(&rows, db));
+    let no_pk = no_pk_tables(&rows);
+    if !no_pk.is_empty() {
+        out.push(no_pk_warning("ms.pk", &no_pk));
+    }
+    out
+}
+
+fn ms_tracked(rows: &[Row], db: &str) -> Check {
+    let untracked: Vec<(String, String)> = rows
+        .iter()
+        .filter(|row| b(row.get("tracked")) == Some(false))
+        .map(|row| (s(row.get("schema")), s(row.get("name"))))
+        .collect();
+    if untracked.is_empty() {
+        return check(
+            "ms.tables",
+            "Tables tracked by CDC",
+            Status::Pass,
+            format!("All {} table(s) have a capture instance.", rows.len()),
+        );
+    }
+    let enable = untracked.iter().map(|(a, t)| format!("EXEC sys.sp_cdc_enable_table @source_schema = N{}, @source_name = N{}, @role_name = NULL, @supports_net_changes = 0;", lit(a), lit(t))).collect::<Vec<_>>().join("\n");
+    let names = untracked
+        .iter()
+        .map(|(a, t)| format!("{a}.{t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    check(
+        "ms.tables",
+        "Tables tracked by CDC",
+        Status::Fail,
+        format!("No capture instance: {names}"),
+    )
+    .fix(format!("USE {};\n{enable}", quote_ms(db)))
+}
+
 // ── Oracle ──────────────────────────────────────────────────────────────────────────────
 
+const ORA_DICT_GRANT: &str =
+    "Grant SELECT_CATALOG_ROLE (or SELECT ON V_$DATABASE) to let the check read it.";
+
 fn eval_ora(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
-    let mut checks = Vec::new();
-    let mut params = Vec::new();
     let user = if ctx.username.is_empty() {
         "C##DBZUSER".to_string()
     } else {
         ctx.username.to_ascii_uppercase()
     };
-    const DICT_GRANT: &str =
-        "Grant SELECT_CATALOG_ROLE (or SELECT ON V_$DATABASE) to let the check read it.";
+    let mut params = Vec::new();
     if let Some(v) = r.first("version") {
         params.push(Param {
             name: "version".into(),
             value: s(v.get("version")),
         });
     }
-    let sess = r.first("session");
-    if let Some(x) = &sess {
+    if let Some(x) = r.first("session") {
         params.push(Param {
             name: "con_name".into(),
             value: s(x.get("con_name")),
@@ -1588,190 +1638,213 @@ fn eval_ora(ctx: &Ctx, r: &Res) -> (String, Vec<Check>, Vec<Param>) {
     }
     let db = r.first("db");
     let cdb = db.as_ref().map(|x| s(x.get("cdb"))).unwrap_or_default() == "YES";
-    match &db {
-        Some(row) => {
-            for k in [
-                "log_mode",
-                "supp_min",
-                "supp_all",
-                "force_logging",
-                "cdb",
-                "open_mode",
-                "database_role",
-            ] {
-                params.push(Param {
-                    name: k.into(),
-                    value: s(row.get(k)),
-                });
-            }
-            let mode = s(row.get("log_mode"));
-            checks.push(if mode == "ARCHIVELOG" {
-                check("ora.archivelog", "ARCHIVELOG mode", Status::Pass, "Redo is archived, so LogMiner can read past changes.").val(mode)
-            } else {
-                check("ora.archivelog", "ARCHIVELOG mode", Status::Fail, format!("The database runs in {mode}; LogMiner needs ARCHIVELOG (requires a short restart).")).val(mode).want("ARCHIVELOG").fix("-- As SYSDBA (brief outage):\nSHUTDOWN IMMEDIATE;\nSTARTUP MOUNT;\nALTER DATABASE ARCHIVELOG;\nALTER DATABASE OPEN;\n-- Amazon RDS: enable automated backups instead.")
-            });
-            let min = s(row.get("supp_min"));
-            let all = s(row.get("supp_all")) == "YES";
-            checks.push(if min == "YES" || min == "IMPLICIT" {
-                check("ora.supp_min", "Minimal supplemental logging", Status::Pass, "Database-level supplemental logging is on.").val(min)
-            } else {
-                check("ora.supp_min", "Minimal supplemental logging", Status::Fail, "Supplemental logging is off; LogMiner cannot reconstruct row changes.").val(min).want("YES").fix("ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;\n-- Amazon RDS: EXEC rdsadmin.rdsadmin_util.alter_supplemental_logging(p_action => 'ADD');")
-            });
-            let role = s(row.get("database_role"));
-            if !role.is_empty() && role != "PRIMARY" {
-                checks.push(check("ora.role", "Primary database", Status::Warn, format!("The database role is {role}. Capture from the primary unless you run LogMiner on an Active Data Guard standby on purpose.")).val(role));
-            }
-            // per-table ALL COLUMNS logging (not needed when the whole database logs all columns)
-            if !ctx.tables.is_empty() {
-                if all {
-                    checks.push(check(
-                        "ora.supp_tables",
-                        "All-column logging for tables",
-                        Status::Pass,
-                        "The database logs all columns for every table.",
-                    ));
-                } else if r.ok("table_logs") {
-                    let have: HashSet<(String, String)> = r
-                        .rows("table_logs")
-                        .into_iter()
-                        .map(|row| (s(row.get("owner")), s(row.get("table_name"))))
-                        .collect();
-                    let missing: Vec<(String, String)> = ctx
-                        .tables
-                        .iter()
-                        .map(|(o, t)| (o.to_ascii_uppercase(), t.to_ascii_uppercase()))
-                        .filter(|k| !have.contains(k))
-                        .collect();
-                    if missing.is_empty() {
-                        checks.push(check(
-                            "ora.supp_tables",
-                            "All-column logging for tables",
-                            Status::Pass,
-                            "Every selected table logs all columns.",
-                        ));
-                    } else {
-                        checks.push(check("ora.supp_tables", "All-column logging for tables", Status::Fail, format!("{} table(s) without ALL COLUMNS supplemental logging; updates would miss unchanged columns.", missing.len())).fix(missing.iter().map(|(o, t)| format!("ALTER TABLE {o}.{t} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;")).collect::<Vec<_>>().join("\n")));
-                    }
-                } else {
-                    checks.push(unknown(
-                        "ora.supp_tables",
-                        "All-column logging for tables",
-                        r.err("table_logs"),
-                        "",
-                    ));
-                }
-            }
-        }
-        None => {
-            checks.push(unknown(
+    let mut checks = match &db {
+        Some(row) => ora_db(ctx, r, row, &mut params),
+        None => vec![
+            unknown(
                 "ora.archivelog",
                 "ARCHIVELOG mode",
                 r.err("db"),
-                DICT_GRANT,
-            ));
-            checks.push(unknown(
+                ORA_DICT_GRANT,
+            ),
+            unknown(
                 "ora.supp_min",
                 "Minimal supplemental logging",
                 r.err("db"),
-                DICT_GRANT,
-            ));
-        }
-    }
-    // privileges of the session
-    if r.ok("privs") {
-        let privs: HashSet<String> = r
-            .rows("privs")
-            .into_iter()
-            .map(|row| s(row.get("privilege")))
-            .collect();
-        let roles: HashSet<String> = r
-            .rows("roles")
-            .into_iter()
-            .map(|row| s(row.get("role")))
-            .collect();
-        let dba = roles.contains("DBA");
-        let has = |p: &str| dba || privs.contains(p);
-        let mut missing = Vec::new();
-        for p in [
-            "CREATE SESSION",
-            "SELECT ANY TRANSACTION",
-            "FLASHBACK ANY TABLE",
-            "CREATE TABLE",
-        ] {
-            if !has(p) {
-                missing.push(p.to_string());
-            }
-        }
-        if !(has("LOGMINING") || roles.contains("EXECUTE_CATALOG_ROLE")) {
-            missing.push("LOGMINING".into());
-        }
-        if !(has("SELECT ANY DICTIONARY") || roles.contains("SELECT_CATALOG_ROLE")) {
-            missing.push("SELECT_CATALOG_ROLE".into());
-        }
-        if cdb && !has("SET CONTAINER") {
-            missing.push("SET CONTAINER".into());
-        }
-        if missing.is_empty() {
-            checks.push(check(
-                "ora.privs",
-                "LogMiner privileges",
-                Status::Pass,
-                if dba {
-                    "The login has the DBA role."
-                } else {
-                    "The login has the LogMiner, dictionary and snapshot privileges."
-                },
-            ));
-        } else {
-            let container = if cdb { " CONTAINER=ALL" } else { "" };
-            checks.push(
-                check(
-                    "ora.privs",
-                    "LogMiner privileges",
-                    Status::Fail,
-                    format!("Missing: {}", missing.join(", ")),
-                )
-                .fix(
-                    missing
-                        .iter()
-                        .map(|p| format!("GRANT {p} TO {user}{container};"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-            );
-        }
+                ORA_DICT_GRANT,
+            ),
+        ],
+    };
+    checks.push(ora_privs(r, cdb, &user));
+    checks.extend(ora_redo(r, &mut params));
+    let platform = if params.iter().any(|p| p.value.contains("RDS")) {
+        "amazon_rds"
     } else {
-        checks.push(unknown(
-            "ora.privs",
-            "LogMiner privileges",
-            r.err("privs"),
-            "",
-        ));
+        "self_managed"
+    };
+    (platform.into(), checks, params)
+}
+
+fn ora_db(ctx: &Ctx, r: &Res, row: &Row, params: &mut Vec<Param>) -> Vec<Check> {
+    for k in [
+        "log_mode",
+        "supp_min",
+        "supp_all",
+        "force_logging",
+        "cdb",
+        "open_mode",
+        "database_role",
+    ] {
+        params.push(Param {
+            name: k.into(),
+            value: s(row.get(k)),
+        });
     }
-    if let Some(row) = r.first("redo") {
-        let mb = n(row.get("min_mb")).unwrap_or(0);
-        params.push(Param {
-            name: "redo_groups".into(),
-            value: s(row.get("groups_count")),
-        });
-        params.push(Param {
-            name: "redo_min_mb".into(),
-            value: mb.to_string(),
-        });
-        if mb > 0 && mb < 500 {
-            checks.push(check("ora.redo", "Redo log size", Status::Warn, format!("Smallest redo log is {mb} MB. Small logs switch often and make LogMiner fall behind under load; 1–2 GB is typical.")).val(format!("{mb} MB")));
+    let mut checks = vec![ora_archivelog(row), ora_supp_min(row)];
+    let role = s(row.get("database_role"));
+    if !role.is_empty() && role != "PRIMARY" {
+        checks.push(check("ora.role", "Primary database", Status::Warn, format!("The database role is {role}. Capture from the primary unless you run LogMiner on an Active Data Guard standby on purpose.")).val(role));
+    }
+    if !ctx.tables.is_empty() {
+        checks.push(ora_supp_tables(ctx, r, s(row.get("supp_all")) == "YES"));
+    }
+    checks
+}
+
+fn ora_archivelog(row: &Row) -> Check {
+    let mode = s(row.get("log_mode"));
+    if mode == "ARCHIVELOG" {
+        return check(
+            "ora.archivelog",
+            "ARCHIVELOG mode",
+            Status::Pass,
+            "Redo is archived, so LogMiner can read past changes.",
+        )
+        .val(mode);
+    }
+    check("ora.archivelog", "ARCHIVELOG mode", Status::Fail, format!("The database runs in {mode}; LogMiner needs ARCHIVELOG (requires a short restart).")).val(mode).want("ARCHIVELOG").fix("-- As SYSDBA (brief outage):\nSHUTDOWN IMMEDIATE;\nSTARTUP MOUNT;\nALTER DATABASE ARCHIVELOG;\nALTER DATABASE OPEN;\n-- Amazon RDS: enable automated backups instead.")
+}
+
+fn ora_supp_min(row: &Row) -> Check {
+    let min = s(row.get("supp_min"));
+    if min == "YES" || min == "IMPLICIT" {
+        return check(
+            "ora.supp_min",
+            "Minimal supplemental logging",
+            Status::Pass,
+            "Database-level supplemental logging is on.",
+        )
+        .val(min);
+    }
+    check("ora.supp_min", "Minimal supplemental logging", Status::Fail, "Supplemental logging is off; LogMiner cannot reconstruct row changes.").val(min).want("YES").fix("ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;\n-- Amazon RDS: EXEC rdsadmin.rdsadmin_util.alter_supplemental_logging(p_action => 'ADD');")
+}
+
+/// Per-table ALL COLUMNS logging (not needed when the whole database logs all columns).
+fn ora_supp_tables(ctx: &Ctx, r: &Res, all: bool) -> Check {
+    const ID: &str = "ora.supp_tables";
+    const TITLE: &str = "All-column logging for tables";
+    if all {
+        return check(
+            ID,
+            TITLE,
+            Status::Pass,
+            "The database logs all columns for every table.",
+        );
+    }
+    if !r.ok("table_logs") {
+        return unknown(ID, TITLE, r.err("table_logs"), "");
+    }
+    let have: HashSet<(String, String)> = r
+        .rows("table_logs")
+        .into_iter()
+        .map(|row| (s(row.get("owner")), s(row.get("table_name"))))
+        .collect();
+    let missing: Vec<(String, String)> = ctx
+        .tables
+        .iter()
+        .map(|(o, t)| (o.to_ascii_uppercase(), t.to_ascii_uppercase()))
+        .filter(|k| !have.contains(k))
+        .collect();
+    if missing.is_empty() {
+        return check(
+            ID,
+            TITLE,
+            Status::Pass,
+            "Every selected table logs all columns.",
+        );
+    }
+    let fix = missing
+        .iter()
+        .map(|(o, t)| format!("ALTER TABLE {o}.{t} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    check(ID, TITLE, Status::Fail, format!("{} table(s) without ALL COLUMNS supplemental logging; updates would miss unchanged columns.", missing.len())).fix(fix)
+}
+
+/// Privileges LogMiner needs that the session lacks, and whether it has the DBA role.
+fn ora_missing_privs(r: &Res, cdb: bool) -> (Vec<String>, bool) {
+    let privs: HashSet<String> = r
+        .rows("privs")
+        .into_iter()
+        .map(|row| s(row.get("privilege")))
+        .collect();
+    let roles: HashSet<String> = r
+        .rows("roles")
+        .into_iter()
+        .map(|row| s(row.get("role")))
+        .collect();
+    let dba = roles.contains("DBA");
+    let has = |p: &str| dba || privs.contains(p);
+    let mut missing: Vec<String> = [
+        "CREATE SESSION",
+        "SELECT ANY TRANSACTION",
+        "FLASHBACK ANY TABLE",
+        "CREATE TABLE",
+    ]
+    .into_iter()
+    .filter(|p| !has(p))
+    .map(String::from)
+    .collect();
+    let via_role = [
+        ("LOGMINING", "EXECUTE_CATALOG_ROLE", "LOGMINING"),
+        (
+            "SELECT ANY DICTIONARY",
+            "SELECT_CATALOG_ROLE",
+            "SELECT_CATALOG_ROLE",
+        ),
+    ];
+    for (privilege, role, grant) in via_role {
+        if !has(privilege) && !roles.contains(role) {
+            missing.push(grant.into());
         }
     }
-    (
-        if params.iter().any(|p| p.value.contains("RDS")) {
-            "amazon_rds"
+    if cdb && !has("SET CONTAINER") {
+        missing.push("SET CONTAINER".into());
+    }
+    (missing, dba)
+}
+
+fn ora_privs(r: &Res, cdb: bool, user: &str) -> Check {
+    if !r.ok("privs") {
+        return unknown("ora.privs", "LogMiner privileges", r.err("privs"), "");
+    }
+    let (missing, dba) = ora_missing_privs(r, cdb);
+    if missing.is_empty() {
+        let detail = if dba {
+            "The login has the DBA role."
         } else {
-            "self_managed"
-        }
-        .into(),
-        checks,
-        params,
+            "The login has the LogMiner, dictionary and snapshot privileges."
+        };
+        return check("ora.privs", "LogMiner privileges", Status::Pass, detail);
+    }
+    let container = if cdb { " CONTAINER=ALL" } else { "" };
+    check(
+        "ora.privs",
+        "LogMiner privileges",
+        Status::Fail,
+        format!("Missing: {}", missing.join(", ")),
     )
+    .fix(
+        missing
+            .iter()
+            .map(|p| format!("GRANT {p} TO {user}{container};"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn ora_redo(r: &Res, params: &mut Vec<Param>) -> Option<Check> {
+    let row = r.first("redo")?;
+    let mb = n(row.get("min_mb")).unwrap_or(0);
+    params.push(Param {
+        name: "redo_groups".into(),
+        value: s(row.get("groups_count")),
+    });
+    params.push(Param {
+        name: "redo_min_mb".into(),
+        value: mb.to_string(),
+    });
+    (mb > 0 && mb < 500).then(|| check("ora.redo", "Redo log size", Status::Warn, format!("Smallest redo log is {mb} MB. Small logs switch often and make LogMiner fall behind under load; 1–2 GB is typical.")).val(format!("{mb} MB")))
 }
 
 #[cfg(test)]

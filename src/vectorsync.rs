@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::models::{VectorSyncProfile, VectorSyncProfileRequest};
+use crate::models::{
+    VectorSyncEmbedding, VectorSyncProfile, VectorSyncProfileRequest, VectorSyncTarget,
+};
 use crate::saved_secret::REDACTED;
 use crate::tool_sidecar::SidecarAccess;
 use crate::AppState;
@@ -167,7 +169,18 @@ fn valid_topic(s: &str) -> bool {
 
 /// Field checks the UI can show next to the input. The sidecar re-checks templates.
 pub fn validate(req: &VectorSyncProfileRequest) -> Result<(), AppError> {
-    let bad = |m: &str| Err(AppError::BadRequest(m.to_string()));
+    validate_basics(req)?;
+    validate_embedding(&req.embedding)?;
+    validate_target(&req.target)?;
+    validate_projection(&req.projection)?;
+    validate_id_strategy(&req.id_strategy)
+}
+
+fn bad(m: &str) -> Result<(), AppError> {
+    Err(AppError::BadRequest(m.to_string()))
+}
+
+fn validate_basics(req: &VectorSyncProfileRequest) -> Result<(), AppError> {
     if req.name.trim().is_empty() {
         return bad("name is required");
     }
@@ -185,19 +198,24 @@ pub fn validate(req: &VectorSyncProfileRequest) -> Result<(), AppError> {
     if !matches!(req.delete_mode.as_str(), "" | "hard" | "soft") {
         return bad("delete_mode must be hard or soft");
     }
-    let provider = req.embedding.provider.trim();
+    Ok(())
+}
+
+fn validate_embedding(e: &VectorSyncEmbedding) -> Result<(), AppError> {
+    let provider = e.provider.trim();
     if !provider.is_empty() && !PROVIDERS.contains(&provider) {
         return bad("embedding.provider must be ollama, openai or hash");
     }
-    if provider == "openai" && req.embedding.model.trim().is_empty() {
+    if provider == "openai" && e.model.trim().is_empty() {
         return bad("embedding.model is required for an OpenAI-compatible server");
     }
-    if let Some(d) = req.embedding.dimensions {
-        if d == 0 || d > 16000 {
-            return bad("embedding.dimensions must be 1-16000");
-        }
+    if e.dimensions.is_some_and(|d| d == 0 || d > 16000) {
+        return bad("embedding.dimensions must be 1-16000");
     }
-    let t = &req.target;
+    Ok(())
+}
+
+fn validate_target(t: &VectorSyncTarget) -> Result<(), AppError> {
     if t.host.trim().is_empty() || t.database.trim().is_empty() || t.username.trim().is_empty() {
         return bad("target host, database and username are required");
     }
@@ -209,20 +227,26 @@ pub fn validate(req: &VectorSyncProfileRequest) -> Result<(), AppError> {
             "target.collection: letters, digits, _ . - (max 63, starts with a letter, digit or _)",
         );
     }
-    for (name, cfg) in projection_tables(&req.projection) {
-        if let Some(tpl) = cfg.get("content_template").and_then(Value::as_str) {
-            if let Some(err) = template_error(tpl) {
-                return Err(AppError::BadRequest(format!("projection {name}: {err}")));
-            }
-        }
-    }
-    if req.id_strategy.get("kind").and_then(Value::as_str) == Some("composite")
-        && req
-            .id_strategy
-            .get("pk_fields")
-            .and_then(Value::as_array)
-            .is_none_or(|a| a.is_empty())
-    {
+    Ok(())
+}
+
+fn validate_projection(projection: &Value) -> Result<(), AppError> {
+    let err = projection_tables(projection)
+        .into_iter()
+        .find_map(|(name, cfg)| {
+            let tpl = cfg.get("content_template").and_then(Value::as_str)?;
+            template_error(tpl).map(|e| format!("projection {name}: {e}"))
+        });
+    err.map_or(Ok(()), |e| Err(AppError::BadRequest(e)))
+}
+
+fn validate_id_strategy(id: &Value) -> Result<(), AppError> {
+    let composite = id.get("kind").and_then(Value::as_str) == Some("composite");
+    let no_fields = id
+        .get("pk_fields")
+        .and_then(Value::as_array)
+        .is_none_or(|a| a.is_empty());
+    if composite && no_fields {
         return bad("id_strategy composite needs pk_fields");
     }
     Ok(())

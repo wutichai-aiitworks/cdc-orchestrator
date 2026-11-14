@@ -48,30 +48,41 @@ async fn fill_saved(
     let mut saved = load(state, id).await?;
     vectorsync::open_secrets(&state.config, &mut saved)?;
     if let Some(t) = target {
-        if t.password == REDACTED {
-            let same = t.host.trim() == saved.target.host
-                && t.username.trim() == saved.target.username
-                && t.database.trim() == saved.target.database
-                && t.port.trim() == saved.target.port.trim();
-            t.password = if same {
-                saved.target.password.clone()
-            } else {
-                String::new()
-            };
-        }
+        keep_saved_password(t, &saved.target);
     }
     if let Some(e) = embedding {
-        if e.api_key == REDACTED {
-            let same = e.base_url.trim() == saved.embedding.base_url.trim()
-                && e.provider == saved.embedding.provider;
-            e.api_key = if same {
-                saved.embedding.api_key.clone()
-            } else {
-                String::new()
-            };
-        }
+        keep_saved_api_key(e, &saved.embedding);
     }
     Ok(())
+}
+
+/// A redacted password is the saved one only while host, login, database and port match.
+fn keep_saved_password(t: &mut VectorSyncTarget, saved: &VectorSyncTarget) {
+    if t.password != REDACTED {
+        return;
+    }
+    let same = t.host.trim() == saved.host
+        && t.username.trim() == saved.username
+        && t.database.trim() == saved.database
+        && t.port.trim() == saved.port.trim();
+    t.password = if same {
+        saved.password.clone()
+    } else {
+        String::new()
+    };
+}
+
+/// A redacted API key is the saved one only while provider and base URL match.
+fn keep_saved_api_key(e: &mut VectorSyncEmbedding, saved: &VectorSyncEmbedding) {
+    if e.api_key != REDACTED {
+        return;
+    }
+    let same = e.base_url.trim() == saved.base_url.trim() && e.provider == saved.provider;
+    e.api_key = if same {
+        saved.api_key.clone()
+    } else {
+        String::new()
+    };
 }
 
 // ── capability / sources / test / preview ───────────────────────────────────────────────
