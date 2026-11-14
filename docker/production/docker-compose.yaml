@@ -35,6 +35,7 @@ volumes:
   cdc-mongocopy-data:
   cdc-pgdump-data:
   cdc-rsync-data:
+  cdc-vectorsync-data:
 
 # Docker secrets (files under ./secrets/, created by ./deploy.sh secrets). Mounted per
 # service at /run/secrets/<ENV_NAME>; config/secret-env.sh exports them before exec.
@@ -67,6 +68,8 @@ secrets:
     file: ./secrets/orch_redis_shake_token
   orch_rsync_token:
     file: ./secrets/orch_rsync_token
+  orch_vectorsync_token:
+    file: ./secrets/orch_vectorsync_token
   orch_secret_key:
     file: ./secrets/orch_secret_key
   orch_wireguard_token:
@@ -268,6 +271,7 @@ services:
       - { source: orch_pgdump_token, target: ORCH_PGDUMP_TOKEN }
       - { source: orch_rsync_token, target: ORCH_RSYNC_TOKEN }
       - { source: orch_wireguard_token, target: ORCH_WIREGUARD_TOKEN }
+      - { source: orch_vectorsync_token, target: ORCH_VECTORSYNC_TOKEN }
     <<: [*restart, *logging]
     depends_on:
       cdc-connect:
@@ -335,6 +339,12 @@ services:
       ORCH_PGDUMP_URL: http://cdc-pgdump:8089
       ORCH_RSYNC_URL: http://cdc-rsync:8090
       ORCH_WIREGUARD_URL: http://cdc-wireguard:8091
+      # AI vector sync (ADR 0018): VECTORSYNC_ENABLED=true starts the sidecar (deploy.sh adds the
+      # vectorsync profile) and shows the page.
+      # Source/target database version re-read per pipeline (ADR 0019 §8), seconds, min 60.
+      ORCH_DB_VERSION_REFRESH_SECS: ${ORCH_DB_VERSION_REFRESH_SECS:-3600}
+      ORCH_VECTORSYNC_ENABLED: ${VECTORSYNC_ENABLED:-false}
+      ORCH_VECTORSYNC_URL: http://cdc-vectorsync:8092
     volumes:
       - ./config/secret-env.sh:/cdc/secret-env.sh:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -588,6 +598,42 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+
+  # AI vector sync (ADR 0018): pipeline topics → embeddings → PGVector via pydebeziumai.
+  # Started only with VECTORSYNC_ENABLED=true (profile vectorsync); VECTORSYNC_DOCLING=true runs the
+  # cdc-vectorsync-docling image instead (deploy.sh). Needs the embedding server
+  # (e.g. Ollama) and the pgvector database reachable from this container.
+  cdc-vectorsync:
+    image: ${CDC_VECTORSYNC_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-vectorsync:${CDC_VERSION:-latest}}
+    profiles: ["vectorsync"]
+    container_name: cdc-vectorsync
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh"]
+    command: ["python3", "/app/serve.py"]
+    secrets:
+      - { source: orch_vectorsync_token, target: VECTORSYNC_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      VECTORSYNC_API_HOST: 0.0.0.0
+      VECTORSYNC_API_PORT: "8092"
+      VECTORSYNC_WORK_ROOT: /var/lib/vectorsync
+      VECTORSYNC_KAFKA_BOOTSTRAP: ${VECTORSYNC_KAFKA_BOOTSTRAP:-cdc-message:9092}
+      VECTORSYNC_SCHEMA_REGISTRY_URL: ${VECTORSYNC_SCHEMA_REGISTRY_URL:-http://cdc-message:8081}
+      VECTORSYNC_DLQ_MAX: ${VECTORSYNC_DLQ_MAX:-1000}
+      VECTORSYNC_MAX_BACKOFF_SECONDS: ${VECTORSYNC_MAX_BACKOFF_SECONDS:-60}
+      VECTORSYNC_DOCLING_MAX_MB: ${VECTORSYNC_DOCLING_MAX_MB:-50}
+      VECTORSYNC_DOCLING_MAX_PAGES: ${VECTORSYNC_DOCLING_MAX_PAGES:-500}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+      - cdc-vectorsync-data:/var/lib/vectorsync
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8092/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
   # ══════════════════════════════ AI agent (profile: agent) ══════════════════════════════
 

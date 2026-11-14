@@ -257,4 +257,30 @@ class JdbcOpsTest {
         JdbcOps.LookupResult found = JdbcOps.lookup("h2", DIFF, "d", "t", List.of("BRANCH", "CODE"), List.of(), keys);
         assertEquals(List.of(List.of("1", "A")), found.rows());
     }
+
+    @Test
+    void probeKeepsGoingAfterAFailureAndIsSelectOnly() throws Exception {
+        Map<String, Object> out = JdbcOps.probe("h2", CONN, List.of(
+                new JdbcOps.Probe("one", "SELECT 1 AS n"),
+                new JdbcOps.Probe("missing", "SELECT * FROM no_such_view"),
+                new JdbcOps.Probe("write", "DELETE FROM x"),
+                new JdbcOps.Probe("two", "SELECT 2 AS n")));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> results = (List<Map<String, Object>>) out.get("results");
+        assertEquals(4, results.size());
+        assertEquals(List.of("n"), results.get(0).get("columns"));
+        assertTrue(results.get(1).containsKey("error"));
+        assertTrue(String.valueOf(results.get(2).get("error")).contains("SELECT"));
+        assertEquals(List.of(List.of(2)), results.get(3).get("rows"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> server = (Map<String, Object>) out.get("server");
+        assertEquals("H2", server.get("product"));
+    }
+
+    @Test
+    void testReportsServerVersion() throws Exception {
+        JdbcOps.TestResult r = JdbcOps.testWithInfo("h2", CONN);
+        assertEquals("H2", r.server().product());
+        assertFalse(r.server().version().isBlank());
+    }
 }

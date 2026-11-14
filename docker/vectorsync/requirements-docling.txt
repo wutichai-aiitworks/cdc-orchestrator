@@ -1,0 +1,3 @@
+# Only for the cdc-vectorsync:docling variant (Dockerfile WITH_DOCLING=true, ADR 0018).
+# Bump deliberately; test_vectorsync.py DoclingTests run against it in CI.
+docling==2.150.1

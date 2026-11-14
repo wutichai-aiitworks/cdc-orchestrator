@@ -8,6 +8,7 @@ import {
   ArrowUpDown,
   CalendarClock,
   CheckCircle2,
+  Database,
   Eye,
   Filter,
   KeyRound,
@@ -47,6 +48,7 @@ import type {
 } from "~/composables/useProfilesM3"
 import { latencySortValue, type LatencyCurrent } from "~/utils/latency"
 import { formatApiError } from "~/utils/apiError"
+import { formatServer, versionLine, versionTitle, type ServerInfo } from "~/utils/cdcReadiness"
 import { DB_TYPE_OPTIONS, dbIconPath } from "~/utils/dbIcon"
 
 type WizardStep = "source" | "transform" | "target" | "mapping" | "review"
@@ -62,6 +64,8 @@ const {
   fetchDlqStatus,
   validateSource,
   validateTarget,
+  checkSourceReadiness,
+  dbVersions,
   validateLake,
   browseSourceCatalog,
   browseTargetCatalog,
@@ -87,8 +91,8 @@ const deleting = ref(false)
 const pendingDelete = ref<CdcProfile | null>(null)
 const validating = ref(false)
 const error = ref("")
-const sourceValidation = ref<{ valid: boolean; message: string } | null>(null)
-const targetValidation = ref<{ valid: boolean; message: string } | null>(null)
+const sourceValidation = ref<{ valid: boolean; message: string; server?: ServerInfo } | null>(null)
+const targetValidation = ref<{ valid: boolean; message: string; server?: ServerInfo } | null>(null)
 const dlqStatus = ref<ProfileDlqStatus | null>(null)
 const dlqLoading = ref(false)
 const dlqError = ref("")
@@ -1515,6 +1519,12 @@ const testConnection = async () => {
   }
 }
 
+// Live CDC readiness (ADR 0019): same payload and saved-credential merge as Test Connection.
+const checkReadiness = () => {
+  syncAutofilledSecrets()
+  return checkSourceReadiness({ ...buildPayload().source, profile_id: selectedId.value || undefined })
+}
+
 const saveDraft = () => save(true)
 
 const closeWizard = () => {
@@ -2622,6 +2632,8 @@ onUnmounted(() => {
               :username="form.username"
               :database="form.database"
               :tables="form.tableMode === 'specific_tables' ? form.tables : ''"
+              :check="checkReadiness"
+              :check-disabled="!canBrowseSource"
             />
             <div v-if="form.captureMode === 'trigger'" class="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div class="md:col-span-2 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:items-end">
@@ -2910,6 +2922,9 @@ onUnmounted(() => {
                 :class="sourceValidation.valid ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'"
               >
                 {{ sourceValidation.message }}
+              </p>
+              <p v-if="sourceValidation?.valid && formatServer(sourceValidation.server)" class="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Database class="h-3.5 w-3.5" :stroke-width="1.75" />Source database: <span class="font-medium text-foreground">{{ formatServer(sourceValidation.server) }}</span>
               </p>
             </div>
             <AppContextHint
@@ -3339,6 +3354,9 @@ onUnmounted(() => {
                 :class="targetValidation.valid ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'"
               >
                 {{ targetValidation.message }}
+              </p>
+              <p v-if="targetValidation?.valid && formatServer(targetValidation.server)" class="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Database class="h-3.5 w-3.5" :stroke-width="1.75" />Target database: <span class="font-medium text-foreground">{{ formatServer(targetValidation.server) }}</span>
               </p>
             </div>
             <div class="flex gap-2">
@@ -3824,6 +3842,11 @@ onUnmounted(() => {
                     <Waves v-else class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
                   </div>
                   <p class="mt-1 font-mono text-xs text-muted-foreground">{{ pipelineRoute(profile) }}</p>
+                  <p
+                    v-if="versionLine(dbVersions[profile.id], profile.pattern === 'source_to_target')"
+                    class="mt-0.5 text-[11px] text-muted-foreground"
+                    :title="[versionTitle(dbVersions[profile.id]?.source), versionTitle(dbVersions[profile.id]?.target)].filter(Boolean).join('\n')"
+                  >{{ versionLine(dbVersions[profile.id], profile.pattern === 'source_to_target') }}</p>
                 </td>
                 <td>{{ captureModeLabel(profile) }}</td>
                 <td>{{ patternLabel(profile) }}</td>

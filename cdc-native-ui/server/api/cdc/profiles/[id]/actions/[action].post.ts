@@ -4,6 +4,10 @@ export default defineEventHandler((event) => {
   const id = encodeURIComponent(getRouterParam(event, "id") || "")
   const action = String(getRouterParam(event, "action") || "")
   if (!id) throw createError({ statusCode: 400, statusMessage: "Profile ID is required" })
+  // Re-read the source/target database version now (kept in one file: Nitro typed routes, TS2589).
+  if (action === "db-versions-refresh") {
+    return orchestratorFetch(event, `/cdc/profiles/${id}/db-versions/refresh`, { method: "POST" })
+  }
   if (!["start", "pause", "resume", "restart", "stop", "resync"].includes(action)) {
     throw createError({ statusCode: 400, statusMessage: "Unsupported profile action" })
   }

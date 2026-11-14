@@ -15,6 +15,8 @@ servers:
 tags:
   - name: System
     description: Health and runtime capability discovery.
+  - name: AI Vector Sync
+    description: Keep a PGVector collection in step with a pipeline's CDC topics via pydebeziumai (ADR 0018). Off unless VECTORSYNC_ENABLED=true.
   - name: Engine
     description: Managed Docker engine lifecycle and status.
   - name: Connectors
@@ -1136,6 +1138,7 @@ paths:
   /cdc/profiles/validate/source:
     post:
       summary: Validate source connection
+      description: Also returns `server` (database product and version from JDBC metadata) when cdc-jdbc-admin is configured.
       operationId: validateProfileSource
       tags: [Profiles]
       requestBody:
@@ -1150,7 +1153,58 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ValidationResponse"
+                $ref: "#/components/schemas/ConnectionCheckResponse"
+  /cdc/profiles/db-versions:
+    get:
+      summary: Source and target database version of every pipeline
+      description: |
+        `{versions: {<profile_id>: {source, target}}}`; each side `{product, version, major, minor,
+        checked_at, changed_at?, previous?, error?}`. Read from JDBC metadata and refreshed every
+        ORCH_DB_VERSION_REFRESH_SECS (default 3600), after create/save, and on Test Connection of a
+        saved pipeline. A changed version replaces the old one (`previous`, `changed_at`); a failed
+        check keeps the last known version and sets `error`.
+      operationId: listProfileDbVersions
+      tags: [Profiles]
+      responses:
+        "200": { description: Versions by pipeline, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/profiles/{id}/db-versions/refresh:
+    post:
+      summary: Read a pipeline's source and target database version now
+      operationId: refreshProfileDbVersions
+      tags: [Profiles]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "{source, target}", content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/profiles/catalog/source/readiness:
+    post:
+      summary: Live CDC readiness check of the source
+      description: |
+        Read-only probes through cdc-jdbc-admin (SELECT only, one connection, 10 s per statement), judged
+        per engine (ADR 0019): PostgreSQL (wal_level, slots, WAL senders, REPLICATION login, publication
+        coverage, replica identity, table SELECT), MySQL/MariaDB (binlog on/ROW/FULL, server_id, retention,
+        grants, InnoDB, primary keys), SQL Server (edition, database and table CDC, SQL Server Agent,
+        change-table access), Oracle (ARCHIVELOG, supplemental logging incl. per table, LogMiner
+        privileges, redo size). Each check is `pass | warn | fail | unknown | info`; `unknown` = the login
+        may not read that setting (the detail names the grant). Fixes are platform-specific (self-managed,
+        Amazon RDS/Aurora, Cloud SQL, Azure) and joined in `fix_script`; nothing is run. Body: the source
+        config plus optional `profile_id` (stored password and this pipeline's slot name are used).
+        Non-log capture modes and trigger-only engines return `applicable: false`.
+      operationId: checkProfileSourceReadiness
+      tags: [Profiles]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceConfig"
+      responses:
+        "200":
+          description: Readiness report `{engine, capture_mode, applicable, server, platform, checks[{id, title, status, detail, value?, expected?, fix?}], parameters[{name, value}], fix_script, summary{pass, warn, fail, unknown}, ready, note?, checked_at}`
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
   /cdc/profiles/catalog/source:
     post:
       summary: Browse live schemas and tables from a source connection
@@ -1318,7 +1372,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ValidationResponse"
+                $ref: "#/components/schemas/ConnectionCheckResponse"
   /cdc/profiles/validate/lake:
     post:
       summary: Validate a lakehouse destination (object storage + catalog)
@@ -3104,6 +3158,224 @@ paths:
       responses:
         "200": { description: Version deleted, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
         "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/capability:
+    get:
+      summary: Vector sync switch and sidecar versions
+      description: |
+        Always 200. `enabled=false` (with a hint) while VECTORSYNC_ENABLED is off; otherwise the
+        sidecar's versions (pydebeziumai, langchain-postgres), providers and Kafka endpoints, plus
+        `sidecar_ready` and `secrets_encrypted` (ORCH_SECRET_KEY set).
+      operationId: vectorSyncCapability
+      tags: [AI Vector Sync]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+  /cdc/vectorsync/sources:
+    get:
+      summary: Pipelines and the topics they have
+      description: |
+        `pipelines[]` = CDC pipelines with `topic_prefix` and their existing topics
+        (`{name, table, partitions, messages, trimmed}`; `trimmed` = retention already deleted the
+        oldest records, so a backfill/rebuild cannot replay everything). `other[]` = remaining data topics.
+      operationId: vectorSyncSources
+      tags: [AI Vector Sync]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/test:
+    post:
+      summary: Test the embedding model and/or the PGVector target
+      description: |
+        Body `{embedding?, target?, profile_id?}`. Runs in the sidecar: one embedding call
+        (dimensions, latency) and a Postgres login + pgvector availability + collection size.
+        A failed check is a normal answer `{ok:false, checks:[{name, ok, detail, hint?}]}`. With
+        `profile_id`, `********` secrets are filled from that sync only when the login/server is unchanged.
+      operationId: testVectorSync
+      tags: [AI Vector Sync]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/embedding-models:
+    post:
+      summary: List models on the embedding server
+      description: |
+        Body `{embedding: {provider, base_url, api_key?}, profile_id?}` → `{models[], error?}` (Ollama `/api/tags`, OpenAI `/models`).
+      operationId: listVectorSyncModels
+      tags: [AI Vector Sync]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/preview:
+    post:
+      summary: Preview documents from the newest records
+      description: |
+        Body `{topics[], projection?, id_strategy?, delete_mode?, sample? (1-20, default 3)}`.
+        Reads the last records of each topic (no commit) and returns, per topic, the columns and for
+        each record `{offset, op, doc_id, action: upsert|delete, content, chars, metadata}` or `error`.
+        Nothing is embedded or written.
+      operationId: previewVectorSync
+      tags: [AI Vector Sync]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles:
+    get:
+      summary: List vector syncs with live status
+      description: |
+        Each sync carries `status`: state starting|connecting|running|retrying|pending|paused|unknown|error,
+        `message`, `counters {events, upserted, deleted, skipped, dead_lettered, retries}`, `lag {total, topics}`,
+        `documents`, `embedding {provider, model, avg_ms}`, `retention_trimmed[]`, `last_error`. Secrets are `********`.
+      operationId: listVectorSyncs
+      tags: [AI Vector Sync]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      summary: Create a vector sync (starts it unless enabled=false)
+      description: |
+        Validates names, template syntax (`$column`, `${column}`, `$$`) and the target, then pushes the
+        spec to the sidecar. 409 when another sync already writes the same collection.
+      operationId: createVectorSync
+      tags: [AI Vector Sync]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VectorSyncProfileRequest" } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /cdc/vectorsync/profiles/{id}:
+    get:
+      summary: Get one vector sync with live status
+      operationId: getVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Update a vector sync
+      description: |
+        `********` keeps a stored secret. Changing the embedding provider/model/dimensions or the
+        collection bumps `generation` (rebuild: collection cleared, topics re-read).
+      operationId: updateVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VectorSyncProfileRequest" } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a vector sync
+      description: |
+        Stops it and forgets its consumer groups and dead letters. `drop_collection=true` also deletes
+        the collection and its vectors; otherwise they stay in Postgres.
+      operationId: deleteVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: drop_collection, required: false, schema: { type: boolean } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles/{id}/pause:
+    post:
+      summary: Pause (stop consuming; offsets kept)
+      operationId: pauseVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles/{id}/resume:
+    post:
+      summary: Resume from the committed offsets
+      operationId: resumeVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles/{id}/rebuild:
+    post:
+      summary: Rebuild from the start of the topics
+      description: |
+        Bumps `generation`: the collection is cleared once and a new consumer group re-reads whatever the
+        topics still retain. Rows older than topic retention are not restored (see `retention_trimmed`).
+      operationId: rebuildVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles/{id}/search:
+    post:
+      summary: Semantic search in the collection
+      description: |
+        Body `{query, k? (1-50, default 5), filter? (metadata equality, e.g. {"_table": "orders"})}` →
+        `{hits: [{id, score (cosine similarity), content, metadata}], took_ms}`.
+      operationId: searchVectorSync
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /cdc/vectorsync/profiles/{id}/dead-letters:
+    get:
+      summary: Rows that could not become documents
+      description: |
+        `{items: [{at, topic, partition, offset, key, doc_id, op, error}], total}` newest first. Row values
+        are not stored — read them from the topic at that offset.
+      operationId: listVectorSyncDeadLetters
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: limit, required: false, schema: { type: integer, minimum: 1, maximum: 1000 } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Clear the dead letters
+      operationId: clearVectorSyncDeadLetters
+      tags: [AI Vector Sync]
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
 components:
   securitySchemes:
     bearerAuth:
@@ -3124,6 +3396,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NotFound:
       description: Requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Conflicts with an existing resource or an action in flight
       content:
         application/json:
           schema:
@@ -3149,6 +3427,65 @@ components:
       name: limit
       schema: { type: integer, minimum: 1 }
   schemas:
+    ConnectionCheckResponse:
+      type: object
+      required: [valid, message, timestamp]
+      properties:
+        valid: { type: boolean }
+        message: { type: string }
+        server:
+          type: object
+          description: Database product and version (JDBC metadata); absent without cdc-jdbc-admin.
+          properties:
+            product: { type: string, example: PostgreSQL }
+            version: { type: string, example: "17.6 (Debian 17.6-1.pgdg12+1)" }
+            major: { type: integer }
+            minor: { type: integer }
+            driver: { type: string }
+        timestamp: { type: string, format: date-time }
+    VectorSyncProfileRequest:
+      type: object
+      required: [name, topics, target]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        enabled: { type: boolean, default: true }
+        source_profile_id: { type: string, format: uuid, nullable: true }
+        topics: { type: array, items: { type: string } }
+        start_from: { type: string, enum: [earliest, latest], default: earliest }
+        embedding:
+          type: object
+          properties:
+            provider: { type: string, enum: [ollama, openai, hash], default: ollama }
+            base_url: { type: string, description: "Ollama default http://host.docker.internal:11434" }
+            model: { type: string, description: "Ollama default bge-m3" }
+            api_key: { type: string, description: "Write-only; ******** keeps the stored key" }
+            dimensions: { type: integer }
+            batch_size: { type: integer }
+        target:
+          type: object
+          required: [host, database, username, collection]
+          properties:
+            host: { type: string }
+            port: { type: string }
+            database: { type: string }
+            username: { type: string }
+            password: { type: string, description: "Write-only; ******** keeps the stored password" }
+            sslmode: { type: string }
+            collection: { type: string, pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$" }
+        projection:
+          type: object
+          description: "{default: P, tables: {table: P}}; P = {content_template?, include_fields?, exclude_fields?, metadata_fields?}"
+          additionalProperties: true
+        id_strategy:
+          type: object
+          description: "{kind: table_pk|composite, pk_fields?: [..]}"
+          additionalProperties: true
+        delete_mode: { type: string, enum: [hard, soft], default: hard }
+        batch:
+          type: object
+          description: "{max_events? (default 200), max_wait_ms? (default 1000)}"
+          additionalProperties: true
     ErrorResponse:
       type: object
       required: [error]

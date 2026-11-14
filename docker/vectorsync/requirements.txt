@@ -1,0 +1,8 @@
+# Pinned (ADR 0018). pydebeziumai is used only through bridge.py; bump it deliberately and re-run
+# test_vectorsync.py against the new wheel before changing this line.
+pydebeziumai==0.1.0
+langchain-core==1.8.0
+langchain-postgres==0.0.19
+psycopg[binary]==3.3.9
+confluent-kafka==2.16.1
+fastavro==1.13.1

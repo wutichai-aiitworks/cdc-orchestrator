@@ -12,6 +12,21 @@ COMPOSE_SIDECARS=( -f docker-compose.sidecars.yaml )
 COMPOSE_OPS=( -f docker-compose.ops.yaml )
 COMPOSE_FILES=( "${COMPOSE_CORE[@]}" "${COMPOSE_SIDECARS[@]}" "${COMPOSE_OPS[@]}" )
 
+# Feature switches read from the environment, else docker/.env (ADR 0018):
+#   VECTORSYNC_ENABLED=true  → --profile vectorsync (cdc-vectorsync sidecar)
+#   VECTORSYNC_DEMO=true     → --profile vectorsync-demo (cdc-pgvector demo store)
+_env_flag() {
+  local name=$1 v="${!1:-}"
+  if [[ -z "$v" && -f .env ]]; then
+    v="$(grep -E "^[[:space:]]*${name}=" .env | tail -n1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$//' | tr -d "\"' " || true)"
+  fi
+  [[ "$(printf %s "$v" | tr '[:upper:]' '[:lower:]')" =~ ^(1|true|yes|on)$ ]]
+}
+if _env_flag VECTORSYNC_ENABLED; then
+  COMPOSE_FILES+=( --profile vectorsync )
+  _env_flag VECTORSYNC_DEMO && COMPOSE_FILES+=( --profile vectorsync-demo )
+fi
+
 # WebUI build version, same rule as Woodpecker: a v* tag on HEAD → the tag (no commit id),
 # otherwise <branch-slug>_<short-sha>. An explicit CDC_APP_VERSION wins.
 if [[ -z "${CDC_APP_VERSION:-}" ]] && git rev-parse --git-dir >/dev/null 2>&1; then

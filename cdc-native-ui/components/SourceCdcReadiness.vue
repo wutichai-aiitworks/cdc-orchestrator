@@ -14,8 +14,11 @@ const props = withDefaults(
     /** Comma/newline separated `schema.table` list when specific tables are selected. */
     tables?: string
     database?: string
+    /** Live check (ADR 0019); shown for log-based capture when provided. */
+    check?: () => Promise<import("~/utils/cdcReadiness").ReadinessReport>
+    checkDisabled?: boolean
   }>(),
-  { username: "", tables: "", database: "" },
+  { username: "", tables: "", database: "", check: undefined, checkDisabled: false },
 )
 
 const toast = useToast()
@@ -68,6 +71,8 @@ const copy = async (text: string, what: string) => {
       <TriangleAlert class="mt-0.5 h-4 w-4 shrink-0 text-yellow-500" :stroke-width="1.75" />
       <p class="text-xs text-foreground">{{ guide.modeNote }}</p>
     </div>
+
+    <SourceReadinessLive v-if="check && captureMode === 'logical'" :check="check" :disabled="checkDisabled" />
 
     <div v-if="open" class="space-y-6 border-t border-border p-4">
       <section class="space-y-3">

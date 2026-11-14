@@ -5,6 +5,7 @@ mod config;
 mod connector_catalog;
 mod connector_meta;
 mod connector_parse;
+mod db_versions;
 mod diagnose;
 mod engine;
 mod error;
@@ -42,12 +43,15 @@ mod rsync_handlers;
 mod saved_secret;
 mod schedule;
 mod secretbox;
+mod source_readiness;
 mod split;
 mod start_position;
 mod store;
 mod tool_events;
 mod tool_sidecar;
 mod trigger_cdc;
+mod vectorsync;
+mod vectorsync_handlers;
 mod watcher;
 mod wireguard;
 
@@ -96,6 +100,10 @@ pub struct AppState {
     pub mongocopy_profiles: MongoCopyProfileStore,
     pub pgdump_profiles: PgDumpProfileStore,
     pub rsync_profiles: RsyncProfileStore,
+    /// AI vector sync definitions (ADR 0018).
+    pub vectorsync_profiles: vectorsync::VectorSyncStore,
+    /// Source/target database version per pipeline (refreshed in the background).
+    pub db_versions: db_versions::DbVersionStore,
     pub rqlite: Option<RqliteClient>,
     pub history: Arc<RwLock<AlertHistory>>,
     pub alerts_tx: broadcast::Sender<String>,
@@ -231,6 +239,8 @@ async fn main() {
         mongocopy_profiles: MongoCopyProfileStore::new(rqlite.clone()),
         pgdump_profiles: PgDumpProfileStore::new(rqlite.clone()),
         rsync_profiles: RsyncProfileStore::new(rqlite.clone()),
+        vectorsync_profiles: vectorsync::VectorSyncStore::new(rqlite.clone()),
+        db_versions: db_versions::DbVersionStore::new(rqlite.clone()),
         rqlite: rqlite.clone(),
         history: Arc::new(RwLock::new(AlertHistory::new(config.history_capacity))),
         alerts_tx,
@@ -318,6 +328,10 @@ async fn main() {
         .route("/profiles/cases", post(handlers::create_profile_from_case))
         .route("/profiles/validate/source", post(handlers::validate_source))
         .route(
+            "/profiles/catalog/source/readiness",
+            post(handlers::source_readiness),
+        )
+        .route(
             "/profiles/catalog/source",
             post(handlers::browse_source_catalog),
         )
@@ -351,6 +365,11 @@ async fn main() {
         )
         .route("/profiles/validate/target", post(handlers::validate_target))
         .route("/profiles/validate/lake", post(handlers::validate_lake))
+        .route("/profiles/db-versions", get(db_versions::list_versions))
+        .route(
+            "/profiles/:id/db-versions/refresh",
+            post(db_versions::refresh_versions),
+        )
         .route("/profiles/:id", get(handlers::get_profile))
         .route("/profiles/:id", put(handlers::update_profile))
         .route("/profiles/:id", delete(handlers::delete_profile))
@@ -541,6 +560,10 @@ async fn main() {
         .route("/profiles/cases", post(handlers::create_profile_from_case))
         .route("/profiles/validate/source", post(handlers::validate_source))
         .route(
+            "/profiles/catalog/source/readiness",
+            post(handlers::source_readiness),
+        )
+        .route(
             "/profiles/catalog/source",
             post(handlers::browse_source_catalog),
         )
@@ -574,6 +597,11 @@ async fn main() {
         )
         .route("/profiles/validate/target", post(handlers::validate_target))
         .route("/profiles/validate/lake", post(handlers::validate_lake))
+        .route("/profiles/db-versions", get(db_versions::list_versions))
+        .route(
+            "/profiles/:id/db-versions/refresh",
+            post(db_versions::refresh_versions),
+        )
         .route("/profiles/:id", get(handlers::get_profile))
         .route("/profiles/:id", put(handlers::update_profile))
         .route("/profiles/:id", delete(handlers::delete_profile))
@@ -1055,6 +1083,48 @@ async fn main() {
         .route(
             "/rsync/profiles/:id/run",
             post(rsync_handlers::run_rsync_profile),
+        )
+        // AI vector sync (ADR 0018); 404 while VECTORSYNC_ENABLED is off (capability stays 200).
+        .route(
+            "/vectorsync/capability",
+            get(vectorsync_handlers::capability),
+        )
+        .route("/vectorsync/sources", get(vectorsync_handlers::sources))
+        .route("/vectorsync/test", post(vectorsync_handlers::test))
+        .route(
+            "/vectorsync/embedding-models",
+            post(vectorsync_handlers::embedding_models),
+        )
+        .route("/vectorsync/preview", post(vectorsync_handlers::preview))
+        .route(
+            "/vectorsync/profiles",
+            get(vectorsync_handlers::list_profiles).post(vectorsync_handlers::create_profile),
+        )
+        .route(
+            "/vectorsync/profiles/:id",
+            get(vectorsync_handlers::get_profile)
+                .put(vectorsync_handlers::update_profile)
+                .delete(vectorsync_handlers::delete_profile),
+        )
+        .route(
+            "/vectorsync/profiles/:id/pause",
+            post(vectorsync_handlers::pause),
+        )
+        .route(
+            "/vectorsync/profiles/:id/resume",
+            post(vectorsync_handlers::resume),
+        )
+        .route(
+            "/vectorsync/profiles/:id/rebuild",
+            post(vectorsync_handlers::rebuild),
+        )
+        .route(
+            "/vectorsync/profiles/:id/search",
+            post(vectorsync_handlers::search),
+        )
+        .route(
+            "/vectorsync/profiles/:id/dead-letters",
+            get(vectorsync_handlers::dead_letters).delete(vectorsync_handlers::clear_dead_letters),
         );
 
     let protected = Router::new()
@@ -1097,6 +1167,8 @@ async fn main() {
     let _poll_audit = watcher::spawn_poll_audit(Arc::new(state.clone()));
     let _tool_runs = tool_events::spawn_run_watcher(Arc::new(state.clone()));
     let _wireguard = wireguard::spawn_reconcile(Arc::new(state.clone()));
+    let _vectorsync = vectorsync::spawn_reconcile(Arc::new(state.clone()));
+    let _db_versions = db_versions::spawn_refresher(Arc::new(state.clone()));
 
     let autostart_state = state.clone();
     tokio::spawn(async move {

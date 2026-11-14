@@ -1565,6 +1565,9 @@ pub struct CapabilityFeatures {
     pub redisshake: bool,
     pub pgloader: bool,
     pub mongocopy: bool,
+    /// VECTORSYNC_ENABLED and ORCH_VECTORSYNC_URL set: AI vector sync page and API (ADR 0018).
+    #[serde(default)]
+    pub vectorsync: bool,
 }
 
 /// Alert rule persisted in rqlite (`cdc_config` kind `rule`).
@@ -1747,6 +1750,17 @@ pub struct ProfileDlqStatus {
 pub struct ValidationResponse {
     pub valid: bool,
     pub message: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Pipeline source/target connection test: also the database product and version
+/// (JDBC metadata; `None` without cdc-jdbc-admin or with an older one).
+#[derive(Debug, Serialize)]
+pub struct ConnectionCheckResponse {
+    pub valid: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<crate::clients::ServerInfo>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -2684,4 +2698,109 @@ pub struct RsyncProfileRequest {
 #[derive(Debug, Serialize)]
 pub struct RsyncProfilesResponse {
     pub profiles: Vec<RsyncProfile>,
+}
+
+// ── AI vector sync (ADR 0018) ─────────────────────────────────────────────────────────────
+
+/// Embedding model the cdc-vectorsync sidecar calls (`ollama`, `openai`-compatible, `hash`).
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct VectorSyncEmbedding {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    /// Write-only: `********` on read; stored encrypted when ORCH_SECRET_KEY is set.
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u32>,
+}
+
+/// PGVector store (langchain_postgres tables; one collection per sync).
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct VectorSyncTarget {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: String,
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub username: String,
+    /// Write-only: `********` on read; stored encrypted when ORCH_SECRET_KEY is set.
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub sslmode: String,
+    #[serde(default)]
+    pub collection: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VectorSyncProfile {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// false = paused: the sidecar does not run it (offsets stay in the consumer group).
+    #[serde(default)]
+    pub enabled: bool,
+    /// CDC pipeline the topics belong to (display / grouping only; `topics` is authoritative).
+    #[serde(default)]
+    pub source_profile_id: Option<Uuid>,
+    pub topics: Vec<String>,
+    /// `earliest` (backfill what the topics still retain) or `latest` (new changes only).
+    #[serde(default)]
+    pub start_from: String,
+    pub embedding: VectorSyncEmbedding,
+    pub target: VectorSyncTarget,
+    /// `{default: TableProjection, tables: {table: TableProjection}}`; TableProjection =
+    /// `{content_template?, include_fields?, exclude_fields?, metadata_fields?}`.
+    #[serde(default)]
+    pub projection: Value,
+    /// `{kind: table_pk|composite, pk_fields?: [..]}`.
+    #[serde(default)]
+    pub id_strategy: Value,
+    /// `hard` (remove the vector) or `soft` (keep it with `_is_deleted=true`).
+    #[serde(default)]
+    pub delete_mode: String,
+    /// `{max_events?, max_wait_ms?}`.
+    #[serde(default)]
+    pub batch: Value,
+    /// Bumped by Rebuild: new consumer group from the start of the topics, collection cleared.
+    #[serde(default)]
+    pub generation: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct VectorSyncProfileRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub source_profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub start_from: String,
+    #[serde(default)]
+    pub embedding: VectorSyncEmbedding,
+    #[serde(default)]
+    pub target: VectorSyncTarget,
+    #[serde(default)]
+    pub projection: Value,
+    #[serde(default)]
+    pub id_strategy: Value,
+    #[serde(default)]
+    pub delete_mode: String,
+    #[serde(default)]
+    pub batch: Value,
 }

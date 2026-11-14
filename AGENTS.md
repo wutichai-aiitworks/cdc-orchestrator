@@ -38,6 +38,8 @@ Instructions for AI coding agents working with the CDC control plane.
 | `docs/adr/0015-notification-channels.md` | Alert channels (webhook/email/LINE/Slack/Discord/Teams), encrypted write-only secrets (`ORCH_SECRET_KEY`), queued delivery + log, conditions, cooldown |
 | `docs/adr/0016-pipeline-latency.md` | Per-pipeline latency: estimate (Kafka/Connect), trigger inbox, opt-in heartbeat probe; `/cdc/latency`, rollups, `latency_above` alert |
 | `docs/adr/0017-mcp-oauth-and-full-api-coverage.md` | mcp-cdc OAuth bridge for claude.ai / ChatGPT (consent with an MCP key), `cdc_api_catalog` / `_get` / `_call`, pipelines by name |
+| `docs/adr/0018-ai-vector-sync-sidecar.md` | AI vector sync (`cdc-vectorsync`, pydebeziumai via `bridge.py` only): one switch `VECTORSYNC_ENABLED`, at-least-once with data-vs-infra error split, rebuild = new consumer-group generation, `/cdc/vectorsync/*`; chunking + Docling documents (`VECTORSYNC_DOCLING`, `_parent_id` per row) in the amendment |
+| `docs/adr/0019-live-source-cdc-readiness.md` | "Check source" in the pipeline wizard: jdbc-admin `/v1/probe` (read-only facts) + `src/source_readiness.rs` (rules, platform-specific fixes); `unknown` = login can't read it; source/target database version via `/v1/test` `server` |
 | `docs/roadmap/gluesync-gap-roadmap.md` | Competitive gap plan vs GlueSync (plan only, R0–R4) |
 | `docs/adr/0008-mcp-per-client-keys-and-hardening.md` | mcp-cdc for other clients: per-client keys/scopes, error shape, sessions, redaction |
 | `docs/adr/0002-native-ui-local-auth.md` | Native WebUI login (`AUTH_MODE=local`), threat model, decisions |
@@ -86,4 +88,7 @@ Source `cdc-postgres-source`, target `cdc-postgres-target`, db/user/pass `demo`,
 | "run all tests" | `npm run check` then `npm run test:api`; report pass/fail + any `test.fail` that flipped |
 | "run e2e" | `npm run test:api:e2e`, then verify no `pw-` leftovers (profiles, connectors, slots, topics, schemas) |
 | "fix B-02" (any B-xx) | Read the register row, fix, remove its `test.fail`, run `check` + `test:api:e2e`, update register |
+| "enable / disable vector sync" | Set `VECTORSYNC_ENABLED=true` or `false` (and `VECTORSYNC_DEMO` for the demo pgvector) in `docker/.env`, run `./docker/deploy.sh` — it starts or stops `cdc-vectorsync` and the UI page follows (ADR 0018) |
+| "turn on Docling" | `VECTORSYNC_DOCLING=true` (with `VECTORSYNC_ENABLED=true`) in `docker/.env`, `./docker/deploy.sh` rebuilds `cdc-vectorsync` with Docling; then pick "Document (Docling)" per table in the sync wizard (ADR 0018 amendment) |
+| "is this source ready for CDC" | `POST /cdc/profiles/catalog/source/readiness` with the source config (or the wizard's Check source); add rules in `src/source_readiness.rs` with a unit test, never in jdbc-admin (ADR 0019) |
 | "what's not tested" | Read "Not covered yet" in the test plan and re-check against current routes |

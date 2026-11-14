@@ -63,6 +63,53 @@ struct AdminRequest<'a> {
     /// `/v1/lookup`: key tuples (canonical strings, `key_columns` order).
     #[serde(skip_serializing_if = "<[Vec<Option<String>>]>::is_empty")]
     keys: &'a [Vec<Option<String>>],
+    /// `/v1/probe`: read-only statements run on one connection (CDC readiness).
+    #[serde(skip_serializing_if = "<[ProbeSql]>::is_empty")]
+    probes: &'a [ProbeSql],
+}
+
+/// One named read-only statement for `/v1/probe`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProbeSql {
+    pub id: String,
+    pub sql: String,
+}
+
+/// Database product/version as the JDBC driver reports it (any login can read it).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ServerInfo {
+    #[serde(default)]
+    pub product: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub major: i64,
+    #[serde(default)]
+    pub minor: i64,
+    #[serde(default)]
+    pub driver: String,
+}
+
+/// Result of one probe: rows, or the error the database returned (e.g. missing privilege).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProbeResult {
+    pub id: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub rows: Vec<Vec<Value>>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub sqlstate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProbeResponse {
+    #[serde(default)]
+    pub server: Option<ServerInfo>,
+    #[serde(default)]
+    pub results: Vec<ProbeResult>,
 }
 
 impl<'a> AdminRequest<'a> {
@@ -83,6 +130,7 @@ impl<'a> AdminRequest<'a> {
             canonical: false,
             key_columns: &[],
             keys: &[],
+            probes: &[],
         }
     }
 }
@@ -105,6 +153,8 @@ struct ErrorBody {
 #[derive(Debug, Deserialize)]
 struct TestBody {
     message: Option<String>,
+    #[serde(default)]
+    server: Option<ServerInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,33 +246,37 @@ impl JdbcAdminClient {
         Self::try_new(&url, token).ok()
     }
 
-    pub async fn test(
+    /// `POST /v1/test`: connection check plus the server's product/version (older jdbc-admin: None).
+    pub async fn test_info(
         &self,
         db_type: &str,
         connection: &HashMap<String, String>,
-    ) -> Result<String, AppError> {
+    ) -> Result<(String, Option<ServerInfo>), AppError> {
         let body: TestBody = self
-            .post(
-                "/v1/test",
-                &AdminRequest {
-                    db_type,
-                    connection,
-                    schema: None,
-                    table: None,
-                    statement: None,
-                    search: None,
-                    schema_filter: Vec::new(),
-                    page: None,
-                    page_size: None,
-                    max_rows: None,
-                    fetch_size: None,
-                    ..AdminRequest::new(db_type, connection)
-                },
-            )
+            .post("/v1/test", &AdminRequest::new(db_type, connection))
             .await?;
-        Ok(body
-            .message
-            .unwrap_or_else(|| "connection successful via jdbc-admin".into()))
+        Ok((
+            body.message
+                .unwrap_or_else(|| "connection successful via jdbc-admin".into()),
+            body.server,
+        ))
+    }
+
+    /// Read-only probes on one connection; per-probe errors come back as data.
+    pub async fn probe(
+        &self,
+        db_type: &str,
+        connection: &HashMap<String, String>,
+        probes: &[ProbeSql],
+    ) -> Result<ProbeResponse, AppError> {
+        self.post(
+            "/v1/probe",
+            &AdminRequest {
+                probes,
+                ..AdminRequest::new(db_type, connection)
+            },
+        )
+        .await
     }
 
     pub async fn catalog(

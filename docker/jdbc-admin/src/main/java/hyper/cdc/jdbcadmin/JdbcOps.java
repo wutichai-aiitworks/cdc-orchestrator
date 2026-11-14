@@ -81,6 +81,39 @@ final class JdbcOps {
     }
 
     static String test(String dbType, Map<String, String> connection) throws SQLException {
+        return testWithInfo(dbType, connection).message();
+    }
+
+    /** Database product and version as the driver reports them (no extra privileges needed). */
+    record ServerInfo(String product, String version, int major, int minor, String driver) {
+        Map<String, Object> toMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("product", product);
+            m.put("version", version);
+            m.put("major", major);
+            m.put("minor", minor);
+            m.put("driver", driver);
+            return m;
+        }
+    }
+
+    record TestResult(String message, ServerInfo server) {}
+
+    static ServerInfo serverInfo(Connection conn) {
+        try {
+            DatabaseMetaData md = conn.getMetaData();
+            return new ServerInfo(
+                    md.getDatabaseProductName(),
+                    md.getDatabaseProductVersion(),
+                    md.getDatabaseMajorVersion(),
+                    md.getDatabaseMinorVersion(),
+                    md.getDriverName() + " " + md.getDriverVersion());
+        } catch (SQLException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    static TestResult testWithInfo(String dbType, Map<String, String> connection) throws SQLException {
         try (Connection conn = open(dbType, connection)) {
             boolean ok = conn.isValid(10);
             if (!ok) {
@@ -88,7 +121,78 @@ final class JdbcOps {
             }
             String host = value(connection, "host", "");
             String port = value(connection, "port", "");
-            return "connection successful via jdbc-admin: " + host + ":" + port;
+            return new TestResult("connection successful via jdbc-admin: " + host + ":" + port, serverInfo(conn));
+        }
+    }
+
+    /** One named read-only statement for {@code /v1/probe}. */
+    record Probe(String id, String sql) {}
+
+    /**
+     * Runs read-only probes on one connection (CDC readiness checks). Each probe is SELECT-only,
+     * has a 10 s timeout and at most 300 rows; a failing probe (missing privilege, unknown view)
+     * is reported with its error and the next one still runs.
+     */
+    static Map<String, Object> probe(String dbType, Map<String, String> connection, List<Probe> probes)
+            throws SQLException {
+        if (probes == null || probes.isEmpty()) {
+            throw new IllegalArgumentException("probes are required");
+        }
+        if (probes.size() > 40) {
+            throw new IllegalArgumentException("at most 40 probes per request");
+        }
+        try (Connection conn = open(dbType, connection)) {
+            try {
+                conn.setReadOnly(true);
+            } catch (SQLException ignored) {
+                // Some drivers reject the hint; statements are still SELECT-only.
+            }
+            List<Map<String, Object>> results = new ArrayList<>();
+            for (Probe p : probes) {
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("id", p.id());
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.setQueryTimeout(10);
+                    stmt.setMaxRows(300);
+                    try (ResultSet rs = stmt.executeQuery(requireSelect(p.sql()))) {
+                        ResultSetMetaData md = rs.getMetaData();
+                        List<String> columns = new ArrayList<>();
+                        for (int i = 1; i <= md.getColumnCount(); i++) {
+                            columns.add(md.getColumnLabel(i).toLowerCase(Locale.ROOT));
+                        }
+                        List<List<Object>> rows = new ArrayList<>();
+                        while (rs.next()) {
+                            List<Object> row = new ArrayList<>(columns.size());
+                            for (int i = 1; i <= columns.size(); i++) {
+                                row.add(jsonSafe(rs.getObject(i)));
+                            }
+                            rows.add(row);
+                        }
+                        r.put("columns", columns);
+                        r.put("rows", rows);
+                    }
+                } catch (SQLException | IllegalArgumentException e) {
+                    String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                    r.put("error", msg.length() > 500 ? msg.substring(0, 500) : msg);
+                    if (e instanceof SQLException se && se.getSQLState() != null) {
+                        r.put("sqlstate", se.getSQLState());
+                    }
+                    // Postgres aborts the transaction after an error when autocommit is off.
+                    try {
+                        if (!conn.getAutoCommit()) {
+                            conn.rollback();
+                        }
+                    } catch (SQLException ignored) {
+                        // best effort
+                    }
+                }
+                results.add(r);
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            ServerInfo info = serverInfo(conn);
+            out.put("server", info == null ? null : info.toMap());
+            out.put("results", results);
+            return out;
         }
     }
 

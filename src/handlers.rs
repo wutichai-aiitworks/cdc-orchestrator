@@ -1304,6 +1304,7 @@ pub async fn delete_profile(
 
     let name = profile.name.clone();
     state.profiles.delete(id).await?;
+    state.db_versions.delete(id).await;
     let actor = actor_from_headers(&headers);
     let event = new_event(
         &actor,
@@ -1327,6 +1328,7 @@ pub async fn create_profile(
     let mut profile = build_profile(None, payload)?;
     crate::incremental_cdc::hydrate_upsert_keys_from_mappings(&mut profile);
     state.profiles.upsert(&profile).await?;
+    crate::db_versions::refresh_soon(&state, &profile);
     let actor = actor_from_headers(&headers);
     let pid = profile.id;
     let pname = profile.name.clone();
@@ -1508,6 +1510,7 @@ pub async fn update_profile(
         profile.status = ProfileStatus::Draft;
     }
     state.profiles.upsert(&profile).await?;
+    crate::db_versions::refresh_soon(&state, &profile);
     let actor = actor_from_headers(&headers);
     let event = new_event(
         &actor,
@@ -2319,13 +2322,14 @@ pub async fn cancel_initial_load(
 pub async fn validate_source(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::SourceCatalogRequest>,
-) -> Result<Json<ValidationResponse>, AppError> {
+) -> Result<Json<crate::models::ConnectionCheckResponse>, AppError> {
     // Restore stored credentials when the caller omits the password (saved profile).
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
             preserve_secret_fields(&mut req.source.connection, &profile.source.connection);
         }
     }
+    let req_profile_id = req.profile_id;
     let payload = req.source;
     if payload.source_type.trim().is_empty() {
         return Err(AppError::BadRequest("source_type is required".to_string()));
@@ -2349,8 +2353,20 @@ pub async fn validate_source(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    let message = if crate::clients::JdbcAdminClient::from_env().is_some() {
-        connector_catalog::test_connection(&payload.source_type, &payload.connection).await?
+    let mut server = None;
+    let message = if let Some(admin) = crate::clients::JdbcAdminClient::from_env() {
+        let (msg, info) = admin
+            .test_info(&payload.source_type, &payload.connection)
+            .await?;
+        // A saved pipeline's test also refreshes its stored version (no extra round trip).
+        if let (Some(pid), Some(i)) = (req_profile_id, info.as_ref()) {
+            state
+                .db_versions
+                .record(pid, crate::db_versions::Side::Source, Ok(i))
+                .await;
+        }
+        server = info;
+        msg
     } else {
         match payload.source_type.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => {
@@ -2373,11 +2389,55 @@ pub async fn validate_source(
         }
     };
 
-    Ok(Json(ValidationResponse {
+    Ok(Json(crate::models::ConnectionCheckResponse {
         valid: true,
         message,
+        server,
         timestamp: Utc::now(),
     }))
+}
+
+/// Live CDC readiness of a pipeline source (ADR 0019): read-only probes through jdbc-admin,
+/// judged by `source_readiness`. Missing privileges come back as `unknown`, not errors.
+pub async fn source_readiness(
+    State(state): State<AppState>,
+    Json(mut req): Json<crate::models::SourceCatalogRequest>,
+) -> Result<Json<crate::source_readiness::Report>, AppError> {
+    let mut slot = None;
+    if let Some(pid) = req.profile_id {
+        if let Ok(Some(profile)) = state.profiles.get(pid).await {
+            preserve_secret_fields(&mut req.source.connection, &profile.source.connection);
+            slot = Some(crate::reconcile::postgres_slot_name(&profile));
+        }
+    }
+    let source = req.source;
+    if !is_supported_database_type(&source.source_type) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported source_type: {} (database connectors only)",
+            source.source_type
+        )));
+    }
+    validate_connection_fields(&source.connection, "source")?;
+    let admin = crate::clients::JdbcAdminClient::from_env().ok_or_else(|| {
+        AppError::BadRequest(
+            "the CDC readiness check needs cdc-jdbc-admin (ORCH_JDBC_ADMIN_URL)".into(),
+        )
+    })?;
+    let ctx = crate::source_readiness::ctx_from_source(&source, slot);
+    let Some(probes) = crate::source_readiness::probes(&ctx) else {
+        let (_, server) = admin
+            .test_info(&source.source_type, &source.connection)
+            .await?;
+        return Ok(Json(crate::source_readiness::not_applicable(&ctx, server)));
+    };
+    let res = admin
+        .probe(&source.source_type, &source.connection, &probes)
+        .await?;
+    Ok(Json(crate::source_readiness::evaluate(
+        &ctx,
+        res.server,
+        &res.results,
+    )))
 }
 
 fn catalog_response(
@@ -2932,7 +2992,7 @@ fn sql_string_literals(sql: &str) -> Vec<String> {
 pub async fn validate_target(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::TargetCatalogRequest>,
-) -> Result<Json<ValidationResponse>, AppError> {
+) -> Result<Json<crate::models::ConnectionCheckResponse>, AppError> {
     // Restore stored credentials when the caller omits the password (saved profile).
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -2941,6 +3001,7 @@ pub async fn validate_target(
             }
         }
     }
+    let req_profile_id = req.profile_id;
     let payload = req.target;
     if payload.target_type.trim().is_empty() {
         return Err(AppError::BadRequest("target_type is required".to_string()));
@@ -2964,8 +3025,20 @@ pub async fn validate_target(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    let message = if crate::clients::JdbcAdminClient::from_env().is_some() {
-        connector_catalog::test_connection(&payload.target_type, &payload.connection).await?
+    let mut server = None;
+    let message = if let Some(admin) = crate::clients::JdbcAdminClient::from_env() {
+        let (msg, info) = admin
+            .test_info(&payload.target_type, &payload.connection)
+            .await?;
+        // A saved pipeline's test also refreshes its stored version (no extra round trip).
+        if let (Some(pid), Some(i)) = (req_profile_id, info.as_ref()) {
+            state
+                .db_versions
+                .record(pid, crate::db_versions::Side::Target, Ok(i))
+                .await;
+        }
+        server = info;
+        msg
     } else {
         match payload.target_type.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => {
@@ -2988,9 +3061,10 @@ pub async fn validate_target(
         }
     };
 
-    Ok(Json(ValidationResponse {
+    Ok(Json(crate::models::ConnectionCheckResponse {
         valid: true,
         message,
+        server,
         timestamp: Utc::now(),
     }))
 }

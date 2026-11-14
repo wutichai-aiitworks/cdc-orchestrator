@@ -399,6 +399,12 @@ services:
       ORCH_PGDUMP_TOKEN: ${ORCH_PGDUMP_TOKEN:-}
       ORCH_RSYNC_URL: ${ORCH_RSYNC_URL:-http://cdc-rsync:8090}
       ORCH_RSYNC_TOKEN: ${ORCH_RSYNC_TOKEN:-}
+      # AI vector sync (ADR 0018). One switch for sidecar + UI: VECTORSYNC_ENABLED in .env.
+      # Source/target database version re-read per pipeline (ADR 0019 §8), seconds, min 60.
+      ORCH_DB_VERSION_REFRESH_SECS: ${ORCH_DB_VERSION_REFRESH_SECS:-3600}
+      ORCH_VECTORSYNC_ENABLED: ${VECTORSYNC_ENABLED:-false}
+      ORCH_VECTORSYNC_URL: ${ORCH_VECTORSYNC_URL:-http://cdc-vectorsync:8092}
+      ORCH_VECTORSYNC_TOKEN: ${ORCH_VECTORSYNC_TOKEN:-}
       # WireGuard gateway (ADR 0010); unset ORCH_WIREGUARD_URL to turn tunnels off.
       ORCH_WIREGUARD_URL: ${ORCH_WIREGUARD_URL:-http://cdc-wireguard:8091}
       ORCH_WIREGUARD_TOKEN: ${ORCH_WIREGUARD_TOKEN:-}

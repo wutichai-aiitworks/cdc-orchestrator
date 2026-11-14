@@ -2,4 +2,5 @@
 // (server/middleware/feature-pages.ts, direct requests) and the page meta (middleware/feature.ts).
 export const FEATURE_PAGES: Record<string, string> = {
   "/ksqldb": "ksql_enabled", // ORCH_KSQL_ENABLED (default false)
+  "/vectorsync": "vectorsync", // VECTORSYNC_ENABLED (default false), ADR 0018
 }

@@ -948,6 +948,14 @@
   "write": true
  },
  {
+  "method": "POST",
+  "path": "/cdc/profiles/{id}/db-versions/refresh",
+  "summary": "Read a pipeline's source and target database version now",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
   "method": "GET",
   "path": "/cdc/profiles/{id}/dlq",
   "summary": "Get the managed sink DLQ topic and current message count",
@@ -1135,6 +1143,14 @@
  },
  {
   "method": "POST",
+  "path": "/cdc/profiles/catalog/source/readiness",
+  "summary": "Live CDC readiness check of the source",
+  "tag": "Profiles",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
   "path": "/cdc/profiles/catalog/source/table",
   "summary": "Inspect source table structure, keys, and sample rows",
   "tag": "Profiles",
@@ -1188,6 +1204,14 @@
   "tag": "Profiles",
   "query": [],
   "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/db-versions",
+  "summary": "Source and target database version of every pipeline",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
  },
  {
   "method": "POST",
@@ -1437,6 +1461,138 @@
   "path": "/cdc/topics/{topic}/recreate",
   "summary": "Recreate a Kafka topic with the same partitions, replication, and core configs",
   "tag": "Kafka",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/vectorsync/capability",
+  "summary": "Vector sync switch and sidecar versions",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/embedding-models",
+  "summary": "List models on the embedding server",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/preview",
+  "summary": "Preview documents from the newest records",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/vectorsync/profiles",
+  "summary": "List vector syncs with live status",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/profiles",
+  "summary": "Create a vector sync (starts it unless enabled=false)",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/vectorsync/profiles/{id}",
+  "summary": "Delete a vector sync",
+  "tag": "AI Vector Sync",
+  "query": [
+   "drop_collection"
+  ],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/vectorsync/profiles/{id}",
+  "summary": "Get one vector sync with live status",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/vectorsync/profiles/{id}",
+  "summary": "Update a vector sync",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/vectorsync/profiles/{id}/dead-letters",
+  "summary": "Clear the dead letters",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/vectorsync/profiles/{id}/dead-letters",
+  "summary": "Rows that could not become documents",
+  "tag": "AI Vector Sync",
+  "query": [
+   "limit"
+  ],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/profiles/{id}/pause",
+  "summary": "Pause (stop consuming; offsets kept)",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/profiles/{id}/rebuild",
+  "summary": "Rebuild from the start of the topics",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/profiles/{id}/resume",
+  "summary": "Resume from the committed offsets",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/profiles/{id}/search",
+  "summary": "Semantic search in the collection",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/vectorsync/sources",
+  "summary": "Pipelines and the topics they have",
+  "tag": "AI Vector Sync",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/vectorsync/test",
+  "summary": "Test the embedding model and/or the PGVector target",
+  "tag": "AI Vector Sync",
   "query": [],
   "write": true
  },

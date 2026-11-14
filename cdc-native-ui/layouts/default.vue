@@ -13,6 +13,7 @@ import {
   FileText,
   Gauge,
   GitBranch,
+  Sparkles,
   HardDrive,
   FolderSync,
   HardDriveDownload,
@@ -61,6 +62,7 @@ const navGroups: NavGroup[] = [
       { label: "CDC Pipelines", to: "/pipelines", icon: Workflow },
       { label: "Schema Compare", to: "/schema-compare", icon: Columns2 },
       { label: "Event Processing", to: "/processing", icon: GitBranch },
+      { label: "AI Vector Sync", to: "/vectorsync", icon: Sparkles, feature: "vectorsync" },
     ],
   },
   {

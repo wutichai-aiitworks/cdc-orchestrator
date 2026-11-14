@@ -36,6 +36,7 @@ public final class Main {
         server.createContext("/v1/ddl", exchange -> handle(exchange, token, Main::ddl));
         server.createContext("/v1/stream", exchange -> stream(exchange, token));
         server.createContext("/v1/lookup", exchange -> handle(exchange, token, Main::lookup));
+        server.createContext("/v1/probe", exchange -> handle(exchange, token, Main::probe));
         // A streaming copy can hold its request for many minutes; the default executor runs
         // every request on one thread and would block catalog/preview/count meanwhile.
         server.setExecutor(Executors.newCachedThreadPool());
@@ -44,7 +45,24 @@ public final class Main {
     }
 
     private static Object test(AdminRequest req) throws Exception {
-        return Map.of("ok", true, "message", JdbcOps.test(req.dbType, req.connection));
+        JdbcOps.TestResult r = JdbcOps.testWithInfo(req.dbType, req.connection);
+        Map<String, Object> out = new HashMap<>();
+        out.put("ok", true);
+        out.put("message", r.message());
+        if (r.server() != null) {
+            out.put("server", r.server().toMap());
+        }
+        return out;
+    }
+
+    private static Object probe(AdminRequest req) throws Exception {
+        List<JdbcOps.Probe> probes = new ArrayList<>();
+        if (req.probes != null) {
+            for (Map<String, String> p : req.probes) {
+                probes.add(new JdbcOps.Probe(p.getOrDefault("id", ""), p.getOrDefault("sql", "")));
+            }
+        }
+        return JdbcOps.probe(req.dbType, req.connection, probes);
     }
 
     private static Object catalog(AdminRequest req) throws Exception {
@@ -294,8 +312,21 @@ public final class Main {
                 strings(root.get("columns")),
                 root.path("canonical").asBoolean(false),
                 strings(root.get("key_columns")),
-                keyTuples(root.get("keys"))
+                keyTuples(root.get("keys")),
+                probes(root.get("probes"))
         );
+    }
+
+    private static List<Map<String, String>> probes(JsonNode node) {
+        List<Map<String, String>> out = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            for (JsonNode item : node) {
+                if (item != null && item.isObject()) {
+                    out.add(Map.of("id", item.path("id").asText(""), "sql", item.path("sql").asText("")));
+                }
+            }
+        }
+        return out;
     }
 
     private static List<String> strings(JsonNode node) {
@@ -388,7 +419,9 @@ public final class Main {
             /** {@code /v1/lookup}: key column names. */
             List<String> keyColumns,
             /** {@code /v1/lookup}: key tuples as canonical strings, {@code keyColumns} order. */
-            List<List<String>> keys
+            List<List<String>> keys,
+            /** {@code /v1/probe}: [{id, sql}] read-only statements (CDC readiness). */
+            List<Map<String, String>> probes
     ) {}
 
     @FunctionalInterface

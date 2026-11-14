@@ -12,6 +12,8 @@ volumes:
   cdc-mongocopy-data:
   cdc-pgdump-data:
   cdc-rsync-data:
+  cdc-vectorsync-data:
+  cdc-pgvector-data:
 
 services:
   cdc-pgcopydb:
@@ -198,6 +200,67 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    restart: unless-stopped
+
+  # AI vector sync (ADR 0018): pipeline topics → embeddings → PGVector, via pydebeziumai.
+  # Off unless VECTORSYNC_ENABLED=true in .env (compose.inc.sh then adds --profile vectorsync and
+  # the orchestrator shows the feature). Not related to cdc-vector (the log shipper below).
+  cdc-vectorsync:
+    image: ${CDC_VECTORSYNC_IMAGE:-cdc-vectorsync:local}
+    profiles: ["vectorsync"]
+    build:
+      context: ./vectorsync
+      dockerfile: Dockerfile
+      args:
+        # VECTORSYNC_DOCLING=true: Docling (PDF/DOCX/… in a bytes column → chunks); ~3–4 GB image.
+        WITH_DOCLING: ${VECTORSYNC_DOCLING:-false}
+    container_name: cdc-vectorsync
+    depends_on:
+      cdc-message:
+        condition: service_healthy
+    environment:
+      VECTORSYNC_API_HOST: 0.0.0.0
+      VECTORSYNC_API_PORT: "8092"
+      VECTORSYNC_API_TOKEN: ${ORCH_VECTORSYNC_TOKEN:-}
+      VECTORSYNC_WORK_ROOT: /var/lib/vectorsync
+      VECTORSYNC_KAFKA_BOOTSTRAP: ${VECTORSYNC_KAFKA_BOOTSTRAP:-cdc-message:9092}
+      VECTORSYNC_SCHEMA_REGISTRY_URL: ${VECTORSYNC_SCHEMA_REGISTRY_URL:-http://cdc-message:8081}
+      VECTORSYNC_DLQ_MAX: ${VECTORSYNC_DLQ_MAX:-1000}
+      VECTORSYNC_MAX_BACKOFF_SECONDS: ${VECTORSYNC_MAX_BACKOFF_SECONDS:-60}
+      VECTORSYNC_DOCLING_MAX_MB: ${VECTORSYNC_DOCLING_MAX_MB:-50}
+      VECTORSYNC_DOCLING_MAX_PAGES: ${VECTORSYNC_DOCLING_MAX_PAGES:-500}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cdc-vectorsync-data:/var/lib/vectorsync
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8092/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # Demo vector store (VECTORSYNC_DEMO=true): Postgres with pgvector, user/pass/db "vector".
+  cdc-pgvector:
+    image: ${CDC_PGVECTOR_IMAGE:-pgvector/pgvector:0.8.0-pg17}
+    profiles: ["vectorsync-demo"]
+    container_name: cdc-pgvector
+    environment:
+      POSTGRES_USER: vector
+      POSTGRES_PASSWORD: vector
+      POSTGRES_DB: vector
+    ports:
+      - "${CDC_PGVECTOR_HOST_PORT:-25434}:5432"
+    volumes:
+      - cdc-pgvector-data:/var/lib/postgresql/data
+    networks: [server_zone]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vector -d vector"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped
 
   cdc-vector:

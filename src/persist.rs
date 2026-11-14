@@ -21,6 +21,7 @@ pub const KIND_MONGOCOPY: &str = "mongocopy_profile";
 pub const KIND_PGDUMP: &str = "pgdump_profile";
 pub const KIND_RSYNC: &str = "rsync_profile";
 pub const KIND_WIREGUARD: &str = "wireguard_tunnel";
+pub const KIND_VECTORSYNC: &str = "vectorsync_profile";
 
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_config (
   kind TEXT NOT NULL,

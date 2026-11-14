@@ -17,3 +17,5 @@ CDC_PGLOADER_IMAGE|cdc-pgloader|docker/pgloader/Dockerfile|docker/pgloader|--bui
 CDC_REDIS_SHAKE_IMAGE|cdc-redisshake|docker/redisshake/Dockerfile|docker/redisshake|--build-context common=docker/sidecar_common
 CDC_MONGOCOPY_IMAGE|cdc-mongocopy|docker/mongocopy/Dockerfile|docker/mongocopy|--build-context common=docker/sidecar_common
 CDC_RSYNC_IMAGE|cdc-rsync|docker/rsync/Dockerfile|docker/rsync|
+CDC_VECTORSYNC_IMAGE|cdc-vectorsync|docker/vectorsync/Dockerfile|docker/vectorsync|
+CDC_VECTORSYNC_DOCLING_IMAGE|cdc-vectorsync-docling|docker/vectorsync/Dockerfile|docker/vectorsync|--build-arg WITH_DOCLING=true

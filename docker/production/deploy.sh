@@ -31,6 +31,7 @@ BUILT=(
   CDC_PGCOPY_IMAGE\|cdc-pgcopydb CDC_PGDUMP_IMAGE\|cdc-pgdump
   CDC_PGLOADER_IMAGE\|cdc-pgloader CDC_REDIS_SHAKE_IMAGE\|cdc-redisshake
   CDC_MONGOCOPY_IMAGE\|cdc-mongocopy CDC_RSYNC_IMAGE\|cdc-rsync
+  CDC_VECTORSYNC_IMAGE\|cdc-vectorsync CDC_VECTORSYNC_DOCLING_IMAGE\|cdc-vectorsync-docling
 )
 # Entrypoint/Cmd that docker-compose.yaml re-states after the secret-env.sh shim.
 # If an image changes its ENTRYPOINT/CMD, compose must follow — checked after pull.
@@ -46,6 +47,8 @@ EXPECTED_EP=(
   'CDC_REDIS_SHAKE_IMAGE|["python3","/app/serve.py"] null'
   'CDC_MONGOCOPY_IMAGE|["docker-entrypoint.sh"] ["python3","/app/serve.py"]'
   'CDC_RSYNC_IMAGE|null ["python3","/app/serve.py"]'
+  'CDC_VECTORSYNC_IMAGE|["python3","/app/serve.py"] null'
+  'CDC_VECTORSYNC_DOCLING_IMAGE|["python3","/app/serve.py"] null'
 )
 # Secrets: name|kind. hex/b64 = generated; manual = you fill it; optional = may stay empty;
 # mcpkeys = generated "ops:read:<hex>" (edit to add clients).
@@ -53,18 +56,19 @@ SECRETS=(
   orch_api_token\|hex orch_secret_key\|b64
   orch_jdbc_admin_token\|hex orch_pgcopy_token\|hex orch_redis_shake_token\|hex
   orch_pgloader_token\|hex orch_mongocopy_token\|hex orch_pgdump_token\|hex
-  orch_rsync_token\|hex orch_wireguard_token\|hex
+  orch_rsync_token\|hex orch_wireguard_token\|hex orch_vectorsync_token\|hex
   admin_password\|hex session_secret\|hex admin_session_secret\|hex
   sso_app_secret\|manual authelia_client_secret\|optional
   mcp_client_keys\|mcpkeys mcp_bearer_token\|optional o2_password\|manual
   deploy_discord_webhook\|optional deploy_o2_auth_b64\|optional
 )
 SERVICE_TOKENS=(orch_api_token orch_jdbc_admin_token orch_pgcopy_token orch_redis_shake_token
-  orch_pgloader_token orch_mongocopy_token orch_pgdump_token orch_rsync_token orch_wireguard_token)
+  orch_pgloader_token orch_mongocopy_token orch_pgdump_token orch_rsync_token orch_wireguard_token
+  orch_vectorsync_token)
 # Keys that must no longer be in .env (they moved to ./secrets).
 LEGACY_ENV_SECRETS=(ORCH_API_TOKEN ORCH_SECRET_KEY ORCH_JDBC_ADMIN_TOKEN ORCH_PGCOPY_TOKEN
   ORCH_REDIS_SHAKE_TOKEN ORCH_PGLOADER_TOKEN ORCH_MONGOCOPY_TOKEN ORCH_PGDUMP_TOKEN ORCH_RSYNC_TOKEN
-  ORCH_WIREGUARD_TOKEN ADMIN_PASSWORD SESSION_SECRET ADMIN_SESSION_SECRET SSO_APP_SECRET
+  ORCH_WIREGUARD_TOKEN ORCH_VECTORSYNC_TOKEN ADMIN_PASSWORD SESSION_SECRET ADMIN_SESSION_SECRET SSO_APP_SECRET
   AUTHELIA_CLIENT_SECRET MCP_CLIENT_KEYS MCP_BEARER_TOKEN O2_PASSWORD DEPLOY_DISCORD_WEBHOOK
   DEPLOY_O2_AUTH_B64)
 
@@ -72,6 +76,9 @@ CORE_INFRA=(cdc-message cdc-rqlite cdc-redis)
 CORE_ENGINE=(cdc-connect cdc-jdbc-admin)
 SIDECARS=(cdc-wireguard cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync)
 AGENT=(mcp-cdc cdc-vector)
+# Optional, behind VECTORSYNC_ENABLED (profile vectorsync, ADR 0018). Images only some releases have.
+VECTORSYNC=(cdc-vectorsync)
+OPTIONAL_IMAGES=(CDC_VECTORSYNC_IMAGE CDC_VECTORSYNC_DOCLING_IMAGE)
 
 errors=0
 warnings=0
@@ -92,10 +99,34 @@ file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 compose() {
   local args=(--env-file "$ENV_FILE")
   [[ -f "$IMAGES_FILE" ]] && args+=(--env-file "$IMAGES_FILE")
-  COMPOSE_IGNORE_ORPHANS=1 docker compose --project-directory "$DIR" "${args[@]}" \
+  # One switch for the AI vector sync sidecar + UI (ADR 0018).
+  vectorsync_enabled && args+=(--profile vectorsync)
+  # Docling variant: a shell value overrides images.env inside compose. Set it only when the
+  # variant is on (an empty value would make compose drop the digest pin of the default image).
+  local envs=()
+  if docling_enabled; then
+    local ref; ref="$(env_get CDC_VECTORSYNC_DOCLING_IMAGE "$IMAGES_FILE")"
+    if [[ -z "$ref" ]]; then
+      local reg ver
+      reg="$(env_get CDC_REGISTRY "$IMAGES_FILE")"; ver="$(env_get CDC_VERSION "$IMAGES_FILE")"
+      ref="${reg:-$DEFAULT_REGISTRY}/cdc-vectorsync-docling:${ver:-latest}"
+    fi
+    envs=(CDC_VECTORSYNC_IMAGE="$ref")
+  fi
+  env ${envs[@]+"${envs[@]}"} COMPOSE_IGNORE_ORPHANS=1 docker compose --project-directory "$DIR" "${args[@]}" \
     -f "$DIR/docker-compose.yaml" "$@"
 }
 
+vectorsync_enabled() { [[ "$(env_get VECTORSYNC_ENABLED | tr '[:upper:]' '[:lower:]')" =~ ^(1|true|yes|on)$ ]]; }
+# An optional image is skipped (resolve, pin check, entrypoint check) while its feature is off.
+docling_enabled() { vectorsync_enabled && [[ "$(env_get VECTORSYNC_DOCLING | tr '[:upper:]' '[:lower:]')" =~ ^(1|true|yes|on)$ ]]; }
+image_skipped() {
+  case "$1" in
+    CDC_VECTORSYNC_IMAGE) ! vectorsync_enabled || docling_enabled ;;
+    CDC_VECTORSYNC_DOCLING_IMAGE) ! docling_enabled ;;
+    *) return 1 ;;
+  esac
+}
 agent_enabled() { [[ ",$(env_get COMPOSE_PROFILES)," == *",agent,"* ]]; }
 # SSO_* / AUTHELIA_* and their secrets matter only when the UI runs AUTH_MODE=sso.
 sso_enabled() { [[ "$(env_get AUTH_MODE | tr '[:upper:]' '[:lower:]')" == sso ]]; }
@@ -195,6 +226,8 @@ cmd_images() {
     var="${spec%%|*}"; name="${spec#*|}"; ref="$reg/$name:$tag"
     if digest="$(resolve_digest "$ref")"; then
       echo "$var=$ref@$digest" >>"$tmp"; printf '  %-22s %s\n' "$name" "${digest:0:19}…"
+    elif image_skipped "$var"; then
+      printf '  %-22s %s\n' "$name" "not in this release (feature off — skipped)"
     else
       rm -f "$tmp"; die "cannot resolve $ref (tag pushed? docker login done for a private repo?)"
     fi
@@ -299,6 +332,15 @@ cmd_preflight() {
     fi
   fi
 
+  echo "AI vector sync (VECTORSYNC_ENABLED)"
+  if vectorsync_enabled; then
+    pass "on → cdc-vectorsync starts with the stack and the UI shows AI Vector Sync"
+    if docling_enabled; then pass "Docling variant (cdc-vectorsync-docling): give the container ~4 GB RAM"; fi
+    warn "the embedding server (e.g. Ollama) and the pgvector database must be reachable from cdc-vectorsync — use Test in the wizard"
+  else
+    pass "off (sidecar not started, page hidden)"
+  fi
+
   echo "Release (images.env)"
   if [[ ! -f "$IMAGES_FILE" ]]; then
     fail "images.env missing (./deploy.sh images TAG, or up --images <woodpecker file>)"
@@ -306,12 +348,13 @@ cmd_preflight() {
     local s var unpinned=0 ver=""
     for s in "${BUILT[@]}"; do
       var="${s%%|*}"
+      image_skipped "$var" && continue
       local ref; ref="$(env_get "$var" "$IMAGES_FILE")"
       if [[ -z "$ref" || "$ref" != *@sha256:* ]]; then unpinned=$((unpinned + 1)); fi
       [[ -z "$ver" && "$ref" =~ :([^:@/]+)@ ]] && ver="${BASH_REMATCH[1]}"
     done
     if [[ "$unpinned" -eq 0 ]]; then
-      pass "all ${#BUILT[@]} Woodpecker images pinned by digest${ver:+ (release $ver)}"
+      pass "all required Woodpecker images pinned by digest${ver:+ (release $ver)}"
     else
       warn "$unpinned image(s) not digest-pinned → $(image_ref CDC_ORCHESTRATOR_IMAGE cdc-orchestrator | sed 's#/cdc-orchestrator#/<image>#') (run ./deploy.sh images TAG)"
     fi
@@ -343,6 +386,7 @@ check_entrypoints() {
   local spec var exp name ref insp got bad=0 s
   for spec in "${EXPECTED_EP[@]}"; do
     var="${spec%%|*}"; exp="${spec#*|}"
+    image_skipped "$var" && continue
     for s in "${BUILT[@]}"; do [[ "${s%%|*}" == "$var" ]] && name="${s#*|}"; done
     ref="$(image_ref "$var" "$name")"
     [[ "$ref" == *@* ]] && insp="${ref%%:*}@${ref##*@}" || insp="$ref"
@@ -423,6 +467,14 @@ do_rollout() {
   echo "==> sidecars"
   compose up -d --no-build "${SIDECARS[@]}"
   wait_healthy 180 "${SIDECARS[@]}"
+  if vectorsync_enabled; then
+    echo "==> AI vector sync (cdc-vectorsync)"
+    compose up -d --no-build "${VECTORSYNC[@]}"
+    wait_healthy 120 "${VECTORSYNC[@]}"
+  elif docker inspect cdc-vectorsync >/dev/null 2>&1; then
+    echo "==> VECTORSYNC_ENABLED off: removing cdc-vectorsync (volume and vectors kept)"
+    docker rm -f cdc-vectorsync >/dev/null
+  fi
   echo "==> control plane + UI"
   compose up -d --no-build cdc-orchestrator
   wait_healthy 180 cdc-orchestrator

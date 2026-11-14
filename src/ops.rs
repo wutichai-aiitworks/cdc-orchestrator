@@ -55,6 +55,7 @@ pub async fn capability(State(state): State<AppState>) -> Json<CapabilityRespons
             redisshake: state.config.redis_shake_url.is_some(),
             pgloader: state.config.pgloader_url.is_some(),
             mongocopy: state.config.mongocopy_url.is_some(),
+            vectorsync: crate::vectorsync::enabled(&state.config),
         },
         timestamp: Utc::now(),
     })

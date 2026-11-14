@@ -69,7 +69,9 @@ steps:
         ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
         echo running > "$${ST}/sidecars"
         # stdlib unittest only; pgdump imports paramiko lazily (image-only dependency).
-        for D in sidecar_common pgcopydb pgdump pgloader redisshake mongocopy rsync; do
+        # vectorsync tests run against the pinned pydebeziumai wheel (ADR 0018; they skip without it).
+        pip install -q -r docker/vectorsync/requirements.txt
+        for D in sidecar_common pgcopydb pgdump pgloader redisshake mongocopy rsync vectorsync; do
           echo "==> docker/$${D}"
           (cd "docker/$${D}" && PYTHONPATH=../sidecar_common python -m unittest discover -p 'test_*.py')
         done

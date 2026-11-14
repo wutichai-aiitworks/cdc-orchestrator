@@ -29,6 +29,8 @@ import type { ActionMenuItem } from "~/components/AppActionMenu.vue"
 import type { CdcProfile, ProfileDlqStatus } from "~/composables/useProfilesM3"
 import { formatApiError } from "~/utils/apiError"
 import { eventLabel } from "~/utils/pipelineEvents"
+import { formatServer, recentlyChanged, versionTitle } from "~/utils/cdcReadiness"
+import { RefreshCw as RefreshVersionsIcon } from "@lucide/vue"
 
 /**
  * Selected-pipeline view: status with its reason, the one next action, and tabs
@@ -322,9 +324,28 @@ const connectionText = (c?: Record<string, string> | null) => {
   return [hostPort, c.database].filter(Boolean).join(" / ") || "—"
 }
 
+// Source/target database version, refreshed in the background and when a database changes
+// (ADR 0019 §8). The stored value is the last one read; a failed check keeps it.
+const toast = useToast()
+const { dbVersions, refreshDbVersions } = useProfilesM3()
+const versions = computed(() => dbVersions.value[props.profile.id] || null)
+const hasDbTarget = computed(() => !!props.profile.target && props.profile.pattern === "source_to_target")
+const versionsBusy = ref(false)
+const refreshVersions = async () => {
+  versionsBusy.value = true
+  try {
+    await refreshDbVersions(props.profile.id)
+  } catch (e: any) {
+    toast.error(formatApiError(e, "Could not read the database versions"))
+  } finally {
+    versionsBusy.value = false
+  }
+}
+const withVersion = (text: string, v?: import("~/utils/cdcReadiness").VersionStamp | null) => (formatServer(v) ? `${text} · ${formatServer(v)}` : text)
+
 const configRows = computed(() => [
-  { label: "Source", value: `${props.flow.sourceLabel} · ${connectionText(props.profile.source.connection)}` },
-  { label: "Destination", value: [props.flow.targetLabel, props.flow.targetCaption].filter(Boolean).join(" · ") },
+  { label: "Source", value: withVersion(`${props.flow.sourceLabel} · ${connectionText(props.profile.source.connection)}`, versions.value?.source) },
+  { label: "Destination", value: withVersion([props.flow.targetLabel, props.flow.targetCaption].filter(Boolean).join(" · "), hasDbTarget.value ? versions.value?.target : null) },
   { label: "How changes are captured", value: captureText.value },
   { label: "When changes are delivered", value: scheduleText.value },
   { label: "What is captured", value: scopeText.value },
@@ -370,6 +391,22 @@ const configRows = computed(() => [
           <p class="truncate font-mono text-xs text-muted-foreground" :title="`${flow.sourceCaption} → ${flow.targetCaption}`">
             {{ flow.sourceLabel }} {{ connectionText(profile.source.connection) }} → {{ flow.targetCaption || flow.targetLabel }}
           </p>
+          <div class="flex flex-wrap items-center gap-1.5 text-xs">
+            <template v-for="side in [{ key: 'source', label: 'Source', v: versions?.source }, ...(hasDbTarget ? [{ key: 'target', label: 'Target', v: versions?.target }] : [])]" :key="side.key">
+              <span
+                class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5"
+                :class="side.v?.error ? 'border-amber-500/40 text-amber-700 dark:text-amber-300' : 'border-border text-muted-foreground'"
+                :title="versionTitle(side.v)"
+              >
+                {{ side.label }}:
+                <span class="font-medium text-foreground">{{ formatServer(side.v) || "version not read yet" }}</span>
+                <span v-if="recentlyChanged(side.v)" class="rounded bg-brand-500/10 px-1 text-[10px] font-medium text-primary">updated</span>
+              </span>
+            </template>
+            <button type="button" class="icon-button h-6 w-6" title="Read the database versions again" :disabled="versionsBusy" @click="refreshVersions">
+              <RefreshVersionsIcon class="h-3.5 w-3.5" :class="versionsBusy && 'animate-spin'" :stroke-width="1.75" />
+            </button>
+          </div>
           <div v-if="!editingTags" class="flex flex-wrap items-center gap-1 pt-1">
             <span v-for="tag in profile.tags ?? []" :key="tag" class="tag-chip">{{ tag }}</span>
             <button type="button" class="btn-ghost inline-flex items-center gap-1 text-xs" @click="startTagEdit">

@@ -28,6 +28,7 @@ secrets/
 ├── orch_pgdump_token         generated   orchestrator, pgdump
 ├── orch_rsync_token          generated   orchestrator, rsync
 ├── orch_wireguard_token      generated   orchestrator, wireguard
+├── orch_vectorsync_token     generated   orchestrator, vectorsync (when VECTORSYNC_ENABLED)
 ├── admin_password            generated   native-ui (break-glass login)
 ├── session_secret            generated   native-ui
 ├── admin_session_secret      generated   native-ui

@@ -2,8 +2,9 @@
 /** One pipeline as a card (card view and tag view of the pipelines list). */
 import { ArrowRight, Pencil, Trash2, Waves } from "@lucide/vue"
 import type { CdcProfile } from "~/composables/useProfilesM3"
+import { versionLine, versionTitle } from "~/utils/cdcReadiness"
 
-defineProps<{
+const props = defineProps<{
   profile: CdcProfile
   route: string
   capture: string
@@ -13,6 +14,9 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{ select: []; edit: []; delete: []; tag: [tag: string] }>()
+const { dbVersions } = useProfilesM3()
+const versions = computed(() => dbVersions.value[props.profile.id] || null)
+const line = computed(() => versionLine(versions.value, props.profile.pattern === "source_to_target"))
 </script>
 
 <template>
@@ -46,6 +50,7 @@ const emit = defineEmits<{ select: []; edit: []; delete: []; tag: [tag: string] 
       <Waves v-else class="h-4 w-4 text-muted-foreground" :stroke-width="1.75" />
       <span class="ml-1 truncate font-mono text-xs text-muted-foreground" :title="route">{{ route }}</span>
     </div>
+    <p v-if="line" class="-mt-2 truncate text-[11px] text-muted-foreground" :title="[versionTitle(versions?.source), versionTitle(versions?.target)].filter(Boolean).join('\n')">{{ line }}</p>
 
     <dl class="grid grid-cols-2 gap-2 text-xs">
       <div>

@@ -88,6 +88,19 @@ wait_container_healthy() {
   return 1
 }
 
+# AI vector sync (ADR 0018): follow VECTORSYNC_ENABLED both ways, so turning it off really stops it.
+apply_vectorsync() {
+  if _env_flag VECTORSYNC_ENABLED; then
+    echo "VECTORSYNC_ENABLED=true → (re)building cdc-vectorsync…"
+    local svcs=(cdc-vectorsync)
+    _env_flag VECTORSYNC_DEMO && svcs+=(cdc-pgvector)
+    compose up -d --build --no-deps "${svcs[@]}"
+  elif docker inspect cdc-vectorsync >/dev/null 2>&1; then
+    echo "VECTORSYNC_ENABLED is off → stopping cdc-vectorsync (its volume and the vectors are kept)…"
+    docker rm -f cdc-vectorsync >/dev/null
+  fi
+}
+
 if [[ "$FULL" -eq 1 ]]; then
   echo "Full redeploy (restarts message bus + Connect — Kafka/connectors may briefly reset)…"
   ensure_rqlite_healthy
@@ -107,6 +120,7 @@ if [[ "$FULL" -eq 1 ]]; then
   #compose up -d --no-deps cdc-admin
   compose --profile vector up -d --no-deps cdc-vector
   compose --profile native-ui up -d --build --no-deps cdc-native-ui
+  apply_vectorsync
   echo "Done (full)."
   exit 0
 fi
@@ -118,6 +132,7 @@ compose up -d --build --force-recreate --no-deps cdc-jdbc-admin
 compose --profile native-ui up -d --build --force-recreate --no-deps cdc-native-ui
 compose up -d --build --force-recreate --no-deps cdc-orchestrator
 wait_container_healthy cdc-orchestrator 90
+apply_vectorsync
 
 if [[ "$WITH_CONNECT" -eq 1 ]]; then
   echo "Also rebuilding Kafka Connect…"

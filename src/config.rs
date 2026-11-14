@@ -113,6 +113,12 @@ pub struct AppConfig {
     pub pgdump_token: Option<String>,
     pub rsync_url: Option<String>,
     pub rsync_token: Option<String>,
+    /// VECTORSYNC_ENABLED / ORCH_VECTORSYNC_ENABLED (default off): AI vector sync (ADR 0018).
+    pub vectorsync_enabled: bool,
+    pub vectorsync_url: Option<String>,
+    pub vectorsync_token: Option<String>,
+    /// How often desired syncs are pushed to cdc-vectorsync (ORCH_VECTORSYNC_RECONCILE_SECS).
+    pub vectorsync_reconcile_secs: u64,
     pub rqlite_url: Option<String>,
     pub rqlite_user: Option<String>,
     pub rqlite_pass: Option<String>,
@@ -291,6 +297,27 @@ impl AppConfig {
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let vectorsync_enabled = ksql_enabled_from(
+            env::var("ORCH_VECTORSYNC_ENABLED")
+                .or_else(|_| env::var("VECTORSYNC_ENABLED"))
+                .ok()
+                .as_deref(),
+        );
+        let vectorsync_url = env::var("ORCH_VECTORSYNC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let vectorsync_token = env::var("ORCH_VECTORSYNC_TOKEN")
+            .ok()
+            .or_else(|| env::var("VECTORSYNC_API_TOKEN").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let vectorsync_reconcile_secs = env::var("ORCH_VECTORSYNC_RECONCILE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 5)
+            .unwrap_or(30);
+
         let rqlite_url = env::var("ORCH_RQLITE_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -466,6 +493,10 @@ impl AppConfig {
             pgdump_token,
             rsync_url,
             rsync_token,
+            vectorsync_enabled,
+            vectorsync_url,
+            vectorsync_token,
+            vectorsync_reconcile_secs,
             rqlite_url,
             rqlite_user,
             rqlite_pass,
@@ -555,7 +586,8 @@ impl AppConfig {
     }
 }
 
-/// ORCH_KSQL_ENABLED: off unless explicitly turned on (1/true/yes/on). Unset or empty = off.
+/// Feature switches (ORCH_KSQL_ENABLED, ORCH_VECTORSYNC_ENABLED): off unless explicitly turned on
+/// (1/true/yes/on). Unset or empty = off.
 fn ksql_enabled_from(v: Option<&str>) -> bool {
     matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),

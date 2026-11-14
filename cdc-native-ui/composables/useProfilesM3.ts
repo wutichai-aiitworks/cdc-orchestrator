@@ -1,3 +1,4 @@
+import type { DbVersions, ReadinessReport, ServerInfo } from "~/utils/cdcReadiness"
 export type DatabaseType = "postgres" | "mysql" | "mariadb" | "sqlserver" | "oracle" | "db2" | "informix" | "sqlite"
 export type PipelinePattern = "source_to_stream" | "source_to_target" | "source_to_lake" | "source_to_olake"
 export type TableFormat = "iceberg" | "parquet" | "delta"
@@ -346,9 +347,18 @@ export type ProfileDlqStatus = {
 
 export const useProfilesM3 = () => {
   const fetchSchedule = () => $fetch<ScheduleResponse>("/api/cdc/schedule")
+  // Source/target database versions per pipeline, refreshed with every list load (ADR 0019 §8).
+  const dbVersions = useState<Record<string, DbVersions>>("cdc-db-versions", () => ({}))
   const fetchProfiles = async () => {
-    const response = await $fetch<{ profiles: CdcProfile[] }>("/api/cdc/profiles")
+    const response = await $fetch<{ profiles: CdcProfile[]; db_versions?: Record<string, DbVersions> }>("/api/cdc/profiles")
+    if (response.db_versions) dbVersions.value = response.db_versions
     return response.profiles || []
+  }
+  /** Ask both databases for their version now; updates `dbVersions`. */
+  const refreshDbVersions = async (id: string) => {
+    const v = await $fetch<DbVersions>(`/api/cdc/profiles/${encodeURIComponent(id)}/actions/db-versions-refresh`, { method: "POST" })
+    dbVersions.value = { ...dbVersions.value, [id]: v }
+    return v
   }
   const createProfile = (body: ProfilePayload) =>
     $fetch<{ profile: CdcProfile }>("/api/cdc/profiles", { method: "POST", body })
@@ -362,16 +372,20 @@ export const useProfilesM3 = () => {
   const fetchDlqStatus = (id: string) =>
     $fetch<ProfileDlqStatus>(`/api/cdc/profiles/${encodeURIComponent(id)}/dlq`)
   // profile_id (optional): the server merges stored credentials for a saved pipeline.
+  // `server`: database product/version from the connection test (jdbc-admin; absent on older ones).
   const validateSource = (body: ProfilePayload["source"] & { profile_id?: string | null }) =>
-    $fetch<{ valid: boolean; message: string }>("/api/cdc/profiles/validate/source", {
+    $fetch<{ valid: boolean; message: string; server?: ServerInfo }>("/api/cdc/profiles/validate/source", {
       method: "POST",
       body,
     })
   const validateTarget = (body: NonNullable<ProfilePayload["target"]> & { profile_id?: string | null }) =>
-    $fetch<{ valid: boolean; message: string }>("/api/cdc/profiles/validate/target", {
+    $fetch<{ valid: boolean; message: string; server?: ServerInfo }>("/api/cdc/profiles/validate/target", {
       method: "POST",
       body,
     })
+  /** Live CDC readiness (ADR 0019): read-only probes on the source; missing privileges → unknown. */
+  const checkSourceReadiness = (body: ProfilePayload["source"] & { profile_id?: string | null }) =>
+    $fetch<ReadinessReport>("/api/cdc/profiles/catalog/source/readiness", { method: "POST", body })
   const validateLake = (body: NonNullable<ProfilePayload["lake"]>) =>
     $fetch<{ valid: boolean; message: string }>("/api/cdc/profiles/validate/lake", {
       method: "POST",
@@ -547,6 +561,9 @@ export const useProfilesM3 = () => {
     fetchDlqStatus,
     validateSource,
     validateTarget,
+    checkSourceReadiness,
+    dbVersions,
+    refreshDbVersions,
     validateLake,
     browseSourceCatalog,
     browseTargetCatalog,

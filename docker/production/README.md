@@ -1,13 +1,13 @@
 # docker/production — production deploy (Woodpecker images, Docker secrets)
 
 Pull-only stack for an AWS EC2 host (or any Linux VM). Woodpecker (`.woodpecker/main-ci.yml`)
-builds and pushes twelve images to Docker Hub under `wutichai/`; this folder runs them,
+builds and pushes thirteen images to Docker Hub under `wutichai/`; this folder runs them,
 pinned by digest. The host needs only this folder (no source tree, no build toolchain),
 Docker with Compose v2, and the external network `server_zone`.
 
 | Path | Purpose | Committed |
 |------|---------|-----------|
-| `docker-compose.yaml` | All 16 services, no `build:`; project `cdc-stack` | yes |
+| `docker-compose.yaml` | All 17 services, no `build:`; project `cdc-stack` | yes |
 | `.env.example` → `.env` | Non-secret config | example only |
 | `secrets/` | One file per credential, mounted as Docker secrets | **no** |
 | `images.env.example` → `images.env` | Release manifest (which image each service runs) | example only |
@@ -23,6 +23,7 @@ Docker with Compose v2, and the external network `server_zone`.
 | Core | `cdc-message` (Redpanda), `cdc-connect`, `cdc-jdbc-admin`, `cdc-rqlite`, `cdc-redis`, `cdc-orchestrator`, `cdc-native-ui` | UI `:4320`; everything else `127.0.0.1` |
 | Sidecars | `cdc-pgcopydb`, `cdc-wireguard`, `cdc-redisshake`, `cdc-pgloader`, `cdc-mongocopy`, `cdc-pgdump`, `cdc-rsync` | none (server_zone only) |
 | AI agent (profile `agent`) | `mcp-cdc`, `cdc-vector` | MCP `127.0.0.1:8410` |
+| AI vector sync (`VECTORSYNC_ENABLED=true`) | `cdc-vectorsync` | none (server_zone only) |
 
 ## First install
 
@@ -45,11 +46,11 @@ $EDITOR .env                                 # ADMIN_USERNAME, SSO_*, O2_*, publ
 
 Docker Hub `wutichai/<image>`: `cdc-orchestrator`, `cdc-connect`, `cdc-webui`, `cdc-mcp`,
 `cdc-jdbc-admin`, `cdc-wireguard`, `cdc-pgcopydb`, `cdc-pgdump`, `cdc-pgloader`,
-`cdc-redisshake`, `cdc-mongocopy`, `cdc-rsync`. Upstream images are pinned in compose
+`cdc-redisshake`, `cdc-mongocopy`, `cdc-rsync`, `cdc-vectorsync`. Upstream images are pinned in compose
 (Redpanda `v24.2.4`, rqlite `8.36.16`, Redis `7.4-alpine`, Vector `0.41.1-alpine`).
 
 Tags come from `scripts/ci/version.sh`. A `v*` git tag publishes `vX.Y.Z`, and `latest`
-moves to it once all 12 images are built. A branch push publishes `<branch>_<sha7>`
+moves to it once all 13 images are built. A branch push publishes `<branch>_<sha7>`
 (e.g. `test_1bb2c3c`) and never moves `latest`.
 
 Three ways to fill `images.env`, best first:
@@ -83,6 +84,7 @@ its env var and then execs the image's original entrypoint. So:
 | `orch_pgdump_token` | orchestrator, pgdump (`PGDUMP_API_TOKEN`) | generated |
 | `orch_rsync_token` | orchestrator, rsync (`RSYNC_API_TOKEN`) | generated |
 | `orch_wireguard_token` | orchestrator, wireguard (`WIREGUARD_API_TOKEN`) | generated |
+| `orch_vectorsync_token` | orchestrator, vectorsync (`VECTORSYNC_API_TOKEN`) | generated (used only when vector sync is on) |
 | `admin_password` | native-ui | generated (break-glass login) |
 | `session_secret`, `admin_session_secret` | native-ui | generated |
 | `sso_app_secret` | native-ui | **you fill** |
@@ -104,7 +106,7 @@ the apps removes this.
 
 ## Release
 
-1. Push a `v*` tag. Woodpecker builds all 12 images, moves `latest`, and posts
+1. Push a `v*` tag. Woodpecker builds all 13 images, moves `latest`, and posts
    `images-<version>.env` to Discord.
 2. On the host: `./deploy.sh up --images images-v1.2.3.env` (or `./deploy.sh images v1.2.3 && ./deploy.sh up`).
 
@@ -114,11 +116,37 @@ order, waiting for each group to be healthy:
 
 ```
 cdc-message, cdc-rqlite, cdc-redis → cdc-connect, cdc-jdbc-admin → 7 sidecars
-  → cdc-orchestrator → cdc-native-ui → mcp-cdc, cdc-vector (if profile agent)
+  → cdc-vectorsync (if VECTORSYNC_ENABLED) → cdc-orchestrator → cdc-native-ui → mcp-cdc, cdc-vector (if profile agent)
 ```
 
 Containers are recreated only when their image or config changed. `./deploy.sh rollback`
 re-deploys the previous manifest.
+
+## AI vector sync (optional, ADR 0018)
+
+Keeps pgvector collections in step with CDC tables (pydebeziumai document builder in the
+`cdc-vectorsync` sidecar, reading the pipelines' existing topics). Off by default.
+
+```bash
+# .env
+VECTORSYNC_ENABLED=true
+./deploy.sh up            # starts cdc-vectorsync, the UI shows "AI Vector Sync"
+```
+
+`deploy.sh` adds the compose profile `vectorsync` from that one flag. `false` + `up` removes the
+container (its volume and the vectors in Postgres stay). Needs:
+
+- a release that contains `cdc-vectorsync` (preflight warns if `images.env` has no pin for it;
+  older releases still deploy while the flag is off);
+- an embedding server reachable from the container: Ollama (`http://host.docker.internal:11434`
+  on the same host, `ollama pull bge-m3`) or any OpenAI-compatible `/v1/embeddings`;
+- a Postgres with the `vector` extension (e.g. RDS for PostgreSQL 15+ or `pgvector/pgvector`).
+  Store it in a database the sync user may `CREATE EXTENSION` in, or enable it beforehand.
+
+Sync passwords and API keys are encrypted at rest with `orch_secret_key`. Use the wizard's
+Test buttons to check both connections from inside the sidecar. Tuning in `.env`:
+`VECTORSYNC_DLQ_MAX`, `VECTORSYNC_MAX_BACKOFF_SECONDS`, and `VECTORSYNC_KAFKA_*` for extra
+librdkafka settings. Every sync is in the orchestrator's rqlite, so backups need nothing new.
 
 ## EC2 notes
 

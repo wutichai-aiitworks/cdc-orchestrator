@@ -70,27 +70,6 @@ fn require_jdbc_admin(db_type: &str) -> Result<JdbcAdminClient, AppError> {
     })
 }
 
-pub async fn test_connection(
-    db_type: &str,
-    connection: &HashMap<String, String>,
-) -> Result<String, AppError> {
-    if let Some(admin) = jdbc_admin() {
-        return admin.test(db_type, connection).await;
-    }
-    match db_type.trim().to_ascii_lowercase().as_str() {
-        "postgres" | "postgresql" => {
-            let insight = insight_from_connection(db_type, connection);
-            postgres_client(&insight).await?;
-            let host = connection.get("host").map(|s| s.as_str()).unwrap_or("");
-            let port = connection.get("port").map(|s| s.as_str()).unwrap_or("");
-            Ok(format!("source connection successful: {host}:{port}"))
-        }
-        other => Err(AppError::BadRequest(format!(
-            "{other} connection test requires cdc-jdbc-admin — set ORCH_JDBC_ADMIN_URL"
-        ))),
-    }
-}
-
 pub async fn load_live_catalog_from_connection(
     source_type: &str,
     connection: &HashMap<String, String>,
