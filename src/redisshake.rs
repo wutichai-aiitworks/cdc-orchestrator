@@ -37,6 +37,60 @@ pub const MAX_DB: u32 = 9999;
 
 /// Normalises the database choice (sorted, no duplicates) and rejects combinations RedisShake
 /// cannot honour. Redis Cluster has only database 0.
+/// Default restart window for `auto_restart = window` (the low-traffic night).
+pub const DEFAULT_RESTART_WINDOW: &str = "00:00-05:00";
+
+/// `HH:MM-HH:MM` → (start, end) minutes of the day. Equal ends are refused (empty window).
+pub fn parse_window(w: &str) -> Option<(u32, u32)> {
+    let (a, b) = w.trim().split_once('-')?;
+    let m = |s: &str| -> Option<u32> {
+        let (h, mi) = s.trim().split_once(':')?;
+        let (h, mi) = (h.parse::<u32>().ok()?, mi.parse::<u32>().ok()?);
+        (h < 24 && mi < 60).then_some(h * 60 + mi)
+    };
+    let (s, e) = (m(a)?, m(b)?);
+    (s != e).then_some((s, e))
+}
+
+/// Validates the auto-restart policy and fills the default window.
+pub fn normalize_restart_options(o: &mut RedisShakeSyncOptions) -> Result<(), AppError> {
+    o.auto_restart = o.auto_restart.trim().to_ascii_lowercase();
+    match o.auto_restart.as_str() {
+        "" | "off" => {
+            o.auto_restart.clear();
+            o.restart_window.clear();
+            return Ok(());
+        }
+        "window" | "always" => {}
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "auto_restart must be off, window or always, not {other}"
+            )))
+        }
+    }
+    if !o.sync_aof {
+        return Err(AppError::BadRequest(
+            "auto-restart applies to real-time syncs only (a one-time copy is not restarted)"
+                .into(),
+        ));
+    }
+    if o.auto_restart == "window" {
+        if o.restart_window.trim().is_empty() {
+            o.restart_window = DEFAULT_RESTART_WINDOW.into();
+        }
+        if parse_window(&o.restart_window).is_none() {
+            return Err(AppError::BadRequest(format!(
+                "restart_window must look like 00:00-05:00, not {:?}",
+                o.restart_window
+            )));
+        }
+        o.restart_window = o.restart_window.trim().to_string();
+    } else {
+        o.restart_window.clear();
+    }
+    Ok(())
+}
+
 pub fn normalize_db_options(o: &mut RedisShakeSyncOptions) -> Result<(), AppError> {
     o.source_dbs.sort_unstable();
     o.source_dbs.dedup();
@@ -174,6 +228,49 @@ crate::sidecar_v1_handlers!(access);
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restart_options_are_validated() {
+        let mut o = RedisShakeSyncOptions {
+            sync_aof: true,
+            auto_restart: "WINDOW".into(),
+            ..Default::default()
+        };
+        normalize_restart_options(&mut o).unwrap();
+        assert_eq!(
+            (o.auto_restart.as_str(), o.restart_window.as_str()),
+            ("window", DEFAULT_RESTART_WINDOW)
+        );
+        let mut bad = RedisShakeSyncOptions {
+            sync_aof: true,
+            auto_restart: "window".into(),
+            restart_window: "25:00-01:00".into(),
+            ..Default::default()
+        };
+        assert!(normalize_restart_options(&mut bad).is_err());
+        let mut once = RedisShakeSyncOptions {
+            sync_aof: false,
+            auto_restart: "always".into(),
+            ..Default::default()
+        };
+        assert!(
+            normalize_restart_options(&mut once).is_err(),
+            "one-time copies are not restarted"
+        );
+        let mut off = RedisShakeSyncOptions {
+            auto_restart: "off".into(),
+            restart_window: "01:00-02:00".into(),
+            ..Default::default()
+        };
+        normalize_restart_options(&mut off).unwrap();
+        assert!(off.auto_restart.is_empty() && off.restart_window.is_empty());
+        assert_eq!(
+            parse_window("22:30-04:15"),
+            Some((22 * 60 + 30, 4 * 60 + 15))
+        );
+        assert_eq!(parse_window("05:00-05:00"), None);
+    }
+
     use super::*;
 
     fn opts(source_dbs: Vec<u32>, target_db: Option<u32>) -> RedisShakeSyncOptions {

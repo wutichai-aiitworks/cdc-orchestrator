@@ -353,6 +353,16 @@ pub async fn route_payload(state: &AppState, body: &mut Value) -> Result<Vec<Str
         let Some(conn) = body.get_mut(key) else {
             continue;
         };
+        // SSH tunnel (ADR 0020) wins over a WireGuard tunnel_id on the same connection.
+        if let Some(name) = crate::ssh_tunnel::materialize_value(state, conn).await? {
+            // A file sync endpoint behind a forward: the hosts cannot reach each other directly.
+            rsync_tunnel |= conn.get("path").is_some();
+            if let Some(o) = conn.as_object_mut() {
+                o.remove("tunnel_id");
+            }
+            used.push(name);
+            continue;
+        }
         if let Some((name, is_ssh)) = route_conn(state, key, conn, &opts).await? {
             rsync_tunnel |= is_ssh;
             used.push(name);

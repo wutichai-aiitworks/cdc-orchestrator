@@ -8,8 +8,7 @@ use uuid::Uuid;
 use crate::audit::log_action;
 use crate::error::AppError;
 use crate::models::{
-    RedisShakeProfile, RedisShakeProfileRequest, RedisShakeProfilesResponse, SchemaCompareConn,
-    ValidationResponse,
+    RedisShakeProfile, RedisShakeProfileRequest, SchemaCompareConn, ValidationResponse,
 };
 use crate::redisshake::{self, normalize_db_options, profile_run_payload, require_redis_pair};
 use crate::saved_secret::keep_password;
@@ -86,12 +85,25 @@ pub async fn stop_redisshake_job(
 
 pub async fn list_redisshake_profiles(
     State(state): State<AppState>,
-) -> Result<Json<RedisShakeProfilesResponse>, AppError> {
+) -> Result<Json<Value>, AppError> {
     let mut profiles = state.redisshake_profiles.list().await?;
     for profile in &mut profiles {
         profile.redact_secrets();
     }
-    Ok(Json(RedisShakeProfilesResponse { profiles }))
+    // Same shape as before plus `supervisor` per profile (real-time down / auto-restart state).
+    let profiles: Vec<Value> = profiles
+        .into_iter()
+        .map(|p| {
+            let sup = crate::watcher::redis_supervisor::status_of(p.id);
+            let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            v["supervisor"] = sup;
+            v
+        })
+        .collect();
+    Ok(Json(json!({
+        "profiles": profiles,
+        "time_zone_offset_minutes": state.config.time_zone_offset_minutes,
+    })))
 }
 
 pub async fn create_redisshake_profile(
@@ -101,6 +113,7 @@ pub async fn create_redisshake_profile(
 ) -> Result<Json<RedisShakeProfile>, AppError> {
     require_redis_pair(&req.source, &req.target)?;
     normalize_db_options(&mut req.options)?;
+    redisshake::normalize_restart_options(&mut req.options)?;
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("Profile name is required".into()));
     }
@@ -155,6 +168,7 @@ pub async fn update_redisshake_profile(
 ) -> Result<Json<RedisShakeProfile>, AppError> {
     require_redis_pair(&req.source, &req.target)?;
     normalize_db_options(&mut req.options)?;
+    redisshake::normalize_restart_options(&mut req.options)?;
     let existing = state
         .redisshake_profiles
         .get(id)
@@ -251,6 +265,25 @@ pub async fn run_redisshake_profile(
     Path(id): Path<Uuid>,
     Query(q): Query<RedisShakeRunQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let actor = actor_from_headers(&headers);
+    let job = start_profile_run(&state, id, &q, &actor).await?;
+    log_action(
+        &actor,
+        "redisshake.profile.run",
+        "success",
+        &format!("profile_id={id}"),
+    );
+    Ok(Json(job))
+}
+
+/// Starts a run of a saved profile (also used by the Redis sync supervisor, actor
+/// `system:watcher`). Records the Copy & Sync timeline and the profile's `last_job_id`.
+pub async fn start_profile_run(
+    state: &AppState,
+    id: Uuid,
+    q: &RedisShakeRunQuery,
+    actor: &str,
+) -> Result<Value, AppError> {
     let mut profile = state
         .redisshake_profiles
         .get(id)
@@ -270,14 +303,14 @@ pub async fn run_redisshake_profile(
     let body = profile_run_payload(&run_profile);
     // WireGuard (ADR 0010): connections with a tunnel go to a gateway forward.
     let mut run_body = body;
-    let started = match crate::wireguard::route_payload(&state, &mut run_body).await {
+    let started = match crate::wireguard::route_payload(state, &mut run_body).await {
         Ok(_) => redisshake::start_job(&state.config, &state.http, run_body).await,
         Err(e) => Err(e),
     };
     tool_events::run_requested_as(
-        &state,
+        state,
         "redisshake",
-        &actor_from_headers(&headers),
+        actor,
         id,
         &profile.name,
         &started,
@@ -291,13 +324,7 @@ pub async fn run_redisshake_profile(
         profile.updated_at = Utc::now();
         state.redisshake_profiles.upsert(&profile).await?;
     }
-    log_action(
-        &actor_from_headers(&headers),
-        "redisshake.profile.run",
-        "success",
-        &format!("profile_id={id}"),
-    );
-    Ok(Json(job))
+    Ok(job)
 }
 
 #[derive(serde::Deserialize)]

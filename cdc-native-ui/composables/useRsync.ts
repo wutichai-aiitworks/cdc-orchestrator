@@ -22,6 +22,8 @@ export type RsyncEndpoint = {
   rsync_path: string
   /** WireGuard tunnel to the host's site (ADR 0010); forces the relay transport. */
   tunnel_id?: string | null
+  /** SSH tunnel (ADR 0020); forces the relay transport. */
+  ssh_tunnel_id?: string | null
   /** Target only: address the source uses to reach it in direct mode. */
   reach_host: string
   reach_port: string

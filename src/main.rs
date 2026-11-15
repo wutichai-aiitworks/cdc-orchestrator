@@ -38,6 +38,7 @@ mod reconcile;
 mod record_diff;
 mod redisshake;
 mod redisshake_handlers;
+mod replication_slot;
 mod rsync;
 mod rsync_handlers;
 mod saved_secret;
@@ -45,6 +46,7 @@ mod schedule;
 mod secretbox;
 mod source_readiness;
 mod split;
+mod ssh_tunnel;
 mod start_position;
 mod store;
 mod tool_events;
@@ -122,6 +124,8 @@ pub struct AppState {
     pub tool_events_mem: tool_events::MemoryLog,
     /// WireGuard tunnels for the Copy & Sync tools (ADR 0010).
     pub wireguard_tunnels: wireguard::TunnelStore,
+    /// SSH tunnels: "Connection method = SSH tunnel" (ADR 0020).
+    pub ssh_tunnels: ssh_tunnel::SshTunnelStore,
     /// Pipelines with a lifecycle action (start / resync / …) in flight on this instance.
     /// A second overlapping action is refused with 409 instead of racing the first one.
     pub profile_action_locks: handlers::ProfileActionLocks,
@@ -254,6 +258,7 @@ async fn main() {
         initial_loads: Arc::new(RwLock::new(HashMap::new())),
         record_diffs: record_diffs.clone(),
         tool_events_mem: tool_events::MemoryLog::default(),
+        ssh_tunnels: ssh_tunnel::SshTunnelStore::new(rqlite_for_wireguard.clone()),
         wireguard_tunnels: wireguard::TunnelStore::new(rqlite_for_wireguard),
         profile_action_locks: handlers::ProfileActionLocks::default(),
         notifier,
@@ -390,6 +395,7 @@ async fn main() {
             post(handlers::profile_reposition),
         )
         .route("/profiles/:id/position", get(handlers::profile_position))
+        .route("/profiles/:id/slot", get(handlers::profile_slot))
         .route(
             "/profiles/:id/initial-load",
             post(handlers::start_initial_load)
@@ -622,6 +628,7 @@ async fn main() {
             post(handlers::profile_reposition),
         )
         .route("/profiles/:id/position", get(handlers::profile_position))
+        .route("/profiles/:id/slot", get(handlers::profile_slot))
         .route(
             "/profiles/:id/initial-load",
             post(handlers::start_initial_load)
@@ -737,6 +744,21 @@ async fn main() {
         .route(
             "/wireguard/tunnels/:id/probe",
             post(wireguard::probe_tunnel),
+        )
+        .route("/ssh-tunnels/capability", get(ssh_tunnel::capability))
+        .route("/ssh-tunnels/test", post(ssh_tunnel::test_tunnel))
+        .route(
+            "/ssh-tunnels",
+            get(ssh_tunnel::list_tunnels).post(ssh_tunnel::create_tunnel),
+        )
+        .route(
+            "/ssh-tunnels/:id",
+            put(ssh_tunnel::update_tunnel).delete(ssh_tunnel::delete_tunnel),
+        )
+        .route("/ssh-tunnels/:id/probe", post(ssh_tunnel::probe_tunnel))
+        .route(
+            "/ssh-tunnels/:id/reconnect",
+            post(ssh_tunnel::reconnect_tunnel),
         )
         .route("/pipeline-logs", get(ops::list_pipeline_logs))
         .route("/ws/alerts", get(ops::ws_alerts))
@@ -1165,8 +1187,10 @@ async fn main() {
     let _pruner = watcher::spawn_changelog_pruner(Arc::new(state.clone()));
     let _refresher = watcher::spawn_refresh_scheduler(Arc::new(state.clone()));
     let _poll_audit = watcher::spawn_poll_audit(Arc::new(state.clone()));
+    let _redis_supervisor = watcher::spawn_redis_supervisor(Arc::new(state.clone()));
     let _tool_runs = tool_events::spawn_run_watcher(Arc::new(state.clone()));
     let _wireguard = wireguard::spawn_reconcile(Arc::new(state.clone()));
+    let _ssh_tunnels = ssh_tunnel::spawn_reconcile(Arc::new(state.clone()));
     let _vectorsync = vectorsync::spawn_reconcile(Arc::new(state.clone()));
     let _db_versions = db_versions::spawn_refresher(Arc::new(state.clone()));
 

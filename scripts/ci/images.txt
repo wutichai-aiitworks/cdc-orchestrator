@@ -11,6 +11,7 @@ CDC_NATIVE_UI_IMAGE|cdc-webui|cdc-native-ui/Dockerfile|cdc-native-ui|--build-arg
 MCP_CDC_IMAGE|cdc-mcp|mcp/Dockerfile|mcp|
 CDC_JDBC_ADMIN_IMAGE|cdc-jdbc-admin|docker/jdbc-admin/Dockerfile|docker/jdbc-admin|
 CDC_WIREGUARD_IMAGE|cdc-wireguard|docker/wireguard/Dockerfile|docker/wireguard|
+CDC_SSHTUNNEL_IMAGE|cdc-sshtunnel|docker/sshtunnel/Dockerfile|docker/sshtunnel|
 CDC_PGCOPY_IMAGE|cdc-pgcopydb|docker/pgcopydb/Dockerfile|docker/pgcopydb|--build-context common=docker/sidecar_common --build-arg PG_MAJOR=18
 CDC_PGDUMP_IMAGE|cdc-pgdump|docker/pgdump/Dockerfile|docker/pgdump|--build-arg PG_MAJOR=18
 CDC_PGLOADER_IMAGE|cdc-pgloader|docker/pgloader/Dockerfile|docker/pgloader|--build-context common=docker/sidecar_common

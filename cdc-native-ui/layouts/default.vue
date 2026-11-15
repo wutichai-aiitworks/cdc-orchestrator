@@ -1,34 +1,38 @@
 <script setup lang="ts">
 import {
+  Activity,
+  ArrowRightLeft,
   Bell,
+  Bot,
   Cable,
   ChevronLeft,
   ChevronRight,
   Columns2,
-  ArrowRightLeft,
   Copy,
   Database,
   DatabaseZap,
   FileJson,
   FileText,
+  FolderSync,
   Gauge,
   GitBranch,
-  Sparkles,
   HardDrive,
-  FolderSync,
   HardDriveDownload,
-  Import,
   History,
   Home,
+  Import,
+  KeyRound,
   LayoutDashboard,
-  Network,
   List,
+  Network,
   PanelLeft,
   ScrollText,
   Server,
   Shield,
+  Sparkles,
   Users,
   Workflow,
+  Wrench,
   X,
 } from "@lucide/vue"
 import type { Component } from "vue"
@@ -81,7 +85,15 @@ const navGroups: NavGroup[] = [
       { label: "Mongo copy", to: "/mongocopy", icon: Database },
       { label: "Redis sync", to: "/redisshake", icon: ArrowRightLeft },
       { label: "File sync", to: "/rsync", icon: FolderSync },
-      { label: "WireGuard tunnels", to: "/tunnels", icon: Network },
+    ],
+  },
+  {
+    // Ways to reach sources/targets whose database port is closed (ADR 0010, ADR 0020).
+    label: "Tunnels",
+    collapsible: true,
+    items: [
+      { label: "WireGuard", to: "/tunnels", icon: Network },
+      { label: "SSH", to: "/ssh-tunnels", icon: KeyRound },
     ],
   },
   {
@@ -107,6 +119,16 @@ const navGroups: NavGroup[] = [
       { label: "Logs", to: "/logs", icon: ScrollText },
       { label: "Sync audit", to: "/audit", icon: History },
       { label: "Alerts", to: "/alerts", icon: Bell },
+    ],
+  },
+  {
+    // Chat clients (Claude, ChatGPT, Cursor) through mcp-cdc: status, tool catalog, audit.
+    label: "MCP",
+    collapsible: true,
+    items: [
+      { label: "Overview", to: "/mcp", icon: Bot },
+      { label: "Tools", to: "/mcp/tools", icon: Wrench },
+      { label: "Activity", to: "/mcp/activity", icon: Activity },
     ],
   },
 
@@ -147,29 +169,43 @@ const toggleNav = (item: NavItem) => {
   navOpen.value = { ...navOpen.value, [item.label]: !isNavOpen(item) }
   localStorage.setItem(NAV_OPEN_KEY, JSON.stringify(navOpen.value))
 }
-// Menu groups (Copy & Sync, Kafka Cluster, Operations) fold under their header; closed by default,
-// remembered per browser. Opening a page inside a group opens that group so the page stays visible.
-const NAV_GROUPS_KEY = "cdc-nav-groups"
+// Menu groups (Copy & Sync, Tunnels, Kafka Cluster, Operations, MCP) fold under their header and are
+// closed by default. Only a header click is remembered per browser. The group holding the current
+// page is shown open for that visit but not saved, so the menu does not slowly end up all open.
+// "-v2": earlier builds saved every auto-opened group; the new key starts everyone collapsed once.
+const NAV_GROUPS_KEY = "cdc-nav-groups-v2"
 const groupOpen = ref<Record<string, boolean>>({})
-const isGroupOpen = (g: NavGroup) => !g.collapsible || groupOpen.value[g.label] === true
+const groupAutoOpen = ref<Record<string, boolean>>({})
+const isGroupOpen = (g: NavGroup) =>
+  !g.collapsible || (groupOpen.value[g.label] ?? groupAutoOpen.value[g.label]) === true
 const setGroupOpen = (label: string, open: boolean) => {
   groupOpen.value = { ...groupOpen.value, [label]: open }
   localStorage.setItem(NAV_GROUPS_KEY, JSON.stringify(groupOpen.value))
 }
 const toggleGroup = (g: NavGroup) => setGroupOpen(g.label, !isGroupOpen(g))
+
 const leafCount = (g: NavGroup) => g.items.reduce((n, i) => n + (i.children ? i.children.length : 1), 0)
 const groupHasActive = (g: NavGroup) => g.items.some((i) => (i.children ?? [i]).some((l) => l.to && isActive(l.to)))
 const openActiveGroup = () => {
-  for (const g of navGroups) if (g.collapsible && groupHasActive(g) && !isGroupOpen(g)) setGroupOpen(g.label, true)
+  const auto: Record<string, boolean> = {}
+  for (const g of navGroups) if (g.collapsible && groupHasActive(g)) auto[g.label] = true
+  groupAutoOpen.value = auto
 }
 
 /** The collapsed icon rail has no room for a parent row: its children become plain icons. */
 const railItems = (items: NavItem[]) => (sidebarOpen.value ? items : items.flatMap((item) => item.children ?? [item]))
 
-const isActive = (to: string) => {
-  if (to === "/") return route.path === "/"
-  return route.path.startsWith(to)
-}
+// The most specific nav link wins (`/mcp/tools` lights Tools, not also Overview at `/mcp`); a link
+// also covers its sub-pages (`/topics/x` → Topics), matched on a path boundary.
+const covers = (to: string, path: string) => path === to || path.startsWith(`${to}/`)
+const activeTo = computed(() => {
+  if (route.path === "/") return "/"
+  return nav
+    .map((item) => item.to)
+    .filter((to) => to !== "/" && covers(to, route.path))
+    .sort((a, b) => b.length - a.length)[0]
+})
+const isActive = (to: string) => to === activeTo.value
 
 const { reselect } = useNavReselect()
 // Same-route clicks don't navigate; tell the page so it can return to its landing view.

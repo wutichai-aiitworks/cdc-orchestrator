@@ -211,6 +211,12 @@ export const CONDITIONS: ConditionMeta[] = [
   { value: "pipeline_failed", label: "Pipeline operation failed", subject: "pipeline", hint: "Start, resync, initial load or another pipeline action failed." },
   { value: "dlq_growth", label: "Dead-letter queue growing", subject: "topic", hint: "New records arrived in a pipeline's DLQ topic." },
   {
+    value: "redis_sync_down",
+    label: "Redis sync stopped",
+    subject: "pipeline",
+    hint: "A real-time Redis sync stopped (failed or lost). Also tells you when auto-restart starts it again, gives up, or it recovers. Filter by Redis sync profile name.",
+  },
+  {
     value: "latency_above",
     label: "Pipeline latency above …",
     subject: "pipeline",

@@ -164,6 +164,8 @@ services:
       ORCHESTRATOR_URL: http://cdc-orchestrator:9788
       PUBLIC_ORCHESTRATOR_URL: http://127.0.0.1:${CDC_ORCHESTRATOR_PORT:-9788}
       ORCHESTRATOR_TOKEN: ${ORCH_API_TOKEN:-}
+      # mcp-cdc status/tools for the MCP pages (GET /info, guarded by the orchestrator token).
+      MCP_URL: ${MCP_INTERNAL_URL:-http://mcp-cdc:8410}
       # Same names as dataservice-admin. Defaults talk to that SuperTokens app.
       # SSO_CALLBACK_URL must be listed on the app redirect URIs.
       AUTH_MODE: ${AUTH_MODE:-sso}
@@ -408,6 +410,13 @@ services:
       # WireGuard gateway (ADR 0010); unset ORCH_WIREGUARD_URL to turn tunnels off.
       ORCH_WIREGUARD_URL: ${ORCH_WIREGUARD_URL:-http://cdc-wireguard:8091}
       ORCH_WIREGUARD_TOKEN: ${ORCH_WIREGUARD_TOKEN:-}
+      # SSH tunnel gateway (ADR 0020); unset ORCH_SSHTUNNEL_URL to turn the SSH connection method off.
+      ORCH_SSHTUNNEL_URL: ${ORCH_SSHTUNNEL_URL:-http://cdc-sshtunnel:8092}
+      ORCH_SSHTUNNEL_TOKEN: ${ORCH_SSHTUNNEL_TOKEN:-}
+      ORCH_SSHTUNNEL_PORT_MIN: ${SSHT_FORWARD_PORT_MIN:-22000}
+      ORCH_SSHTUNNEL_PORT_MAX: ${SSHT_FORWARD_PORT_MAX:-22999}
+      # Local time for clock windows (Redis sync auto-restart window), e.g. +07:00. Default UTC.
+      ORCH_TIME_ZONE_OFFSET: ${ORCH_TIME_ZONE_OFFSET:-}
       ORCH_REQUIRE_AUTH: ${ORCH_REQUIRE_AUTH:-}
       # Fail startup if rqlite is down (avoid empty in-memory UI after redeploy --no-deps).
       ORCH_REQUIRE_PERSISTENCE: ${ORCH_REQUIRE_PERSISTENCE:-true}

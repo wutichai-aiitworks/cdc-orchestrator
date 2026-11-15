@@ -102,9 +102,9 @@ const facts = computed(() => {
         </div>
         <div class="truncate font-mono text-xs text-muted-foreground">{{ daemon ? `${e.module || "?"}/${e.path || ""}` : e.path || "no path yet" }}</div>
       </div>
-      <span v-if="e.host && daemon" class="hidden shrink-0 items-center gap-1 text-xs sm:inline-flex" :class="e.tunnel_id ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'">
-        <component :is="e.tunnel_id ? Lock : AlertTriangle" class="h-3.5 w-3.5" :stroke-width="2" />
-        {{ e.tunnel_id ? "Encrypted by the tunnel" : "Not encrypted" }}
+      <span v-if="e.host && daemon" class="hidden shrink-0 items-center gap-1 text-xs sm:inline-flex" :class="e.tunnel_id || e.ssh_tunnel_id ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'">
+        <component :is="e.tunnel_id || e.ssh_tunnel_id ? Lock : AlertTriangle" class="h-3.5 w-3.5" :stroke-width="2" />
+        {{ e.tunnel_id || e.ssh_tunnel_id ? "Encrypted by the tunnel" : "Not encrypted" }}
       </span>
       <span
         v-else-if="e.host"
@@ -147,8 +147,8 @@ const facts = computed(() => {
         <TransferSegmented v-model="protocolModel" :options="protocolOptions" label="Protocol" />
       </div>
       <div class="sm:col-span-6">
-        <TransferTunnelSelect v-model="e.tunnel_id" />
-        <p v-if="e.tunnel_id" class="mt-1 text-xs text-muted-foreground">Through a tunnel, files always go via the relay (this server), never host to host.</p>
+        <TransferTunnelSelect v-model="e.tunnel_id" v-model:ssh="e.ssh_tunnel_id" />
+        <p v-if="e.tunnel_id || e.ssh_tunnel_id" class="mt-1 text-xs text-muted-foreground">Files go via the relay.</p>
         <p v-else-if="daemon" class="mt-1 text-xs text-amber-600 dark:text-amber-400">
           The rsync daemon protocol is not encrypted (files and listings travel in plain text). Choose a WireGuard tunnel, or use it only on a trusted network.
         </p>

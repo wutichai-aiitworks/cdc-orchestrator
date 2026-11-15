@@ -1287,42 +1287,126 @@ pub async fn get_profile(
     }))
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteProfileQuery {
+    /// Keep the pipeline's PostgreSQL replication slot (it keeps WAL until someone drops it).
+    #[serde(default)]
+    pub keep_slot: bool,
+}
+
+/// Deletes a pipeline completely (B-02): every Kafka Connect connector, then — for log-based
+/// PostgreSQL capture — its replication slot, unless `keep_slot=true`. If the slot cannot be
+/// dropped the pipeline is NOT deleted (409 with the reason and the SQL), so a slot is never
+/// orphaned silently. Responds with what was removed.
 pub async fn delete_profile(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<DeleteProfileQuery>,
     headers: HeaderMap,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _guard = ProfileActionGuard::acquire(&state.profile_action_locks, id, "delete")?;
     let mut profile = state
         .profiles
         .get(id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    let actor = actor_from_headers(&headers);
 
-    if profile.connector_name.is_some() || profile.sink_connector_name.is_some() {
-        let _ = reconcile::apply_profile_action(&state, &mut profile, "stop").await;
-    }
+    // 1. Connectors: always deleted (a paused connector keeps its slot busy and is an orphan).
+    let connectors = reconcile::reconcile_teardown(&state, &profile).await?;
+
+    // 2. Replication slot.
+    // Debezium creates the slot on the first start: a pipeline that never ran has none, so a
+    // draft with a wrong or unreachable host can still be deleted.
+    let never_started = profile.connector_name.is_none()
+        && matches!(
+            profile.status,
+            ProfileStatus::Draft | ProfileStatus::Validated
+        );
+    let slot = if !crate::replication_slot::applies(&profile) {
+        json!({ "result": "not_applicable" })
+    } else if never_started {
+        json!({ "slot_name": reconcile::postgres_slot_name(&profile), "result": "never_started" })
+    } else if q.keep_slot {
+        let slot_name = reconcile::postgres_slot_name(&profile);
+        json!({
+            "slot_name": slot_name,
+            "result": "kept",
+            "warning": format!(
+                "The replication slot keeps WAL on the source until it is dropped: SELECT pg_drop_replication_slot('{slot_name}');"
+            ),
+        })
+    } else {
+        match crate::replication_slot::drop_slot(&profile, Duration::from_secs(20)).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Connectors are gone; keep the pipeline (stopped) so the slot is not orphaned.
+                profile.status = ProfileStatus::Stopped;
+                profile.last_error = Some(e.to_string_message());
+                profile.updated_at = Utc::now();
+                let _ = state.profiles.upsert(&profile).await;
+                let event = new_event(
+                    &actor,
+                    "profile.delete",
+                    "failure",
+                    &detail_json(
+                        json!({ "profile_name": profile.name, "connectors_deleted": connectors, "error": e.to_string_message() }),
+                    ),
+                    Some(id),
+                    Some(profile.name.as_str()),
+                );
+                emit(&state, event).await;
+                return Err(e);
+            }
+        }
+    };
 
     let name = profile.name.clone();
     state.profiles.delete(id).await?;
     state.db_versions.delete(id).await;
-    let actor = actor_from_headers(&headers);
+    let report = json!({
+        "status": true,
+        "id": id,
+        "connectors_deleted": connectors,
+        "slot": slot,
+    });
     let event = new_event(
         &actor,
         "profile.delete",
         "success",
-        &detail_json(json!({ "profile_name": name, "profile_id": id.to_string() })),
+        &detail_json(
+            json!({ "profile_name": name, "profile_id": id.to_string(), "connectors_deleted": report["connectors_deleted"], "slot": report["slot"] }),
+        ),
         Some(id),
         Some(name.as_str()),
     );
     emit(&state, event).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(report))
+}
+
+/// `GET /cdc/profiles/{id}/slot`: the replication slot that deleting this pipeline would drop
+/// (exists, active, WAL it holds). Read-only.
+pub async fn profile_slot(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let profile = state
+        .profiles
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("profile not found: {id}")))?;
+    Ok(Json(crate::replication_slot::describe(&profile).await))
 }
 
 pub async fn create_profile(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<ProfileUpsertRequest>,
+    Json(mut payload): Json<ProfileUpsertRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
+    route_source_ssh(&state, &mut payload.source).await?;
+    if let Some(t) = payload.target.as_mut() {
+        route_target_ssh(&state, t).await?;
+    }
     validate_profile_payload(&payload, false)?;
     reject_dual_source_capture(&state, None, &payload).await?;
     let mut profile = build_profile(None, payload)?;
@@ -1443,8 +1527,12 @@ pub async fn update_profile(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(payload): Json<ProfileUpsertRequest>,
+    Json(mut payload): Json<ProfileUpsertRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
+    route_source_ssh(&state, &mut payload.source).await?;
+    if let Some(t) = payload.target.as_mut() {
+        route_target_ssh(&state, t).await?;
+    }
     validate_profile_payload(&payload, false)?;
     reject_dual_source_capture(&state, Some(id), &payload).await?;
     let mut profile = state
@@ -2323,6 +2411,7 @@ pub async fn validate_source(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::SourceCatalogRequest>,
 ) -> Result<Json<crate::models::ConnectionCheckResponse>, AppError> {
+    route_source_ssh(&state, &mut req.source).await?;
     // Restore stored credentials when the caller omits the password (saved profile).
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -2403,6 +2492,7 @@ pub async fn source_readiness(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::SourceCatalogRequest>,
 ) -> Result<Json<crate::source_readiness::Report>, AppError> {
+    route_source_ssh(&state, &mut req.source).await?;
     let mut slot = None;
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -2512,6 +2602,7 @@ pub async fn browse_source_catalog(
     State(state): State<AppState>,
     Json(mut payload): Json<SourceCatalogRequest>,
 ) -> Result<Json<SourceCatalogResponse>, AppError> {
+    route_source_ssh(&state, &mut payload.source).await?;
     if let Some(pid) = payload.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
             preserve_secret_fields(&mut payload.source.connection, &profile.source.connection);
@@ -2559,6 +2650,7 @@ pub async fn browse_target_catalog(
     State(state): State<AppState>,
     Json(mut payload): Json<TargetCatalogRequest>,
 ) -> Result<Json<SourceCatalogResponse>, AppError> {
+    route_target_ssh(&state, &mut payload.target).await?;
     if let Some(pid) = payload.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
             if let Some(stored_target) = &profile.target {
@@ -2597,6 +2689,7 @@ pub async fn inspect_source_table(
     State(state): State<AppState>,
     Json(mut payload): Json<SourceTableInspectRequest>,
 ) -> Result<Json<crate::models::SourceTableInspectResponse>, AppError> {
+    route_source_ssh(&state, &mut payload.source).await?;
     // When a saved profile_id is supplied, merge stored credentials so the caller
     // does not need to re-supply a password (e.g. when editing a saved pipeline).
     if let Some(pid) = payload.profile_id {
@@ -2657,19 +2750,61 @@ fn prepare_trigger_request(
 
 /// Merge stored source credentials into a trigger request when `profile_id` is supplied,
 /// so callers editing a saved profile do not have to re-enter the password.
-async fn restore_trigger_secrets(state: &AppState, payload: &mut TriggerInstallRequest) {
+async fn restore_trigger_secrets(
+    state: &AppState,
+    payload: &mut TriggerInstallRequest,
+) -> Result<(), AppError> {
     if let Some(pid) = payload.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
             preserve_secret_fields(&mut payload.source.connection, &profile.source.connection);
         }
     }
+    route_source_ssh(state, &mut payload.source).await
+}
+
+/// Connection method (ADR 0020): with `ssh_tunnel_id`, host/port become the stable
+/// `cdc-sshtunnel` forward; without it, a formerly tunnelled connection gets its address back.
+async fn route_source_ssh(
+    state: &AppState,
+    source: &mut crate::models::SourceConfig,
+) -> Result<(), AppError> {
+    restore_saved_compare_password(state, "source", &source.source_type, &mut source.connection)
+        .await?;
+    crate::ssh_tunnel::materialize_conn(state, &source.source_type, &mut source.connection)
+        .await
+        .map(|_| ())
+}
+
+async fn route_target_ssh(state: &AppState, target: &mut TargetConfig) -> Result<(), AppError> {
+    restore_saved_compare_password(state, "target", &target.target_type, &mut target.connection)
+        .await?;
+    crate::ssh_tunnel::materialize_conn(state, &target.target_type, &mut target.connection)
+        .await
+        .map(|_| ())
+}
+
+/// The Schema Compare page loads saved profiles with `********` passwords and uses the same
+/// connection for catalog / validate / inspect calls: restore it from a saved compare profile of
+/// the same login. Runs before the stored-pipeline merge (`preserve_secret_fields`), which only
+/// fills an empty or `***` password.
+async fn restore_saved_compare_password(
+    state: &AppState,
+    role: &str,
+    db_type: &str,
+    conn: &mut HashMap<String, String>,
+) -> Result<(), AppError> {
+    if conn.get("password").map(String::as_str) != Some(crate::saved_secret::REDACTED) {
+        return Ok(());
+    }
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_map_from_saved(role, db_type, conn, &saved)
 }
 
 pub async fn preview_source_triggers(
     State(state): State<AppState>,
     Json(mut payload): Json<TriggerInstallRequest>,
 ) -> Result<Json<TriggerPreviewResponse>, AppError> {
-    restore_trigger_secrets(&state, &mut payload).await;
+    restore_trigger_secrets(&state, &mut payload).await?;
     let tables = prepare_trigger_request(&payload)?;
     let result = crate::trigger_cdc::preview_source_triggers(
         &payload.source.source_type,
@@ -2692,7 +2827,7 @@ pub async fn install_source_triggers(
     State(state): State<AppState>,
     Json(mut payload): Json<TriggerInstallRequest>,
 ) -> Result<Json<TriggerInstallResponse>, AppError> {
-    restore_trigger_secrets(&state, &mut payload).await;
+    restore_trigger_secrets(&state, &mut payload).await?;
     let tables = prepare_trigger_request(&payload)?;
     let result = crate::trigger_cdc::install_source_triggers(
         &payload.source.source_type,
@@ -2715,7 +2850,7 @@ pub async fn source_trigger_status(
     State(state): State<AppState>,
     Json(mut payload): Json<TriggerInstallRequest>,
 ) -> Result<Json<TriggerStatusResponse>, AppError> {
-    restore_trigger_secrets(&state, &mut payload).await;
+    restore_trigger_secrets(&state, &mut payload).await?;
     let source_type = payload.source.source_type.trim().to_ascii_lowercase();
     crate::trigger_cdc::Vendor::parse(&source_type)?;
     if source_type != "sqlite" {
@@ -2746,6 +2881,7 @@ pub async fn inspect_target_table(
     State(state): State<AppState>,
     Json(mut payload): Json<TargetTableInspectRequest>,
 ) -> Result<Json<crate::models::SourceTableInspectResponse>, AppError> {
+    route_target_ssh(&state, &mut payload.target).await?;
     // Merge stored target credentials from a saved profile when profile_id is provided.
     if let Some(pid) = payload.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -2776,6 +2912,7 @@ pub async fn create_target_tables(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::TargetDdlRequest>,
 ) -> Result<Json<crate::models::TargetDdlResponse>, AppError> {
+    route_target_ssh(&state, &mut req.target).await?;
     let mut profile_name: Option<String> = None;
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -2993,6 +3130,7 @@ pub async fn validate_target(
     State(state): State<AppState>,
     Json(mut req): Json<crate::models::TargetCatalogRequest>,
 ) -> Result<Json<crate::models::ConnectionCheckResponse>, AppError> {
+    route_target_ssh(&state, &mut req.target).await?;
     // Restore stored credentials when the caller omits the password (saved profile).
     if let Some(pid) = req.profile_id {
         if let Ok(Some(profile)) = state.profiles.get(pid).await {
@@ -4054,7 +4192,10 @@ mod tests {
 pub async fn list_compare_profiles(
     State(state): State<AppState>,
 ) -> Result<Json<SchemaCompareProfilesResponse>, AppError> {
-    let profiles = state.compare_profiles.list().await?;
+    let mut profiles = state.compare_profiles.list().await?;
+    profiles
+        .iter_mut()
+        .for_each(SchemaCompareProfile::redact_secrets);
     Ok(Json(SchemaCompareProfilesResponse { profiles }))
 }
 
@@ -4074,7 +4215,13 @@ pub async fn create_compare_profile(
     if profile.name.is_empty() {
         return Err(AppError::BadRequest("Profile name is required".into()));
     }
+    let mut profile = profile;
+    // "Save as new" from a loaded profile sends `********`: take the password of the same login.
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("source", &mut profile.source, &saved)?;
+    crate::saved_secret::restore_from_saved("target", &mut profile.target, &saved)?;
     state.compare_profiles.upsert(&profile).await?;
+    profile.redact_secrets();
     Ok(Json(profile))
 }
 
@@ -4087,6 +4234,8 @@ pub async fn get_compare_profile(
         .get(id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("compare profile {id} not found")))?;
+    let mut profile = profile;
+    profile.redact_secrets();
     Ok(Json(profile))
 }
 
@@ -4105,7 +4254,11 @@ pub async fn update_compare_profile(
         return Err(AppError::BadRequest("Profile name is required".into()));
     }
 
-    let profile = SchemaCompareProfile {
+    let mut req = req;
+    // `********` keeps the stored password only for the same login (ADR 0005 §11).
+    crate::saved_secret::keep_password("source", &mut req.source, Some(&existing.source))?;
+    crate::saved_secret::keep_password("target", &mut req.target, Some(&existing.target))?;
+    let mut profile = SchemaCompareProfile {
         id,
         name: req.name.trim().to_string(),
         source: req.source,
@@ -4114,6 +4267,7 @@ pub async fn update_compare_profile(
         updated_at: Utc::now(),
     };
     state.compare_profiles.upsert(&profile).await?;
+    profile.redact_secrets();
     Ok(Json(profile))
 }
 
@@ -4128,9 +4282,11 @@ pub async fn delete_compare_profile(
 /// Execute a DDL statement (CREATE SCHEMA, CREATE TABLE, ALTER TABLE …)
 /// against the target database specified in the request body.
 pub async fn exec_compare_ddl(
-    State(_state): State<AppState>,
-    Json(req): Json<ExecDdlRequest>,
+    State(state): State<AppState>,
+    Json(mut req): Json<ExecDdlRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("target", &mut req.target, &saved)?;
     let stmt = req.statement.trim();
     if stmt.is_empty() {
         return Err(AppError::BadRequest("statement is required".into()));
@@ -4154,9 +4310,12 @@ pub async fn exec_compare_ddl(
 /// are reported individually so that a single error does not abort the whole
 /// migration run.
 pub async fn copy_compare_data(
-    State(_state): State<AppState>,
-    Json(req): Json<CopyDataRequest>,
+    State(state): State<AppState>,
+    Json(mut req): Json<CopyDataRequest>,
 ) -> Result<Json<CopyDataResponse>, AppError> {
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("source", &mut req.source, &saved)?;
+    crate::saved_secret::restore_from_saved("target", &mut req.target, &saved)?;
     if req.tables.is_empty() {
         return Err(AppError::BadRequest("tables list must not be empty".into()));
     }
@@ -4257,9 +4416,11 @@ pub async fn copy_compare_data(
 // ── Table Data Preview ────────────────────────────────────────────────────────
 
 pub async fn count_compare_schema(
-    State(_state): State<AppState>,
-    Json(req): Json<SchemaCountsRequest>,
+    State(state): State<AppState>,
+    Json(mut req): Json<SchemaCountsRequest>,
 ) -> Result<Json<SchemaCountsResponse>, AppError> {
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("connection", &mut req.connection, &saved)?;
     let mut conn = HashMap::new();
     conn.insert("host".to_string(), req.connection.host.clone());
     conn.insert("port".to_string(), req.connection.port.clone());
@@ -4278,9 +4439,11 @@ pub async fn count_compare_schema(
 }
 
 pub async fn count_compare_table(
-    State(_state): State<AppState>,
-    Json(req): Json<TableCountRequest>,
+    State(state): State<AppState>,
+    Json(mut req): Json<TableCountRequest>,
 ) -> Result<Json<TableCountResponse>, AppError> {
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("connection", &mut req.connection, &saved)?;
     let mut conn = HashMap::new();
     conn.insert("host".to_string(), req.connection.host.clone());
     conn.insert("port".to_string(), req.connection.port.clone());
@@ -4304,9 +4467,11 @@ pub async fn count_compare_table(
 }
 
 pub async fn preview_compare_table(
-    State(_state): State<AppState>,
-    Json(req): Json<TablePreviewRequest>,
+    State(state): State<AppState>,
+    Json(mut req): Json<TablePreviewRequest>,
 ) -> Result<Json<TablePreviewResponse>, AppError> {
+    let saved = state.compare_profiles.list().await?;
+    crate::saved_secret::restore_from_saved("connection", &mut req.connection, &saved)?;
     let mut conn = HashMap::new();
     conn.insert("host".to_string(), req.connection.host.clone());
     conn.insert("port".to_string(), req.connection.port.clone());

@@ -107,6 +107,23 @@ export type GovernanceConfig = {
   pii_fields?: string[]
 }
 
+export type ProfileSlot = {
+  applies: boolean
+  slot_name?: string
+  exists?: boolean | null
+  active?: boolean
+  wal_status?: string | null
+  retained_bytes?: number | null
+  retained?: string | null
+  error?: string
+}
+
+export type ProfileDeleteReport = {
+  status: boolean
+  connectors_deleted: string[]
+  slot: { result: string; slot_name?: string; freed?: string | null; warning?: string }
+}
+
 export type ProfilePayload = {
   name: string
   description?: string
@@ -367,8 +384,14 @@ export const useProfilesM3 = () => {
       method: "PUT",
       body,
     })
-  const deleteProfile = (id: string) =>
-    $fetch(`/api/cdc/profiles/${encodeURIComponent(id)}`, { method: "DELETE" })
+  /** Deletes the pipeline, its connectors and its replication slot (unless keepSlot). */
+  const deleteProfile = (id: string, keepSlot = false) =>
+    $fetch<ProfileDeleteReport>(`/api/cdc/profiles/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      query: keepSlot ? { keep_slot: "true" } : undefined,
+    })
+  /** The replication slot a delete would drop (log-based Postgres only). */
+  const fetchProfileSlot = (id: string) => $fetch<ProfileSlot>(`/api/cdc/profiles/${encodeURIComponent(id)}/slot`)
   const fetchDlqStatus = (id: string) =>
     $fetch<ProfileDlqStatus>(`/api/cdc/profiles/${encodeURIComponent(id)}/dlq`)
   // profile_id (optional): the server merges stored credentials for a saved pipeline.
@@ -558,6 +581,7 @@ export const useProfilesM3 = () => {
     createProfile,
     updateProfile,
     deleteProfile,
+    fetchProfileSlot,
     fetchDlqStatus,
     validateSource,
     validateTarget,

@@ -61,6 +61,7 @@ const {
   createProfile,
   updateProfile,
   deleteProfile,
+  fetchProfileSlot,
   fetchDlqStatus,
   validateSource,
   validateTarget,
@@ -89,6 +90,24 @@ const loading = ref(false)
 const saving = ref(false)
 const deleting = ref(false)
 const pendingDelete = ref<CdcProfile | null>(null)
+// B-02: deleting a pipeline also drops its PostgreSQL replication slot (an orphaned slot keeps WAL
+// until the source disk fills). The dialog shows the slot and offers to keep it.
+const deleteSlot = ref<import("~/composables/useProfilesM3").ProfileSlot | null>(null)
+const deleteSlotLoading = ref(false)
+const keepSlot = ref(false)
+watch(pendingDelete, async (p) => {
+  deleteSlot.value = null
+  keepSlot.value = false
+  if (!p) return
+  deleteSlotLoading.value = true
+  try {
+    deleteSlot.value = await fetchProfileSlot(p.id)
+  } catch {
+    deleteSlot.value = { applies: true, error: "Could not check the replication slot." }
+  } finally {
+    deleteSlotLoading.value = false
+  }
+})
 const validating = ref(false)
 const error = ref("")
 const sourceValidation = ref<{ valid: boolean; message: string; server?: ServerInfo } | null>(null)
@@ -101,6 +120,7 @@ const passwordStored = ref(false)
 const targetPasswordStored = ref(false)
 
 const dbTypes = DB_TYPE_OPTIONS
+const { tunnelName: sshTunnelName } = useSshTunnels()
 
 const form = reactive({
   name: "",
@@ -113,6 +133,8 @@ const form = reactive({
   database: "",
   username: "",
   password: "",
+  /** Connection method (ADR 0020): "" = Direct, else SSH tunnel id; host/port are then as seen from the SSH server. */
+  sourceSshTunnelId: "",
   schemaMode: "specific_schemas" as "all_schemas" | "specific_schemas",
   tableMode: "all_tables" as "all_tables" | "specific_tables",
   schemas: "",
@@ -137,6 +159,7 @@ const form = reactive({
   targetDatabase: "",
   targetUsername: "",
   targetPassword: "",
+  targetSshTunnelId: "",
   mappingMode: "identical" as MappingMode,
   mappings: [] as TableMapping[],
   lakeName: "",
@@ -1104,6 +1127,12 @@ const optionalPositiveInt = (value: string): number | null => {
   return Math.floor(n)
 }
 
+/** SSH connection method keys; the orchestrator turns host/port into the cdc-sshtunnel forward. */
+const sshConnectionFields = (tunnelId: string, host: string, port: string): Record<string, string> =>
+  tunnelId
+    ? { ssh_tunnel_id: tunnelId, ssh_remote_host: textValue(host), ssh_remote_port: textValue(port) }
+    : {}
+
 const buildPayload = (): ProfilePayload => {
   // The picked capture mode is authoritative. Watermark columns linger in the form
   // after switching away from Incremental (they are re-hydrated on every save), and
@@ -1128,6 +1157,7 @@ const buildPayload = (): ProfilePayload => {
       database: textValue(form.database),
       username: textValue(form.username),
       password: form.password,
+      ...sshConnectionFields(form.sourceSshTunnelId, form.host, form.port),
     },
     schema_mode: form.schemaMode,
     table_mode:
@@ -1158,6 +1188,7 @@ const buildPayload = (): ProfilePayload => {
             database: textValue(form.targetDatabase),
             username: textValue(form.targetUsername),
             password: form.targetPassword,
+            ...sshConnectionFields(form.targetSshTunnelId, form.targetHost, form.targetPort),
           },
         }
       : null,
@@ -1248,6 +1279,7 @@ const resetForm = () => {
     database: "demo",
     username: "demo",
     password: "",
+    sourceSshTunnelId: "",
     schemaMode: "specific_schemas",
     tableMode: "all_tables",
     schemas: "",
@@ -1271,6 +1303,7 @@ const resetForm = () => {
     targetDatabase: "demo",
     targetUsername: "demo",
     targetPassword: "",
+    targetSshTunnelId: "",
     mappingMode: "identical",
     mappings: [],
     lakeName: "",
@@ -1354,8 +1387,10 @@ const editSelected = () => {
     tags: [...(profile.tags ?? [])],
     pattern: profile.pattern,
     sourceType: profile.source.source_type,
-    host: profile.source.connection.host || "",
-    port: profile.source.connection.port || "",
+    // Through an SSH tunnel the stored host/port are the gateway forward; show the database address.
+    host: profile.source.connection.ssh_remote_host || profile.source.connection.host || "",
+    port: profile.source.connection.ssh_remote_port || profile.source.connection.port || "",
+    sourceSshTunnelId: profile.source.connection.ssh_tunnel_id || "",
     database: profile.source.connection.database || "",
     username: profile.source.connection.username || "",
     password: "",
@@ -1384,8 +1419,9 @@ const editSelected = () => {
     tablePoll: [...(profile.source.table_poll ?? [])],
     targetName: profile.target?.name || "",
     targetType: (profile.target?.target_type as DatabaseType) || "postgres",
-    targetHost: profile.target?.connection.host || "",
-    targetPort: profile.target?.connection.port || "5432",
+    targetHost: profile.target?.connection.ssh_remote_host || profile.target?.connection.host || "",
+    targetPort: profile.target?.connection.ssh_remote_port || profile.target?.connection.port || "5432",
+    targetSshTunnelId: profile.target?.connection.ssh_tunnel_id || "",
     targetDatabase: profile.target?.connection.database || "",
     targetUsername: profile.target?.connection.username || "",
     targetPassword: "",
@@ -2336,8 +2372,15 @@ const confirmDelete = async () => {
   deleting.value = true
   error.value = ""
   try {
-    await deleteProfile(profile.id)
-    toast.success(`Deleted ${profile.name}.`)
+    const report = await deleteProfile(profile.id, keepSlot.value)
+    const slot = report?.slot
+    if (slot?.result === "dropped") {
+      toast.success(`Deleted ${profile.name} and dropped slot ${slot.slot_name}${slot.freed ? ` (${slot.freed} WAL freed)` : ""}.`)
+    } else if (slot?.result === "kept") {
+      toast.error(`Deleted ${profile.name}. Slot ${slot.slot_name} was kept: drop it when no longer needed.`)
+    } else {
+      toast.success(`Deleted ${profile.name}.`)
+    }
     if (selectedId.value === profile.id) selectedId.value = ""
     if (detailId.value === profile.id) void router.replace({ query: withoutDetail() })
     pendingDelete.value = null
@@ -2551,9 +2594,10 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+            <ConnectionMethod v-model="form.sourceSshTunnelId" :host="form.host" :port="form.port" side="source" />
             <label>
               <span class="auth-label">Host</span>
-              <AppInput v-model="form.host" placeholder="db.internal.example" />
+              <AppInput v-model="form.host" :placeholder="form.sourceSshTunnelId ? '127.0.0.1' : 'db.internal.example'" />
             </label>
             <label>
               <span class="auth-label">Port</span>
@@ -3106,9 +3150,10 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+            <ConnectionMethod v-model="form.targetSshTunnelId" :host="form.targetHost" :port="form.targetPort" side="target" />
             <label>
               <span class="auth-label">Target Host</span>
-              <AppInput v-model="form.targetHost" placeholder="cdc-postgres-target" />
+              <AppInput v-model="form.targetHost" :placeholder="form.targetSshTunnelId ? '127.0.0.1' : 'cdc-postgres-target'" />
             </label>
             <label>
               <span class="auth-label">Target Port</span>
@@ -3588,6 +3633,7 @@ onUnmounted(() => {
               </div>
               <p class="text-sm font-medium">Source · {{ form.sourceType }}</p>
               <p class="mt-1 text-sm text-muted-foreground">{{ form.host }}:{{ form.port }}/{{ form.database }}</p>
+              <p v-if="form.sourceSshTunnelId" class="mt-1 text-xs text-primary">via SSH tunnel: {{ sshTunnelName(form.sourceSshTunnelId) }}</p>
               <p class="mt-1 text-xs text-muted-foreground">{{ captureCaption }}</p>
             </div>
             <div class="rounded-xl border border-border bg-muted/50 p-4">
@@ -3624,6 +3670,9 @@ onUnmounted(() => {
                       ? `${form.targetHost}:${form.targetPort}/${form.targetDatabase}`
                       : "Real-time change events"
                 }}
+              </p>
+              <p v-if="form.pattern === 'source_to_target' && form.targetSshTunnelId" class="mt-1 text-xs text-primary">
+                via SSH tunnel: {{ sshTunnelName(form.targetSshTunnelId) }}
               </p>
               <p class="mt-1 text-xs text-muted-foreground">{{ mappingCaption }}</p>
               <p v-if="form.pattern === 'source_to_target'" class="mt-1 text-xs text-muted-foreground">
@@ -4137,8 +4186,34 @@ onUnmounted(() => {
     >
       <p>
         Delete <span class="font-semibold text-foreground">{{ pendingDelete?.name }}</span>?
-        This removes the saved draft or configuration.
+        This removes the pipeline and its Kafka Connect connectors.
       </p>
+      <div v-if="deleteSlotLoading" class="mt-3 text-xs text-muted-foreground">Checking the replication slot…</div>
+      <div v-else-if="deleteSlot?.applies" class="mt-3 space-y-2 rounded-lg border border-border bg-muted/30 p-3 text-sm">
+        <p v-if="deleteSlot.exists">
+          Replication slot <code class="font-mono text-xs">{{ deleteSlot.slot_name }}</code> on the source
+          <template v-if="deleteSlot.retained"> (holds <b>{{ deleteSlot.retained }}</b> of WAL)</template>
+          will be <b>dropped</b>.
+        </p>
+        <p v-else-if="deleteSlot.exists === false" class="text-muted-foreground">No replication slot on the source.</p>
+        <p v-else class="flex items-center gap-1 text-amber-700 dark:text-amber-400">
+          Could not check the replication slot.
+          <AppInfoHint aria-label="Details">
+            <p>{{ deleteSlot.error }}</p>
+            <p class="mt-1">The delete stops (and keeps the pipeline) if the slot cannot be dropped. Tick “Keep the slot” to delete anyway and drop it on the source later.</p>
+          </AppInfoHint>
+        </p>
+        <label v-if="deleteSlot.exists !== false" class="flex items-start gap-2 text-sm">
+          <input v-model="keepSlot" type="checkbox" class="mt-1" />
+          <span>
+            Keep the replication slot
+            <span class="block text-xs text-muted-foreground">Only if you will reuse it. It keeps WAL on the source until someone drops it.</span>
+          </span>
+        </label>
+        <p v-if="keepSlot" class="text-xs text-amber-700 dark:text-amber-400">
+          Drop it later on the source: <code class="font-mono">SELECT pg_drop_replication_slot('{{ deleteSlot.slot_name }}');</code>
+        </p>
+      </div>
     </AppConfirmDialog>
 
     <TriggerPreviewDialog

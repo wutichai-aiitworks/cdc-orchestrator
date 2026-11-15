@@ -97,6 +97,17 @@ pub struct AppConfig {
     /// cdc-wireguard gateway (ADR 0010): ORCH_WIREGUARD_URL / ORCH_WIREGUARD_TOKEN. Unset = no tunnels.
     pub wireguard_url: Option<String>,
     pub wireguard_token: Option<String>,
+    /// cdc-sshtunnel gateway (ADR 0020): ORCH_SSHTUNNEL_URL / ORCH_SSHTUNNEL_TOKEN. Unset = no SSH tunnels.
+    pub sshtunnel_url: Option<String>,
+    pub sshtunnel_token: Option<String>,
+    /// Host the tools use to reach SSH forwards (ORCH_SSHTUNNEL_FORWARD_HOST, default cdc-sshtunnel).
+    pub sshtunnel_forward_host: String,
+    /// Forward port range; must match the gateway's SSHT_FORWARD_PORT_MIN/MAX (default 22000-22999).
+    pub sshtunnel_port_min: u16,
+    pub sshtunnel_port_max: u16,
+    /// Local time for clock windows (Redis auto-restart window): ORCH_TIME_ZONE_OFFSET, e.g.
+    /// `+07:00`. Minutes east of UTC; default 0 (UTC).
+    pub time_zone_offset_minutes: i32,
     pub command_timeout_secs: u64,
     pub api_token: Option<String>,
     pub jdbc_admin_url: Option<String>,
@@ -219,6 +230,32 @@ impl AppConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|s| !s.is_empty());
+        let sshtunnel_url = env::var("ORCH_SSHTUNNEL_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        let sshtunnel_token = env::var("ORCH_SSHTUNNEL_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let sshtunnel_forward_host = env::var("ORCH_SSHTUNNEL_FORWARD_HOST")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cdc-sshtunnel".to_string());
+        let sshtunnel_port_min = env::var("ORCH_SSHTUNNEL_PORT_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(22000);
+        let sshtunnel_port_max = env::var("ORCH_SSHTUNNEL_PORT_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|max| *max >= sshtunnel_port_min)
+            .unwrap_or(22999.max(sshtunnel_port_min));
+        let time_zone_offset_minutes = env::var("ORCH_TIME_ZONE_OFFSET")
+            .ok()
+            .and_then(|v| parse_utc_offset(&v))
+            .unwrap_or(0);
         let command_timeout_secs = env::var("ORCH_COMMAND_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -477,6 +514,12 @@ impl AppConfig {
             ksql_enabled,
             wireguard_url,
             wireguard_token,
+            sshtunnel_url,
+            sshtunnel_token,
+            sshtunnel_forward_host,
+            sshtunnel_port_min,
+            sshtunnel_port_max,
+            time_zone_offset_minutes,
             command_timeout_secs,
             api_token,
             jdbc_admin_url,
@@ -672,5 +715,42 @@ mod app_mode_tests {
         assert!(AppMode::Production.hardened_by_default());
         assert!(!AppMode::Maintenance.hardened_by_default());
         assert!(!AppMode::Enhanced.hardened_by_default());
+    }
+}
+
+/// `+07:00`, `-05:30`, `+7`, `UTC+7` → minutes east of UTC (±14 h at most).
+pub fn parse_utc_offset(raw: &str) -> Option<i32> {
+    let v = raw
+        .trim()
+        .trim_start_matches("UTC")
+        .trim_start_matches("GMT")
+        .trim();
+    if v.is_empty() {
+        return Some(0);
+    }
+    let (sign, rest) = match v.as_bytes()[0] {
+        b'+' => (1, &v[1..]),
+        b'-' => (-1, &v[1..]),
+        _ => (1, v),
+    };
+    let (h, m) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?),
+        None => (rest.parse::<i32>().ok()?, 0),
+    };
+    (0..=14).contains(&h).then_some(())?;
+    (0..60).contains(&m).then_some(())?;
+    Some(sign * (h * 60 + m))
+}
+
+#[cfg(test)]
+mod offset_tests {
+    #[test]
+    fn utc_offsets_parse() {
+        assert_eq!(super::parse_utc_offset("+07:00"), Some(420));
+        assert_eq!(super::parse_utc_offset("UTC+7"), Some(420));
+        assert_eq!(super::parse_utc_offset("-05:30"), Some(-330));
+        assert_eq!(super::parse_utc_offset(""), Some(0));
+        assert_eq!(super::parse_utc_offset("+15:00"), None);
+        assert_eq!(super::parse_utc_offset("abc"), None);
     }
 }

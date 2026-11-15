@@ -4,6 +4,7 @@ mod auto_recover;
 mod diff;
 mod dispatch;
 mod poll_audit;
+pub(crate) mod redis_supervisor;
 pub(crate) mod rules;
 
 use std::sync::Arc;
@@ -40,6 +41,11 @@ pub fn spawn_changelog_pruner(state: Arc<AppState>) -> tokio::task::JoinHandle<(
 /// those pipelines converge on the source.
 pub fn spawn_refresh_scheduler(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_refresh_loop(state))
+}
+
+/// Background job: alert on stopped real-time Redis syncs and restart them per profile policy.
+pub fn spawn_redis_supervisor(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    redis_supervisor::spawn(state)
 }
 
 pub fn spawn_poll_audit(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {

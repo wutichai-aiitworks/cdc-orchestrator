@@ -682,16 +682,36 @@ impl SourceConfig {
     /// Host/port/database identity used to detect two capture engines on one source.
     pub fn capture_identity(&self) -> String {
         let typ = self.source_type.trim().to_ascii_lowercase();
-        let host = self
+        // Through an SSH tunnel (ADR 0020) host/port are the gateway forward; the database is
+        // the tunnel + the address seen from the SSH server.
+        let tunnel = self
             .connection
-            .get("host")
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        let port = self
-            .connection
-            .get("port")
+            .get("ssh_tunnel_id")
             .map(|s| s.trim())
-            .unwrap_or_default();
+            .filter(|s| !s.is_empty());
+        let get = |k: &str| {
+            self.connection
+                .get(k)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        };
+        let (host, port) = match tunnel {
+            Some(t) => (
+                format!(
+                    "{}@{t}",
+                    get("ssh_remote_host")
+                        .or_else(|| get("host"))
+                        .unwrap_or_default()
+                ),
+                get("ssh_remote_port")
+                    .or_else(|| get("port"))
+                    .unwrap_or_default(),
+            ),
+            None => (
+                get("host").unwrap_or_default(),
+                get("port").unwrap_or_default(),
+            ),
+        };
         let database = self
             .connection
             .get("database")
@@ -1823,6 +1843,10 @@ pub struct SchemaCompareConn {
     /// Reach this server through a WireGuard tunnel (ADR 0010); host/port are as seen from the site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_id: Option<Uuid>,
+    /// Reach this server through an SSH tunnel (ADR 0020); host/port are as seen from the SSH
+    /// server. Takes precedence over `tunnel_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_tunnel_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2202,6 +2226,15 @@ pub struct RedisShakeSyncOptions {
     /// FLUSHDB on the databases the sync writes, FLUSHALL when it syncs every database.
     #[serde(default)]
     pub empty_target: bool,
+    /// Real-time syncs only: restart a failed run automatically. Every restart is a new full
+    /// snapshot (BGSAVE) on the source, so the default is `off`; `window` restarts only inside
+    /// `restart_window`, `always` at any time. A stopped sync is alerted either way
+    /// (`redis_sync_down` rules). See docs/production-rollout-guideline.md §2.2.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_restart: String,
+    /// `HH:MM-HH:MM` in ORCH_TIME_ZONE_OFFSET time (may wrap past midnight). Default 00:00-05:00.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub restart_window: String,
 }
 
 fn default_true() -> bool {
@@ -2240,11 +2273,6 @@ pub struct RedisShakeProfileRequest {
     pub target: SchemaCompareConn,
     #[serde(default)]
     pub options: RedisShakeSyncOptions,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RedisShakeProfilesResponse {
-    pub profiles: Vec<RedisShakeProfile>,
 }
 
 // ── pgloader (MySQL / SQL Server / SQLite / CSV → Postgres) ──────────────────
@@ -2598,6 +2626,9 @@ pub struct RsyncEndpoint {
     /// Reach this host through a WireGuard tunnel (ADR 0010); forces the relay transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_id: Option<Uuid>,
+    /// Reach this host through an SSH tunnel (ADR 0020); forces the relay transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_tunnel_id: Option<Uuid>,
     /// Optional rsync binary on this host (e.g. `/opt/homebrew/bin/rsync`); auto-detected if empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rsync_path: String,

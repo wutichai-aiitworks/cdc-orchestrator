@@ -21,6 +21,7 @@ pub const KIND_MONGOCOPY: &str = "mongocopy_profile";
 pub const KIND_PGDUMP: &str = "pgdump_profile";
 pub const KIND_RSYNC: &str = "rsync_profile";
 pub const KIND_WIREGUARD: &str = "wireguard_tunnel";
+pub const KIND_SSH_TUNNEL: &str = "ssh_tunnel";
 pub const KIND_VECTORSYNC: &str = "vectorsync_profile";
 
 const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cdc_config (
@@ -307,9 +308,11 @@ impl RqliteClient {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_audit_events(
         &self,
         limit: usize,
+        actor_prefix: Option<&str>,
         action: Option<&str>,
         profile_id: Option<&str>,
         outcome: Option<&str>,
@@ -321,6 +324,7 @@ impl RqliteClient {
              FROM cdc_audit_events",
             limit,
             |sql, params| {
+                push_prefix_filter(sql, params, "actor", actor_prefix);
                 push_eq_filter(sql, params, "action", action);
                 push_eq_filter(sql, params, "profile_id", profile_id);
                 push_eq_filter(sql, params, "outcome", outcome);
@@ -758,6 +762,21 @@ fn push_eq_filter(sql: &mut String, params: &mut Vec<Value>, column: &str, value
     }
 }
 
+/// `column` starts with `value` (e.g. actor `mcp:` = every MCP client). substr() instead of LIKE so
+/// `%` / `_` in the value are not wildcards.
+fn push_prefix_filter(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    column: &str,
+    value: Option<&str>,
+) {
+    if let Some(v) = value {
+        sql.push_str(&format!(" AND substr({column}, 1, length(?))=?"));
+        params.push(json!(v));
+        params.push(json!(v));
+    }
+}
+
 fn push_ge_filter(sql: &mut String, params: &mut Vec<Value>, column: &str, value: Option<&str>) {
     if let Some(v) = value {
         sql.push_str(&format!(" AND {column}>=?"));
@@ -929,6 +948,24 @@ fn decode_audit_row(row: &[Value]) -> Result<AuditEventRow, PersistError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn prefix_filter_is_parameterized_and_wildcard_safe() {
+        let mut sql = String::from("SELECT * FROM t WHERE 1=1");
+        let mut params = Vec::new();
+        super::push_prefix_filter(&mut sql, &mut params, "actor", Some("mcp:%_"));
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE 1=1 AND substr(actor, 1, length(?))=?"
+        );
+        assert_eq!(
+            params,
+            vec![serde_json::json!("mcp:%_"), serde_json::json!("mcp:%_")]
+        );
+        super::push_prefix_filter(&mut sql, &mut params, "actor", None);
+        assert_eq!(params.len(), 2, "None adds nothing");
+    }
+
     use super::*;
 
     #[test]

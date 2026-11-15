@@ -6,3 +6,6 @@
 samples/*.sql.gz
 .scannerwork/
 **/node_modules/
+
+# Playwright run artifacts (expected-failure "KNOWN BUG" tests leave error-context.md here)
+test-results/

@@ -34,6 +34,7 @@ use tower_http::{
 use uuid::Uuid;
 
 mod copy_tools;
+mod monitor_tools;
 mod oauth;
 mod ops_tools;
 mod redact;
@@ -493,6 +494,72 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// `GET /info`: what the native UI's MCP pages show. Never returns a key, token or client name:
+/// clients are counted by scope only. Guarded by the orchestrator token, which the native UI
+/// server and mcp-cdc already share, so no extra secret is needed; open when that token is unset
+/// (local development, like the orchestrator itself).
+async fn info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !info_authorized(state.cfg.orchestrator_token.as_deref(), &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "send the orchestrator token as Bearer"})),
+        )
+            .into_response();
+    }
+    let active_sessions = {
+        let mut s = state.sessions.lock().unwrap();
+        s.prune(Instant::now());
+        s.by_id.len()
+    };
+    let count = |scope: Scope| {
+        state
+            .cfg
+            .clients
+            .iter()
+            .filter(|c| c.scope == scope)
+            .count()
+    };
+    let tools: Vec<Value> = tools::definitions()
+        .into_iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "description": d.description,
+                "read_only": d.annotations["readOnlyHint"] == json!(true),
+                "input_schema": d.input_schema,
+            })
+        })
+        .collect();
+    Json(json!({
+        "service": "mcp-cdc",
+        "version": env!("CARGO_PKG_VERSION"),
+        "endpoint_path": "/mcp",
+        "write_tools_enabled": state.cfg.allow_write,
+        "clients": {"read": count(Scope::Read), "write": count(Scope::Write)},
+        "active_sessions": active_sessions,
+        "max_sessions": state.cfg.max_sessions,
+        "session_ttl_secs": state.cfg.session_ttl.as_secs(),
+        "rate_limit": {"enabled": state.cfg.rate_limit_enabled, "requests_per_minute": state.cfg.rate_limit_rpm},
+        "oauth": {"enabled": state.cfg.oauth.enabled, "public_url": state.cfg.oauth.public_url},
+        "orchestrator_url": state.cfg.orchestrator_url,
+        "tools": tools,
+        "prompts": tools::prompts(),
+    }))
+    .into_response()
+}
+
+fn info_authorized(token: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(want) = token.filter(|t| !t.is_empty()) else {
+        return true;
+    };
+    let got = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    bool::from(got.as_bytes().ct_eq(want.as_bytes()))
+}
+
 fn router(state: AppState) -> Router {
     let cors = build_cors(&state.cfg.cors_origins);
     Router::new()
@@ -501,6 +568,8 @@ fn router(state: AppState) -> Router {
             get(|| async { Json(json!({"ok":true,"service":"mcp-cdc"})) }),
         )
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
+        // Non-secret status + tool catalog for the native UI's MCP pages.
+        .route("/info", get(info))
         // OAuth bridge (ADR 0017). Both metadata paths: clients probe the root and the /mcp suffix.
         .route(
             "/.well-known/oauth-protected-resource",
@@ -709,6 +778,7 @@ async fn handle_rpc(
                      Pipelines can be named instead of using ids. \
                      Pipelines: cdc_source_validate / cdc_target_validate, then cdc_pipeline_create. \
                      Health and speed: cdc_latency, cdc_pipeline_latency, cdc_audit_events (outcome=failure), cdc_pipeline_logs. \
+                     Production monitoring: cdc_source_health (source, slot/WAL, tunnel), cdc_ssh_tunnels, cdc_redis_sync_status. \
                      Alerts: cdc_notification_channels_list, cdc_notification_rules_list, cdc_notification_deliveries. \
                      Copy & Sync: cdc_copy_test_connection, cdc_pg_copy_create (saves only), cdc_copy_run (starts; only when asked). \
                      Anything else: cdc_api_catalog to find the operation, then cdc_api_get (read) or cdc_api_call (write). \
@@ -1045,11 +1115,32 @@ mod tests {
     }
 
     #[test]
+    fn info_requires_the_orchestrator_token_when_set() {
+        let mut h = HeaderMap::new();
+        assert!(
+            info_authorized(None, &h),
+            "open without a token (local dev)"
+        );
+        assert!(!info_authorized(Some("s3cret-orchestrator-token"), &h));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        assert!(!info_authorized(Some("s3cret-orchestrator-token"), &h));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer s3cret-orchestrator-token"),
+        );
+        assert!(info_authorized(Some("s3cret-orchestrator-token"), &h));
+    }
+
+    #[test]
     fn every_tool_is_dispatched() {
         let src = [
             include_str!("tools.rs"),
             include_str!("copy_tools.rs"),
             include_str!("ops_tools.rs"),
+            include_str!("monitor_tools.rs"),
         ]
         .concat();
         for d in tools::definitions() {

@@ -402,6 +402,8 @@ pub async fn alert_history(
 pub struct AuditEventsQuery {
     #[serde(default = "default_audit_limit")]
     pub limit: usize,
+    /// Actor prefix, e.g. `mcp:` for every MCP client or `mcp:claude` for one.
+    pub actor: Option<String>,
     pub action: Option<String>,
     pub profile_id: Option<String>,
     pub outcome: Option<String>,
@@ -425,6 +427,7 @@ pub async fn list_audit_events(
     let rows = rqlite
         .list_audit_events(
             q.limit,
+            q.actor.as_deref().filter(|s| !s.is_empty()),
             q.action.as_deref().filter(|s| !s.is_empty()),
             q.profile_id.as_deref().filter(|s| !s.is_empty()),
             q.outcome.as_deref().filter(|s| !s.is_empty()),

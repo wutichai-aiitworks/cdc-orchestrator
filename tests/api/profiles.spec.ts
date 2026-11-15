@@ -188,9 +188,13 @@ test.describe("profiles — CRUD & lifecycle", () => {
     expect(after.last_error).toBeNull();
   });
 
-  test("DELETE /profiles/:id → 204, then 404, and it is audited", async ({ request }) => {
+  test("DELETE /profiles/:id → 200 with a report, then 404, and it is audited", async ({ request }) => {
     const res = await request.delete(`${API}/profiles/${profile.id}`);
-    await expectStatus(res, 204);
+    await expectStatus(res, 200);
+    const report = await json(res);
+    expect(report.connectors_deleted).toEqual([]);
+    // A draft that never ran has no replication slot (B-02), whatever its source.
+    expect(["never_started", "not_applicable"]).toContain(report.slot.result);
     created.delete(profile.id);
     await expectError(await request.get(`${API}/profiles/${profile.id}`), 404, /not found/);
 
@@ -366,15 +370,17 @@ test.describe("profiles — end-to-end replication (ORCH_TEST_E2E=true)", () => 
     // POST /compare/table/count on { targetSchema, smallTable } until it equals sourceCount.
   });
 
-  test("KNOWN BUG: deleting the profile removes its connectors", async ({ request }) => {
-    test.fail(true, "delete_profile only pauses connectors when ORCH_STOP_DELETES_CONNECTOR=false (default), orphaning them and the replication slot — see docs/testing/api-test-plan.md");
+  test("deleting the profile removes its connectors and drops its replication slot (B-02)", async ({ request }) => {
     test.skip(!profile, "previous step did not start the pipeline");
-    await expectStatus(await request.delete(`${API}/profiles/${profile.id}`), 204);
+    const slot = await json(await request.get(`${API}/profiles/${profile.id}/slot`));
+    const res = await request.delete(`${API}/profiles/${profile.id}`);
+    await expectStatus(res, 200);
     created.delete(profile.id);
-    await new Promise((r) => setTimeout(r, 3000));
+    const report = await json(res);
     const listing = await (await request.get("/connect/connectors")).text();
     expect(listing).not.toContain(`"${sourceConnector}"`);
     expect(listing).not.toContain(`"${sinkConnector}"`);
+    if (slot.applies) expect(["dropped", "absent"]).toContain(report.slot.result);
   });
 });
 

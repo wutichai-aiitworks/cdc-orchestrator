@@ -114,7 +114,7 @@ if [[ "$FULL" -eq 1 ]]; then
   #compose up -d --no-deps cdc-ksqldb
   compose up -d --build --force-recreate --no-deps cdc-jdbc-admin
   wait_container_healthy cdc-jdbc-admin 60
-  compose up -d --build --no-deps cdc-wireguard cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync
+  compose up -d --build --no-deps cdc-wireguard cdc-sshtunnel cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync
   compose up -d --build --force-recreate --no-deps cdc-orchestrator
   wait_container_healthy cdc-orchestrator 90
   #compose up -d --no-deps cdc-admin
@@ -129,6 +129,8 @@ echo "Redeploy: jdbc-admin + orchestrator + native UI (rqlite untouched; Kafka, 
 ensure_rqlite_healthy
 compose up -d --no-deps cdc-redis
 compose up -d --build --force-recreate --no-deps cdc-jdbc-admin
+# SSH tunnel gateway (ADR 0020): not force-recreated, so open SSH sessions survive a redeploy.
+compose up -d --build --no-deps cdc-sshtunnel
 compose --profile native-ui up -d --build --force-recreate --no-deps cdc-native-ui
 compose up -d --build --force-recreate --no-deps cdc-orchestrator
 wait_container_healthy cdc-orchestrator 90

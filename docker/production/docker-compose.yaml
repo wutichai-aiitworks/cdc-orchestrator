@@ -74,6 +74,8 @@ secrets:
     file: ./secrets/orch_secret_key
   orch_wireguard_token:
     file: ./secrets/orch_wireguard_token
+  orch_sshtunnel_token:
+    file: ./secrets/orch_sshtunnel_token
   session_secret:
     file: ./secrets/session_secret
   sso_app_secret:
@@ -271,6 +273,7 @@ services:
       - { source: orch_pgdump_token, target: ORCH_PGDUMP_TOKEN }
       - { source: orch_rsync_token, target: ORCH_RSYNC_TOKEN }
       - { source: orch_wireguard_token, target: ORCH_WIREGUARD_TOKEN }
+      - { source: orch_sshtunnel_token, target: ORCH_SSHTUNNEL_TOKEN }
       - { source: orch_vectorsync_token, target: ORCH_VECTORSYNC_TOKEN }
     <<: [*restart, *logging]
     depends_on:
@@ -339,6 +342,11 @@ services:
       ORCH_PGDUMP_URL: http://cdc-pgdump:8089
       ORCH_RSYNC_URL: http://cdc-rsync:8090
       ORCH_WIREGUARD_URL: http://cdc-wireguard:8091
+      ORCH_SSHTUNNEL_URL: http://cdc-sshtunnel:8092
+      ORCH_SSHTUNNEL_PORT_MIN: ${SSHT_FORWARD_PORT_MIN:-22000}
+      ORCH_SSHTUNNEL_PORT_MAX: ${SSHT_FORWARD_PORT_MAX:-22999}
+      # Local time for clock windows (Redis sync auto-restart window), e.g. +07:00. Default UTC.
+      ORCH_TIME_ZONE_OFFSET: ${ORCH_TIME_ZONE_OFFSET:-}
       # AI vector sync (ADR 0018): VECTORSYNC_ENABLED=true starts the sidecar (deploy.sh adds the
       # vectorsync profile) and shows the page.
       # Source/target database version re-read per pipeline (ADR 0019 §8), seconds, min 60.
@@ -388,6 +396,8 @@ services:
       APP_MODE: ${APP_MODE:-Production}
       ORCHESTRATOR_URL: http://cdc-orchestrator:9788
       PUBLIC_ORCHESTRATOR_URL: ${PUBLIC_ORCHESTRATOR_URL:-http://127.0.0.1:9788}
+      # mcp-cdc status/tools for the MCP pages (GET /info, guarded by the orchestrator token).
+      MCP_URL: http://mcp-cdc:8410
       AUTH_MODE: ${AUTH_MODE:-sso}
       # Production never runs open (AUTH_MODE=none refuses to start with this false).
       ALLOW_OPEN_AUTH: "false"
@@ -466,6 +476,33 @@ services:
     security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # SSH tunnel gateway (ADR 0020): one SSH session per tunnel (optionally via Cloudflare Access);
+  # tools reach site DBs via stable forwards 22000-22999 on server_zone only.
+  cdc-sshtunnel:
+    image: ${CDC_SSHTUNNEL_IMAGE:-${CDC_REGISTRY:-wutichai}/cdc-sshtunnel:${CDC_VERSION:-latest}}
+    container_name: cdc-sshtunnel
+    entrypoint: ["/bin/sh", "/cdc/secret-env.sh", "/usr/local/bin/cdc-sshtunnel"]
+    secrets:
+      - { source: orch_sshtunnel_token, target: SSHTUNNEL_API_TOKEN }
+    <<: [*restart, *logging]
+    environment:
+      SSHT_FORWARD_HOST: cdc-sshtunnel
+      SSHT_FORWARD_PORT_MIN: ${SSHT_FORWARD_PORT_MIN:-22000}
+      SSHT_FORWARD_PORT_MAX: ${SSHT_FORWARD_PORT_MAX:-22999}
+    volumes:
+      - ./config/secret-env.sh:/cdc/secret-env.sh:ro
+    networks: [server_zone]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8092/health >/dev/null || exit 1"]
       interval: 15s
       timeout: 3s
       retries: 6

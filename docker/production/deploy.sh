@@ -28,6 +28,7 @@ BUILT=(
   CDC_ORCHESTRATOR_IMAGE\|cdc-orchestrator CDC_CONNECT_IMAGE\|cdc-connect
   CDC_NATIVE_UI_IMAGE\|cdc-webui MCP_CDC_IMAGE\|cdc-mcp
   CDC_JDBC_ADMIN_IMAGE\|cdc-jdbc-admin CDC_WIREGUARD_IMAGE\|cdc-wireguard
+  CDC_SSHTUNNEL_IMAGE\|cdc-sshtunnel
   CDC_PGCOPY_IMAGE\|cdc-pgcopydb CDC_PGDUMP_IMAGE\|cdc-pgdump
   CDC_PGLOADER_IMAGE\|cdc-pgloader CDC_REDIS_SHAKE_IMAGE\|cdc-redisshake
   CDC_MONGOCOPY_IMAGE\|cdc-mongocopy CDC_RSYNC_IMAGE\|cdc-rsync
@@ -41,6 +42,7 @@ EXPECTED_EP=(
   'MCP_CDC_IMAGE|["/usr/local/bin/mcp-cdc"] null'
   'CDC_JDBC_ADMIN_IMAGE|["java","-Xms64m","-Xmx256m","-jar","/app/jdbc-admin.jar"] null'
   'CDC_WIREGUARD_IMAGE|["/usr/local/bin/cdc-wireguard"] null'
+  'CDC_SSHTUNNEL_IMAGE|["/usr/local/bin/cdc-sshtunnel"] null'
   'CDC_PGCOPY_IMAGE|null ["python3","/app/serve.py"]'
   'CDC_PGDUMP_IMAGE|null ["python3","/app/serve.py"]'
   'CDC_PGLOADER_IMAGE|null ["python3","/app/serve.py"]'
@@ -56,7 +58,7 @@ SECRETS=(
   orch_api_token\|hex orch_secret_key\|b64
   orch_jdbc_admin_token\|hex orch_pgcopy_token\|hex orch_redis_shake_token\|hex
   orch_pgloader_token\|hex orch_mongocopy_token\|hex orch_pgdump_token\|hex
-  orch_rsync_token\|hex orch_wireguard_token\|hex orch_vectorsync_token\|hex
+  orch_rsync_token\|hex orch_wireguard_token\|hex orch_sshtunnel_token\|hex orch_vectorsync_token\|hex
   admin_password\|hex session_secret\|hex admin_session_secret\|hex
   sso_app_secret\|manual authelia_client_secret\|optional
   mcp_client_keys\|mcpkeys mcp_bearer_token\|optional o2_password\|manual
@@ -64,17 +66,17 @@ SECRETS=(
 )
 SERVICE_TOKENS=(orch_api_token orch_jdbc_admin_token orch_pgcopy_token orch_redis_shake_token
   orch_pgloader_token orch_mongocopy_token orch_pgdump_token orch_rsync_token orch_wireguard_token
-  orch_vectorsync_token)
+  orch_sshtunnel_token orch_vectorsync_token)
 # Keys that must no longer be in .env (they moved to ./secrets).
 LEGACY_ENV_SECRETS=(ORCH_API_TOKEN ORCH_SECRET_KEY ORCH_JDBC_ADMIN_TOKEN ORCH_PGCOPY_TOKEN
   ORCH_REDIS_SHAKE_TOKEN ORCH_PGLOADER_TOKEN ORCH_MONGOCOPY_TOKEN ORCH_PGDUMP_TOKEN ORCH_RSYNC_TOKEN
-  ORCH_WIREGUARD_TOKEN ORCH_VECTORSYNC_TOKEN ADMIN_PASSWORD SESSION_SECRET ADMIN_SESSION_SECRET SSO_APP_SECRET
+  ORCH_WIREGUARD_TOKEN ORCH_SSHTUNNEL_TOKEN ORCH_VECTORSYNC_TOKEN ADMIN_PASSWORD SESSION_SECRET ADMIN_SESSION_SECRET SSO_APP_SECRET
   AUTHELIA_CLIENT_SECRET MCP_CLIENT_KEYS MCP_BEARER_TOKEN O2_PASSWORD DEPLOY_DISCORD_WEBHOOK
   DEPLOY_O2_AUTH_B64)
 
 CORE_INFRA=(cdc-message cdc-rqlite cdc-redis)
 CORE_ENGINE=(cdc-connect cdc-jdbc-admin)
-SIDECARS=(cdc-wireguard cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync)
+SIDECARS=(cdc-wireguard cdc-sshtunnel cdc-pgcopydb cdc-redisshake cdc-pgloader cdc-mongocopy cdc-pgdump cdc-rsync)
 AGENT=(mcp-cdc cdc-vector)
 # Optional, behind VECTORSYNC_ENABLED (profile vectorsync, ADR 0018). Images only some releases have.
 VECTORSYNC=(cdc-vectorsync)

@@ -1008,6 +1008,18 @@ pub async fn reconcile_start(state: &AppState, profile: &mut CdcProfile) -> Resu
                 .into(),
         ));
     }
+    // SSH connection method (ADR 0020): make sure each tunnelled side's forward exists on the
+    // gateway (and the stored host/port point at it) before Connect gets the config.
+    crate::ssh_tunnel::materialize_conn(
+        state,
+        &profile.source.source_type.clone(),
+        &mut profile.source.connection,
+    )
+    .await?;
+    if let Some(t) = profile.target.as_mut() {
+        let kind = t.target_type.clone();
+        crate::ssh_tunnel::materialize_conn(state, &kind, &mut t.connection).await?;
+    }
     let registry = schema_registry_url(state);
     let name = connector_name_for(profile);
     let sources = plan_source_connectors(profile, &name, &registry).await?;
@@ -1250,6 +1262,42 @@ pub async fn reconcile_restart(state: &AppState, profile: &mut CdcProfile) -> Re
         }
     }
     Ok(())
+}
+
+/// Deletes every Kafka Connect connector of a pipeline that is being deleted (source, per-table
+/// poll connectors, leftovers, sink) — always delete, never pause, whatever
+/// ORCH_STOP_DELETES_CONNECTOR says (that switch is for Stop). Returns the names removed.
+pub async fn reconcile_teardown(
+    state: &AppState,
+    profile: &CdcProfile,
+) -> Result<Vec<String>, AppError> {
+    let mut removed = Vec::new();
+    cleanup_leftover_connectors(state, profile).await;
+    for extra in existing_poll_connectors(state, profile).await {
+        if connector_exists(state, &extra).await.unwrap_or(false) {
+            stop_connector(state, &extra, true).await?;
+            removed.push(extra);
+        }
+    }
+    let mut names = vec![connector_name_for(profile)];
+    if let Some(n) = &profile.connector_name {
+        names.push(n.clone());
+    }
+    if profile.has_managed_sink() {
+        names.push(sink_connector_name_for(profile));
+    }
+    if let Some(n) = &profile.sink_connector_name {
+        names.push(n.clone());
+    }
+    names.sort();
+    names.dedup();
+    for name in names {
+        if connector_exists(state, &name).await? {
+            stop_connector(state, &name, true).await?;
+            removed.push(name);
+        }
+    }
+    Ok(removed)
 }
 
 pub async fn reconcile_stop(state: &AppState, profile: &mut CdcProfile) -> Result<(), AppError> {

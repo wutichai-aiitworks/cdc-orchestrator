@@ -90,9 +90,9 @@ html:not(.dark) {
     --accent-foreground: oklch(0.985 0 0);
     --destructive: oklch(0.704 0.191 22.216);
     --destructive-foreground: oklch(0.98 0.016 73.684);
-    --border: oklch(1 0 0 / 16%);
-    --input: oklch(1 0 0 / 20%);
-    --ring: oklch(0.556 0 0);
+    --border: oklch(1 0 0 / 26%); /* was 16%: too faint on --card (L .205) */
+    --input: oklch(1 0 0 / 30%); /* was 20% */
+    --ring: oklch(0.65 0 0); /* was .556 */
     --chart-1: oklch(0.837 0.128 66.29);
     --chart-2: oklch(0.705 0.213 47.604);
     --chart-3: oklch(0.646 0.222 41.116);
@@ -104,8 +104,8 @@ html:not(.dark) {
     --sidebar-primary-foreground: oklch(0.98 0.016 73.684);
     --sidebar-accent: oklch(0.269 0 0);
     --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 16%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --sidebar-border: oklch(1 0 0 / 22%); /* was 16% */
+    --sidebar-ring: oklch(0.65 0 0);
   }
 
   * {
@@ -180,8 +180,10 @@ html:not(.dark) {
     @apply opacity-50 cursor-not-allowed;
   }
 
+  /* One label row height everywhere (16px), with or without an info icon, so fields side by
+     side line up. Use <AppFormLabel> or put <AppInfoHint> inside: never add inline-flex here. */
   .auth-label {
-    @apply mb-1.5 block text-xs font-medium text-muted-foreground;
+    @apply mb-1.5 flex min-h-4 items-center gap-1 text-xs font-medium leading-4 text-muted-foreground;
   }
 
   .btn-primary {

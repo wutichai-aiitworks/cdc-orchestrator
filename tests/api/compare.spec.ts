@@ -54,11 +54,27 @@ test.describe("compare — saved profiles CRUD", () => {
     await expectStatus(await request.get(`${API}/compare/profiles/${id}`), 200);
   });
 
-  test("KNOWN BUG: compare profiles mask stored passwords", async ({ request }) => {
-    test.fail(true, "compare profiles return plaintext passwords (CDC profiles return ***) — see docs/testing/api-test-plan.md");
+  test("compare profiles never return stored passwords (get and list)", async ({ request }) => {
     const body = await json(await request.get(`${API}/compare/profiles/${id}`));
-    expect(body.source.password).toBe("***");
-    expect(body.target.password).toBe("***");
+    expect(body.source.password).toBe("********");
+    expect(body.target.password).toBe("********");
+    const list = await json(await request.get(`${API}/compare/profiles`));
+    const mine = list.profiles.find((p: any) => p.id === id);
+    expect(mine.source.password).toBe("********");
+  });
+
+  test("******** works for the same login and is refused for another host", async ({ request }) => {
+    // Same login: the stored password is used (schema counts reach the database).
+    const same = await request.post(`${API}/compare/schema/counts`, {
+      data: { connection: { ...compareConnection(db.sourcePort), password: "********" }, schema: db.schema },
+    });
+    expect([200, 502]).toContain(same.status()); // 502 only when the demo DB is unreachable
+    // Another host must never receive the stored password.
+    const other = await request.post(`${API}/compare/schema/counts`, {
+      data: { connection: { ...compareConnection(db.sourcePort), host: "pw-other.invalid", password: "********" }, schema: db.schema },
+    });
+    expect(other.status()).toBe(400);
+    expect((await json(other)).error ?? "").toContain("enter the connection password again");
   });
 
   test("PUT /compare/profiles/:id renames", async ({ request }) => {

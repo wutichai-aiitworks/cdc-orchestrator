@@ -18,9 +18,32 @@ export default defineNuxtConfig({
   modules: ["@nuxtjs/tailwindcss"],
   components: [{ path: "~/components", extensions: ["vue"], pathPrefix: false }],
   css: ["~/assets/css/main.css"],
+  nitro: {
+    hooks: {
+      // Typed $fetch/useFetch: keep every route key (paths and methods stay checked) but declare the
+      // responses as `any`. Nitro otherwise types each of ~250 routes as
+      // Simplify<Serialize<Awaited<ReturnType<handler>>>>, and resolving that union on every call
+      // exceeded TypeScript's instantiation depth (TS2589) whenever a route was added. Callers pass
+      // the response type explicitly ($fetch<T>), so no real typing is lost.
+      // Catch-all keys (`/**:path`) are left out entirely: template-literal matching against them is
+      // the expensive part. Calls to those paths still work; they are just not path-checked.
+      "types:extend"(types: { routes?: Record<string, Record<string, string[]>> }) {
+        const routes = types.routes || {}
+        for (const path of Object.keys(routes)) {
+          if (path.includes("**")) {
+            delete routes[path]
+            continue
+          }
+          for (const method of Object.keys(routes[path]!)) routes[path]![method] = ["any"]
+        }
+      },
+    },
+  },
   runtimeConfig: {
     orchestratorUrl: env("ORCHESTRATOR_URL", "PUBLIC_ORCHESTRATOR_URL") || "http://127.0.0.1:9788",
     orchestratorToken: env("ORCHESTRATOR_TOKEN"),
+    // mcp-cdc (optional agent surface): the MCP pages read GET /info with the orchestrator token.
+    mcpUrl: env("MCP_URL") || "http://mcp-cdc:8410",
     sessionCookieSecure:
       cookieSecure === "true" ? true : cookieSecure === "false" ? false : process.env.NODE_ENV === "production",
     sessionSecret: env("SESSION_SECRET"),

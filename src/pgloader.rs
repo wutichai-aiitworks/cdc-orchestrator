@@ -81,6 +81,7 @@ mod tests {
     fn conn(db_type: &str, database: &str) -> SchemaCompareConn {
         SchemaCompareConn {
             tunnel_id: None,
+            ssh_tunnel_id: None,
             db_type: db_type.into(),
             host: "src".into(),
             port: "3306".into(),
@@ -95,6 +96,7 @@ mod tests {
     fn accepts_mysql_to_postgres() {
         let target = SchemaCompareConn {
             tunnel_id: None,
+            ssh_tunnel_id: None,
             db_type: "postgres".into(),
             host: "tgt".into(),
             port: "5432".into(),

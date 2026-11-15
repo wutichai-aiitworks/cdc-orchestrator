@@ -21,7 +21,7 @@ Docker with Compose v2, and the external network `server_zone`.
 | Group | Containers | Published on host |
 |-------|-----------|-------------------|
 | Core | `cdc-message` (Redpanda), `cdc-connect`, `cdc-jdbc-admin`, `cdc-rqlite`, `cdc-redis`, `cdc-orchestrator`, `cdc-native-ui` | UI `:4320`; everything else `127.0.0.1` |
-| Sidecars | `cdc-pgcopydb`, `cdc-wireguard`, `cdc-redisshake`, `cdc-pgloader`, `cdc-mongocopy`, `cdc-pgdump`, `cdc-rsync` | none (server_zone only) |
+| Sidecars | `cdc-pgcopydb`, `cdc-wireguard`, `cdc-sshtunnel`, `cdc-redisshake`, `cdc-pgloader`, `cdc-mongocopy`, `cdc-pgdump`, `cdc-rsync` | none (server_zone only) |
 | AI agent (profile `agent`) | `mcp-cdc`, `cdc-vector` | MCP `127.0.0.1:8410` |
 | AI vector sync (`VECTORSYNC_ENABLED=true`) | `cdc-vectorsync` | none (server_zone only) |
 
@@ -45,7 +45,7 @@ $EDITOR .env                                 # ADMIN_USERNAME, SSO_*, O2_*, publ
 ## Images
 
 Docker Hub `wutichai/<image>`: `cdc-orchestrator`, `cdc-connect`, `cdc-webui`, `cdc-mcp`,
-`cdc-jdbc-admin`, `cdc-wireguard`, `cdc-pgcopydb`, `cdc-pgdump`, `cdc-pgloader`,
+`cdc-jdbc-admin`, `cdc-wireguard`, `cdc-sshtunnel`, `cdc-pgcopydb`, `cdc-pgdump`, `cdc-pgloader`,
 `cdc-redisshake`, `cdc-mongocopy`, `cdc-rsync`, `cdc-vectorsync`. Upstream images are pinned in compose
 (Redpanda `v24.2.4`, rqlite `8.36.16`, Redis `7.4-alpine`, Vector `0.41.1-alpine`).
 
@@ -84,6 +84,7 @@ its env var and then execs the image's original entrypoint. So:
 | `orch_pgdump_token` | orchestrator, pgdump (`PGDUMP_API_TOKEN`) | generated |
 | `orch_rsync_token` | orchestrator, rsync (`RSYNC_API_TOKEN`) | generated |
 | `orch_wireguard_token` | orchestrator, wireguard (`WIREGUARD_API_TOKEN`) | generated |
+| `orch_sshtunnel_token` | orchestrator, sshtunnel (`SSHTUNNEL_API_TOKEN`) | generated |
 | `orch_vectorsync_token` | orchestrator, vectorsync (`VECTORSYNC_API_TOKEN`) | generated (used only when vector sync is on) |
 | `admin_password` | native-ui | generated (break-glass login) |
 | `session_secret`, `admin_session_secret` | native-ui | generated |

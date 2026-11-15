@@ -153,6 +153,7 @@
   "summary": "Query the sync audit trail (rqlite)",
   "tag": "Audit",
   "query": [
+   "actor",
    "action",
    "profile_id",
    "outcome",
@@ -915,9 +916,11 @@
  {
   "method": "DELETE",
   "path": "/cdc/profiles/{id}",
-  "summary": "Delete profile",
+  "summary": "Delete profile, its connectors and its replication slot",
   "tag": "Profiles",
-  "query": [],
+  "query": [
+   "keep_slot"
+  ],
   "write": true
  },
  {
@@ -1108,6 +1111,14 @@
   "tag": "Profiles",
   "query": [],
   "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/profiles/{id}/slot",
+  "summary": "Replication slot a delete would drop",
+  "tag": "Profiles",
+  "query": [],
+  "write": false
  },
  {
   "method": "POST",
@@ -1371,6 +1382,70 @@
  },
  {
   "method": "GET",
+  "path": "/cdc/ssh-tunnels",
+  "summary": "List SSH tunnels with live status",
+  "tag": "Tunnels",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ssh-tunnels",
+  "summary": "Create an SSH tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/ssh-tunnels/{id}",
+  "summary": "Delete an SSH tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/ssh-tunnels/{id}",
+  "summary": "Update an SSH tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ssh-tunnels/{id}/probe",
+  "summary": "Dial a database address through a running SSH tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ssh-tunnels/{id}/reconnect",
+  "summary": "Reconnect an SSH tunnel now (skip the backoff)",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/ssh-tunnels/capability",
+  "summary": "SSH tunnel gateway configured / reachable",
+  "tag": "Tunnels",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/ssh-tunnels/test",
+  "summary": "Test SSH login (and optionally a database dial) for a tunnel form",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
   "path": "/cdc/topics",
   "summary": "List topics with pagination, search, sort, and Kafka metadata",
   "tag": "Kafka",
@@ -1593,6 +1668,78 @@
   "path": "/cdc/vectorsync/test",
   "summary": "Test the embedding model and/or the PGVector target",
   "tag": "AI Vector Sync",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/wireguard/capability",
+  "summary": "WireGuard gateway configured / reachable",
+  "tag": "Tunnels",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/wireguard/tunnels",
+  "summary": "List WireGuard tunnels with live status",
+  "tag": "Tunnels",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/wireguard/tunnels",
+  "summary": "Create a WireGuard tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "DELETE",
+  "path": "/cdc/wireguard/tunnels/{id}",
+  "summary": "Delete a WireGuard tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "PUT",
+  "path": "/cdc/wireguard/tunnels/{id}",
+  "summary": "Update a WireGuard tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/wireguard/tunnels/{id}/probe",
+  "summary": "Dial host:port inside a WireGuard tunnel",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "GET",
+  "path": "/cdc/wireguard/tunnels/{id}/site-config",
+  "summary": "Site WireGuard configuration and checklist",
+  "tag": "Tunnels",
+  "query": [],
+  "write": false
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/wireguard/tunnels/{id}/site-keys",
+  "summary": "Rotate the site's WireGuard keys (returns the full site file once)",
+  "tag": "Tunnels",
+  "query": [],
+  "write": true
+ },
+ {
+  "method": "POST",
+  "path": "/cdc/wireguard/udp-test",
+  "summary": "Test that a site's WireGuard UDP port is open (echo probe)",
+  "tag": "Tunnels",
   "query": [],
   "write": true
  },

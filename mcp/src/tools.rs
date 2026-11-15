@@ -9,6 +9,7 @@ pub fn definitions() -> Vec<ToolDef> {
     let mut defs = base_definitions();
     defs.extend(crate::copy_tools::definitions());
     defs.extend(crate::ops_tools::definitions());
+    defs.extend(crate::monitor_tools::definitions());
     defs
 }
 
@@ -440,12 +441,20 @@ pub fn prompt_messages(name: &str, arguments: &Value) -> Result<Value, ApiError>
     Ok(json!([{"role":"user","content":{"type":"text","text": text}}]))
 }
 
+/// Tools that live in their own modules (ops, monitoring, Copy & Sync); `None` = not theirs.
+async fn module_call(state: &AppState, call: &ToolCall) -> Option<Result<Value, ApiError>> {
+    if let Some(out) = crate::ops_tools::call(state, call).await {
+        return Some(out);
+    }
+    if let Some(out) = crate::monitor_tools::call(state, call).await {
+        return Some(out);
+    }
+    crate::copy_tools::call(state, call).await
+}
+
 pub async fn call(state: &AppState, mut call: ToolCall) -> Result<Value, ApiError> {
     crate::ops_tools::normalize_pipeline_arg(state, &mut call).await?;
-    if let Some(out) = crate::ops_tools::call(state, &call).await {
-        return out;
-    }
-    if let Some(out) = crate::copy_tools::call(state, &call).await {
+    if let Some(out) = module_call(state, &call).await {
         return out;
     }
     match call.name.as_str() {
@@ -934,7 +943,10 @@ fn help_catalog(state: &AppState) -> Value {
             "What failed in the last hour?",
             "Turn on exact latency for CollabX Sync and restart it",
             "Create a LINE channel and alert me when any connector fails",
-            "Run a record diff for CollabX Sync (find it with cdc_api_catalog)"
+            "Run a record diff for CollabX Sync (find it with cdc_api_catalog)",
+            "Is the source of CollabX Sync healthy? Is the slot holding WAL?",
+            "Are the SSH tunnels up?",
+            "Is the Redis real-time sync still running?"
         ],
         "pipelines_by_name": "Any tool that takes a pipeline id also accepts its name.",
         "read_tools": [
@@ -944,6 +956,7 @@ fn help_catalog(state: &AppState) -> Value {
             "cdc_copy_profile_list", "cdc_copy_test_connection", "cdc_copy_jobs", "cdc_copy_job_logs",
             "cdc_latency", "cdc_pipeline_latency", "cdc_audit_events", "cdc_pipeline_logs",
             "cdc_notification_channels_list", "cdc_notification_deliveries",
+            "cdc_source_health", "cdc_source_readiness", "cdc_ssh_tunnels", "cdc_ssh_tunnel_probe", "cdc_redis_sync_status",
             "cdc_api_catalog", "cdc_api_get (any /cdc read)"
         ],
         "write_tools": [
@@ -951,6 +964,7 @@ fn help_catalog(state: &AppState) -> Value {
             "cdc_topic_create", "cdc_engine_up",
             "cdc_pg_copy_create (save only)", "cdc_copy_run (starts a copy)",
             "cdc_latency_probe", "cdc_notification_channel_upsert", "cdc_notification_rule_upsert",
+            "cdc_ssh_tunnel_reconnect",
             "cdc_api_call (any /cdc write; confirm destructive actions first)"
         ]
     })

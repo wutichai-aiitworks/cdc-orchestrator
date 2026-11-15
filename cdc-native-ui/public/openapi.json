@@ -66,6 +66,10 @@
     {
       "name": "Migration Tools",
       "description": "One-shot migration jobs (pgcopydb, pgloader, redis-shake, mongo copy) with a shared contract."
+    },
+    {
+      "name": "Tunnels",
+      "description": "Reach sources/targets whose database port is closed — SSH tunnels with optional Cloudflare Access (ADR 0020) and WireGuard tunnels (ADR 0010). Secrets are always returned as `********`."
     }
   ],
   "security": [
@@ -2533,8 +2537,58 @@
         }
       },
       "delete": {
-        "summary": "Delete profile",
+        "summary": "Delete profile, its connectors and its replication slot",
+        "description": "Deletes every Kafka Connect connector of the pipeline (source, per-table poll, sink) and, for\nlog-based PostgreSQL capture, drops the pipeline's own replication slot (an orphaned slot keeps\nWAL until the source disk fills, B-02). The slot is waited on for up to 20 s to become inactive;\na WAL sender still holding it is then ended. If the slot cannot be dropped (e.g. the source is\nunreachable) the pipeline is kept (stopped) and the call returns 409 with the reason and the\nSQL. `keep_slot=true` keeps the slot (slot-first rollouts that reuse it). A pipeline that never\nstarted has no slot.\n",
         "operationId": "deleteProfile",
+        "tags": [
+          "Profiles"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "keep_slot",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Keep the replication slot (it keeps WAL until dropped)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted: `{status, id, connectors_deleted[], slot{result: dropped|absent|kept|never_started|not_applicable, slot_name?, freed?, warning?}}`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/cdc/profiles/{id}/slot": {
+      "get": {
+        "summary": "Replication slot a delete would drop",
+        "description": "Log-based PostgreSQL only: `{applies, slot_name, exists, active, wal_status, retained_bytes, retained}`; `error` when the source cannot be reached. Read-only.",
+        "operationId": "getProfileSlot",
         "tags": [
           "Profiles"
         ],
@@ -2550,11 +2604,19 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Profile deleted"
+          "200": {
+            "description": "Slot state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
           },
           "404": {
-            "description": "Profile not found"
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -4612,6 +4674,14 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/AuditLimit"
+          },
+          {
+            "in": "query",
+            "name": "actor",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Actor prefix, e.g. `mcp:` for every MCP client, `mcp:claude` for one"
           },
           {
             "in": "query",
@@ -6982,6 +7052,594 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels": {
+      "get": {
+        "summary": "List SSH tunnels with live status",
+        "description": "Stored tunnels (secrets redacted) merged with the cdc-sshtunnel gateway's live view:\n`status{connected, connected_since, last_error, forwards[{remote_host, remote_port, listen_port, listening, active_connections}]}`,\n`forwards` (stable listen ports), `used_by` (pipeline names), plus `configured` / `gateway_reachable`.\n",
+        "operationId": "listSshTunnels",
+        "tags": [
+          "Tunnels"
+        ],
+        "responses": {
+          "200": {
+            "description": "{configured, gateway_reachable, forward_host, tunnels[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an SSH tunnel",
+        "description": "Body `{name, host, port?, username, auth_method(key|password), private_key?, passphrase?, password?, host_key_fingerprint?, keepalive?, proxy{kind(none|cloudflare_access), hostname?, service_token_id?, service_token_secret?}, notes?}`. Without a pinned host key the tunnel is stored but not started.",
+        "operationId": "createSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created tunnel (redacted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels/capability": {
+      "get": {
+        "summary": "SSH tunnel gateway configured / reachable",
+        "operationId": "sshTunnelCapability",
+        "tags": [
+          "Tunnels"
+        ],
+        "responses": {
+          "200": {
+            "description": "{configured, reachable, engine, forward_host, forward_ports, cloudflared}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels/test": {
+      "post": {
+        "summary": "Test SSH login (and optionally a database dial) for a tunnel form",
+        "description": "Body `{tunnel{…same fields as create…}, id?, host?, port?}`. With an unpinned host key it stops before authentication and returns `needs_host_key` + `host_key_fingerprint`. Read-only.",
+        "operationId": "testSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok, ssh_ok?, error?, hint?, host_key_fingerprint?, needs_host_key?, host_key_mismatch?, server_version?, target?}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels/{id}": {
+      "put": {
+        "summary": "Update an SSH tunnel",
+        "description": "Same body as create. `********` keeps a stored secret only while host, port, user and proxy are unchanged. Forwards are kept.",
+        "operationId": "updateSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated tunnel (redacted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an SSH tunnel",
+        "description": "Refused (409) while a pipeline uses it.",
+        "operationId": "deleteSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{status, id}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels/{id}/probe": {
+      "post": {
+        "summary": "Dial a database address through a running SSH tunnel",
+        "description": "Body `{host, port}` as seen from the SSH server. Read-only diagnostic.",
+        "operationId": "probeSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok, target, connected, ms?, error?, hint?}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/ssh-tunnels/{id}/reconnect": {
+      "post": {
+        "summary": "Reconnect an SSH tunnel now (skip the backoff)",
+        "operationId": "reconnectSshTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{ok}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/capability": {
+      "get": {
+        "summary": "WireGuard gateway configured / reachable",
+        "operationId": "wireguardCapability",
+        "tags": [
+          "Tunnels"
+        ],
+        "responses": {
+          "200": {
+            "description": "{configured, reachable, engine?, forward_host?, forward_ports?}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/udp-test": {
+      "post": {
+        "summary": "Test that a site's WireGuard UDP port is open (echo probe)",
+        "operationId": "wireguardUdpTest",
+        "tags": [
+          "Tunnels"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok, endpoint, echoed?, ms?, error?, hint?}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/tunnels": {
+      "get": {
+        "summary": "List WireGuard tunnels with live status",
+        "operationId": "listWireguardTunnels",
+        "tags": [
+          "Tunnels"
+        ],
+        "responses": {
+          "200": {
+            "description": "{configured, gateway_reachable, tunnels[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a WireGuard tunnel",
+        "operationId": "createWireguardTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created tunnel (redacted; once-only secrets in `once`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/tunnels/{id}": {
+      "put": {
+        "summary": "Update a WireGuard tunnel",
+        "operationId": "updateWireguardTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated tunnel (redacted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a WireGuard tunnel",
+        "operationId": "deleteWireguardTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{status, id}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/tunnels/{id}/site-config": {
+      "get": {
+        "summary": "Site WireGuard configuration and checklist",
+        "operationId": "wireguardSiteConfig",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{config, listen_port, checklist[]}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/tunnels/{id}/site-keys": {
+      "post": {
+        "summary": "Rotate the site's WireGuard keys (returns the full site file once)",
+        "operationId": "rotateWireguardSiteKeys",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tunnel with once-only site config",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cdc/wireguard/tunnels/{id}/probe": {
+      "post": {
+        "summary": "Dial host:port inside a WireGuard tunnel",
+        "operationId": "probeWireguardTunnel",
+        "tags": [
+          "Tunnels"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok, target, connected, ms?, error?, hint?}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
           }
         }
       }
@@ -10317,9 +10975,10 @@
               "connector_state_changed",
               "dlq_growth",
               "pipeline_failed",
-              "latency_above"
+              "latency_above",
+              "redis_sync_down"
             ],
-            "description": "`connector_paused_N_min` (legacy) is read as connector_paused. connector_failed_for uses conditionValue.minutes; latency_above uses conditionValue {seconds, forMinutes}."
+            "description": "`connector_paused_N_min` (legacy) is read as connector_paused. connector_failed_for uses conditionValue.minutes; latency_above uses conditionValue {seconds, forMinutes}. redis_sync_down: a real-time Redis sync (RedisShake profile, filter = profile name) stopped, was auto-restarted, gave up or recovered."
           },
           "connectorFilter": {
             "type": "string",

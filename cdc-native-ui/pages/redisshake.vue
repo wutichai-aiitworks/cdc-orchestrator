@@ -5,6 +5,12 @@ import { ArrowRightLeft, ChevronRight } from "@lucide/vue"
 import { applyContractOptionDefaults } from "~/composables/useMigrationTools"
 import { defaultRedisShakeOptions, type RedisShakeConn, type RedisShakeJob, type RedisShakeProfile, useRedisShake } from "~/composables/useRedisShake"
 import * as rules from "~/utils/transferTools/redisshake"
+
+const RESTART_OPTIONS = [
+  { value: "off", label: "Off" },
+  { value: "window", label: "Night window" },
+  { value: "always", label: "Any time" },
+]
 import type { StartMode, TransferTool } from "~/utils/transferTools/types"
 
 definePageMeta({ layout: "default" })
@@ -140,6 +146,12 @@ const START_OPTIONS = [
 const setDefaultMode = (o: Record<string, any>, mode: string) => {
   o.sync_rdb = mode !== "cdc-live"
   o.sync_aof = mode !== "once"
+  // A one-time copy is never restarted (the API refuses auto-restart without sync_aof).
+  if (mode === "once") o.auto_restart = ""
+}
+const setRestart = (o: Record<string, any>, value: string) => {
+  o.auto_restart = value === "off" ? "" : value
+  if (value === "window" && !o.restart_window) o.restart_window = "00:00-05:00"
 }
 const choiceModel = (o: Record<string, any>) => o.rdb_restore_command_behavior || "panic"
 </script>
@@ -222,6 +234,24 @@ const choiceModel = (o: Record<string, any>) => o.rdb_restore_command_behavior |
           "
           danger="Deletes data on the target"
         />
+        <div v-if="rules.defaultMode(draft.options) !== 'once'" class="space-y-3">
+          <div>
+            <AppFormLabel label="Auto-restart if the sync stops">
+              <p>A stopped real-time sync is always alerted (rule condition <b>Redis sync stopped</b>).</p>
+              <p class="mt-1">Each restart takes a <b>full snapshot</b> of the source (BGSAVE), so “Night window” is recommended. Restarts back off 10 → 30 → 90 min and stop after 3 in 24 h.</p>
+            </AppFormLabel>
+            <TransferSegmented
+              :model-value="draft.options.auto_restart || 'off'"
+              label="Auto-restart"
+              :options="RESTART_OPTIONS"
+              @update:model-value="setRestart(draft.options, $event)"
+            />
+          </div>
+          <label v-if="draft.options.auto_restart === 'window'" class="block max-w-[11rem]">
+            <AppFormLabel label="Window" hint="HH:MM-HH:MM in the server's time zone (ORCH_TIME_ZONE_OFFSET). May wrap past midnight." />
+            <input v-model.trim="draft.options.restart_window" class="auth-input font-mono !text-xs" placeholder="00:00-05:00" />
+          </label>
+        </div>
         <TransferTokens
           :model-value="rules.dbTokens(draft.options)"
           label="Source databases"

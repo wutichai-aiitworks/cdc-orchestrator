@@ -91,6 +91,20 @@ steps:
         go test ./...
         echo success > "$${ST}/wireguard"
 
+  test-sshtunnel:
+    image: golang:1.26-alpine
+    environment:
+      CGO_ENABLED: "0"
+    commands:
+      - |
+        set -e
+        ST="$${PWD}/.ci-status"; mkdir -p "$${ST}"; chmod 777 "$${ST}" 2>/dev/null || true
+        echo running > "$${ST}/sshtunnel"
+        cd docker/sshtunnel
+        go vet ./...
+        go test ./...
+        echo success > "$${ST}/sshtunnel"
+
   test-jdbc-admin:
     image: maven:3.9.9-eclipse-temurin-17
     commands:
@@ -121,7 +135,7 @@ steps:
 
   build-and-push:
     image: docker:27-cli
-    depends_on: [sonar, webui, test-sidecars, test-wireguard, test-jdbc-admin]
+    depends_on: [sonar, webui, test-sidecars, test-wireguard, test-sshtunnel, test-jdbc-admin]
     environment:
       DOCKERHUB_USERNAME:
         from_secret: DOCKERHUB_USERNAME
@@ -209,7 +223,7 @@ steps:
 
   notify-discord:
     image: curlimages/curl:8.7.1
-    depends_on: [test-orchestrator, test-mcp, webui, test-sidecars, test-wireguard, test-jdbc-admin, sonar, build-and-push]
+    depends_on: [test-orchestrator, test-mcp, webui, test-sidecars, test-wireguard, test-sshtunnel, test-jdbc-admin, sonar, build-and-push]
     when:
       status: [success, failure]
     environment:

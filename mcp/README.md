@@ -10,6 +10,17 @@ Pair with orchestrator OpenAPI (`docs/openapi.yaml`) and setup notes (compendium
 Start with `cdc_help` or `cdc_overview`. Prefer prompt-friendly tools over raw orchestrator JSON.
 Every tool that takes a pipeline accepts its **id or its name** (e.g. `"CollabX Sync"`).
 
+Full list of all tools with read/write flags and example prompts: [docs/mcp-tools.md](../docs/mcp-tools.md).
+The web UI has an **MCP** menu (Overview, Tools, Activity) that reads `GET /info` from this server
+(non-secret status + tool catalog, guarded by `CDC_ORCHESTRATOR_TOKEN`; see ADR 0021).
+
+### Production monitoring (docs/production-rollout-guideline.md)
+- `cdc_source_health` — one call per pipeline: status, latency/backlog, committed position, replication slot / WAL retention checks, SSH tunnel state, plain-language `warnings[]`
+- `cdc_source_readiness` — live readiness check of a pipeline's source; only the problems + fixes (`include_fix_script` for the DBA script)
+- `cdc_ssh_tunnels`, `cdc_ssh_tunnel_probe` — tunnel state, stable forward ports, which pipelines use them; dial the database through a tunnel
+- `cdc_redis_sync_status` — RedisShake profiles: real-time vs one-time, latest run, flags real-time syncs that are not running
+- Write: `cdc_ssh_tunnel_reconnect`
+
 ### Health, latency, alerts (ADR 0015, 0016)
 - `cdc_latency` — every running pipeline's end-to-end latency, backlog, throughput, status
 - `cdc_pipeline_latency` — one pipeline over 1h…30d (p50 / p95 / max)

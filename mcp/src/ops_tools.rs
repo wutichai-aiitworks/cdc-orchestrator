@@ -110,6 +110,7 @@ pub fn definitions() -> Vec<ToolDef> {
              Use outcome=failure to find errors.",
             json!({"properties":{
                 "pipeline":{"type":"string","description":PIPELINE_ARG},
+                "actor":{"type":"string","description":"Actor prefix, e.g. \"mcp:\" = actions by MCP clients."},
                 "action":{"type":"string"},
                 "outcome":{"type":"string","enum":["success","failure"]},
                 "since":{"type":"string","description":"RFC 3339, e.g. 2026-11-12T00:00:00Z"},
@@ -447,6 +448,7 @@ pub async fn call(state: &AppState, call: &ToolCall) -> Option<Result<Value, Api
                         "/cdc/audit/events",
                         query_string(&[
                             ("profile_id", profile_id),
+                            ("actor", opt_str(a, "actor")),
                             ("action", opt_str(a, "action")),
                             ("outcome", opt_str(a, "outcome")),
                             ("since", opt_str(a, "since")),

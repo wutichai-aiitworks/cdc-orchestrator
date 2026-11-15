@@ -25,6 +25,10 @@ export type RedisShakeSyncOptions = {
   source_dbs?: number[]
   /** Write into this target database instead of the same number (needs exactly one source database). */
   target_db?: number | null
+  /** Real-time only: restart a failed run. "" / "off" | "window" | "always". Each restart is a full snapshot. */
+  auto_restart?: string
+  /** HH:MM-HH:MM in the server's ORCH_TIME_ZONE_OFFSET time (default 00:00-05:00). */
+  restart_window?: string
 }
 
 export type RedisShakeProfile = {
@@ -63,6 +67,9 @@ export const defaultRedisShakeOptions = (): RedisShakeSyncOptions => ({
   sync_rdb: true,
   sync_aof: true,
   rdb_restore_command_behavior: "panic",
+  // New real-time profiles recover by themselves, only in the low-traffic night window.
+  auto_restart: "window",
+  restart_window: "00:00-05:00",
 })
 
 export const useRedisShake = () => {

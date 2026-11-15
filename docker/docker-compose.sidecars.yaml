@@ -69,6 +69,32 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # SSH tunnel gateway (ADR 0020): "Connection method = SSH tunnel" for sites that expose only
+  # SSH (optionally behind Cloudflare Access). Stable forwards 22000-22999 on server_zone only.
+  cdc-sshtunnel:
+    image: ${CDC_SSHTUNNEL_IMAGE:-cdc-sshtunnel:local}
+    build:
+      context: ./sshtunnel
+      dockerfile: Dockerfile
+    container_name: cdc-sshtunnel
+    environment:
+      SSHTUNNEL_API_TOKEN: ${ORCH_SSHTUNNEL_TOKEN:-}
+      SSHT_FORWARD_HOST: cdc-sshtunnel
+      SSHT_FORWARD_PORT_MIN: ${SSHT_FORWARD_PORT_MIN:-22000}
+      SSHT_FORWARD_PORT_MAX: ${SSHT_FORWARD_PORT_MAX:-22999}
+    networks: [server_zone]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8092/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
   cdc-redisshake:
     image: ${CDC_REDIS_SHAKE_IMAGE:-cdc-redisshake:local}
     build:

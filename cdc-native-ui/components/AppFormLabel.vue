@@ -6,8 +6,8 @@ defineProps<{
 </script>
 
 <template>
-  <div class="mb-2 flex items-center gap-1.5">
-    <span class="auth-label mb-0">{{ label }}</span>
+  <div class="auth-label">
+    <span>{{ label }}</span>
     <AppInfoHint v-if="hint || $slots.default" :text="hint">
       <slot />
     </AppInfoHint>

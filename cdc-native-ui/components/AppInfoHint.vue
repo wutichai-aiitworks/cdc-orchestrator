@@ -96,7 +96,7 @@ useEventListener(document, "keydown", (event: KeyboardEvent) => {
   >
     <button
       type="button"
-      class="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground opacity-60 transition hover:opacity-100 hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+      class="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground opacity-60 transition hover:opacity-100 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       :aria-label="accessibleLabel"
       :aria-expanded="open"
       @click.stop="toggle"

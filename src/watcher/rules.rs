@@ -15,6 +15,8 @@ pub const CONDITIONS: &[&str] = &[
     "dlq_growth",
     "pipeline_failed",
     "latency_above",
+    // Real-time Redis sync (RedisShake) stopped / recovered / auto-restarted (redis_supervisor).
+    "redis_sync_down",
 ];
 
 pub fn normalize_condition(c: &str) -> &str {
