@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hyper CDC Orchestrator — Real-time Change Data Capture | AI IT Works</title>
+<meta name="description" content="Hyper CDC Orchestrator streams every insert, update and delete from PostgreSQL, MySQL, SQL Server and Oracle to replicas, event streams and lakehouses — self-hosted, secured inside your network, and operable from your AI assistant." />
+<meta property="og:title" content="Hyper CDC Orchestrator — Change Data Capture Control Plane" />
+<meta property="og:description" content="Real-time database replication that stays inside your network. Guided setup, verified data, self-healing operations, AI-assistant ready." />
+<meta property="og:image" content="assets/og-image.png" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary_large_image" />
+<link rel="icon" type="image/png" href="assets/logo-mark.png" />
+<link rel="apple-touch-icon" href="assets/logo-mark.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --navy: #0e1d3a;
+    --navy-2: #13284f;
+    --ink: #0f172a;
+    --text: #334155;
+    --muted: #64748b;
+    --line: #e2e8f0;
+    --bg: #ffffff;
+    --bg-soft: #f6f8fb;
+    --orange: #ef8a2b;
+    --orange-2: #f5a352;
+    --teal: #149a92;
+    --teal-2: #2dd4bf;
+    --radius: 16px;
+    --shadow: 0 10px 30px -12px rgba(15, 23, 42, .18);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: var(--bg); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+  img { max-width: 100%; display: block; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+  h1, h2, h3 { color: var(--ink); line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
+  h2 { font-size: clamp(28px, 3.4vw, 40px); font-weight: 800; }
+  h3 { font-size: 18px; font-weight: 700; }
+  p { margin: 0; }
+  .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--orange); }
+  .lead { font-size: 18px; color: var(--muted); max-width: 720px; }
+  section { padding: 96px 0; }
+  .section-head { display: grid; gap: 14px; margin-bottom: 48px; }
+  .center { text-align: center; justify-items: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 22px; border-radius: 12px; font-weight: 700; font-size: 15px; text-decoration: none; transition: transform .15s, box-shadow .15s, background .15s; }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-primary { background: var(--orange); color: #fff; box-shadow: 0 8px 24px -8px rgba(239, 138, 43, .7); }
+  .btn-primary:hover { background: #e47c1c; }
+  .btn-ghost { border: 1px solid rgba(255,255,255,.28); color: #fff; }
+  .btn-ghost:hover { background: rgba(255,255,255,.08); }
+  .btn-outline { border: 1px solid var(--line); color: var(--ink); background: #fff; }
+
+  /* nav */
+  .nav { position: sticky; top: 0; z-index: 20; background: rgba(255,255,255,.92); backdrop-filter: saturate(180%) blur(10px); border-bottom: 1px solid var(--line); }
+  .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 68px; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { height: 38px; width: 38px; }
+  .brand b { color: var(--ink); font-size: 17px; letter-spacing: -.01em; }
+  .brand b span { color: var(--orange); }
+  .nav-links { display: flex; gap: 26px; font-size: 14px; font-weight: 600; color: var(--text); }
+  .nav-links a { text-decoration: none; }
+  .nav-links a:hover { color: var(--orange); }
+  @media (max-width: 920px) { .nav-links { display: none; } }
+
+  /* hero */
+  .hero { position: relative; overflow: hidden; background: radial-gradient(1200px 600px at 85% -10%, rgba(20,154,146,.35), transparent 60%), radial-gradient(900px 500px at -10% 110%, rgba(239,138,43,.25), transparent 60%), linear-gradient(160deg, var(--navy) 0%, var(--navy-2) 100%); color: #cbd5e1; padding: 88px 0 72px; }
+  .hero::after { content: ""; position: absolute; inset: 0; background-image: linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px); background-size: 44px 44px; mask-image: linear-gradient(to bottom, #000 30%, transparent); pointer-events: none; }
+  .hero .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 1.05fr 1fr; gap: 48px; align-items: center; }
+  @media (max-width: 980px) { .hero .wrap { grid-template-columns: 1fr; } }
+  .hero .wrap.stats-wrap { display: block; }
+  .hero h1 { color: #fff; font-size: clamp(36px, 5vw, 58px); font-weight: 800; }
+  .hero h1 em { font-style: normal; background: linear-gradient(90deg, var(--orange-2), var(--teal-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lead { color: #b6c2d6; margin-top: 20px; }
+  .hero .eyebrow { color: var(--teal-2); }
+  .hero-ctas { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14); font-size: 13px; color: #dbe4f0; margin-bottom: 22px; }
+  .pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--teal-2); box-shadow: 0 0 0 4px rgba(45,212,191,.2); }
+  .hero-visual { background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12); border-radius: 22px; padding: 18px; box-shadow: 0 30px 80px -30px rgba(0,0,0,.6); }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin-top: 56px; background: rgba(255,255,255,.1); border-radius: 16px; overflow: hidden; position: relative; z-index: 1; }
+  .stats div { background: rgba(14,29,58,.75); padding: 22px 20px; }
+  .stats b { display: block; color: #fff; font-size: 28px; font-weight: 800; letter-spacing: -.02em; }
+  .stats span { font-size: 13px; color: #9fb0c8; }
+  @media (max-width: 760px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+
+  /* flow animation */
+  .flow { stroke-dasharray: 6 8; animation: dash 1.6s linear infinite; }
+  .flow-slow { stroke-dasharray: 4 10; animation: dash 2.6s linear infinite; }
+  @keyframes dash { to { stroke-dashoffset: -28; } }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  @media (prefers-reduced-motion: reduce) { .flow, .flow-slow, .pulse { animation: none; } }
+
+  /* engines */
+  .engines { padding: 34px 0; border-bottom: 1px solid var(--line); background: #fff; }
+  .engines .wrap { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px 12px; }
+  .engines small { width: 100%; text-align: center; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  .chip { padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg-soft); font-size: 14px; font-weight: 600; color: var(--ink); }
+  .chip.src { border-color: rgba(239,138,43,.35); }
+  .chip.dst { border-color: rgba(20,154,146,.35); }
+
+  /* platform overview (cover image) */
+  .overview { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 56px; align-items: center; }
+  @media (max-width: 900px) { .overview { grid-template-columns: 1fr; gap: 32px; } }
+  .overview-figure { margin: 0; border-radius: 24px; overflow: hidden; border: 1px solid var(--line); background: #fff; box-shadow: 0 30px 70px -30px rgba(14,29,58,.35); }
+  .overview-figure img { width: 100%; height: auto; }
+  .pillars { display: grid; gap: 14px; margin-top: 28px; }
+  .pillar { display: grid; grid-template-columns: 40px 1fr; gap: 14px; align-items: start; }
+  .pillar b { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 11px; color: #fff; font-weight: 800; }
+  .pillar:nth-child(1) b { background: var(--orange); }
+  .pillar:nth-child(2) b { background: var(--navy); }
+  .pillar:nth-child(3) b { background: var(--teal); }
+  .pillar h3 { font-size: 16.5px; }
+  .pillar p { font-size: 14.5px; margin-top: 2px; }
+
+  /* cards */
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+  @media (max-width: 960px) { .grid-3 { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 640px) { .grid-3, .grid-2 { grid-template-columns: 1fr; } }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: var(--radius); padding: 26px; box-shadow: 0 1px 0 rgba(15,23,42,.02); transition: box-shadow .2s, transform .2s, border-color .2s; }
+  .card:hover { box-shadow: var(--shadow); transform: translateY(-2px); border-color: #d6dde8; }
+  .card p { margin-top: 8px; font-size: 15px; }
+  .icon { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px; }
+  .icon svg { width: 22px; height: 22px; }
+  .i-o { background: rgba(239,138,43,.12); color: var(--orange); }
+  .i-t { background: rgba(20,154,146,.12); color: var(--teal); }
+  .i-n { background: rgba(14,29,58,.08); color: var(--navy); }
+  .soft { background: var(--bg-soft); }
+
+  /* topology */
+  .topo { background: #fff; border: 1px solid var(--line); border-radius: 22px; padding: 22px; box-shadow: var(--shadow); overflow-x: auto; }
+  .topo svg { min-width: 980px; width: 100%; height: auto; }
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; margin-top: 18px; font-size: 13px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .legend i { width: 26px; height: 0; border-top: 3px dashed; }
+
+  /* steps */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; counter-reset: s; }
+  @media (max-width: 960px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
+  .step { position: relative; padding: 24px; border-radius: var(--radius); background: #fff; border: 1px solid var(--line); }
+  .step::before { counter-increment: s; content: counter(s); display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: var(--navy); color: #fff; font-weight: 800; margin-bottom: 14px; }
+  .step p { font-size: 14.5px; margin-top: 6px; }
+
+  /* differentiators */
+  .diff { background: linear-gradient(160deg, var(--navy) 0%, var(--navy-2) 100%); color: #b6c2d6; position: relative; overflow: hidden; }
+  .diff::before { content: ""; position: absolute; width: 700px; height: 700px; right: -200px; top: -250px; background: radial-gradient(closest-side, rgba(20,154,146,.28), transparent); }
+  .diff h2, .diff h3 { color: #fff; }
+  .diff .lead { color: #9fb0c8; }
+  .diff-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; position: relative; }
+  @media (max-width: 760px) { .diff-list { grid-template-columns: 1fr; } }
+  .diff-item { display: grid; grid-template-columns: 48px 1fr; gap: 16px; padding: 22px; border-radius: var(--radius); background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1); }
+  .diff-item .num { width: 48px; height: 48px; border-radius: 12px; display: grid; place-items: center; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--orange), #d96f14); }
+  .diff-item:nth-child(even) .num { background: linear-gradient(135deg, var(--teal), #0d7a74); }
+  .diff-item p { font-size: 15px; margin-top: 6px; color: #b6c2d6; }
+
+  /* compare */
+  table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 15px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  th, td { padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  thead th { background: var(--bg-soft); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  thead th.us { color: var(--orange); }
+  td.us { background: rgba(239,138,43,.05); color: var(--ink); font-weight: 600; }
+  .yes { color: var(--teal); font-weight: 800; margin-right: 6px; }
+  .no { color: #94a3b8; }
+  .table-wrap { overflow-x: auto; }
+
+  /* screenshots */
+  .shots { display: grid; grid-template-columns: 1.2fr 1fr; gap: 22px; align-items: start; }
+  .shot img.pad { padding: 18px 22px; background: #fff; }
+  @media (max-width: 900px) { .shots { grid-template-columns: 1fr; } }
+  .shot { border-radius: 18px; overflow: hidden; border: 1px solid var(--line); background: #fff; box-shadow: var(--shadow); }
+  .shot .bar { display: flex; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--bg-soft); }
+  .shot .bar i { width: 10px; height: 10px; border-radius: 50%; background: #d7dde7; }
+  .shot figcaption { padding: 14px 18px; font-size: 14px; color: var(--muted); border-top: 1px solid var(--line); }
+  .shot figcaption b { color: var(--ink); }
+  figure { margin: 0; }
+  .stack { display: grid; gap: 22px; }
+  /* product tour */
+  .tour { margin-bottom: 40px; }
+  .tour-tabs { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-bottom: 18px; }
+  .tour-tabs button { font: inherit; font-size: 14px; font-weight: 600; color: var(--muted); background: var(--bg-soft); border: 1px solid var(--line); border-radius: 999px; padding: 8px 16px; cursor: pointer; transition: all .15s; }
+  .tour-tabs button:hover { color: var(--ink); border-color: #cbd5e1; }
+  .tour-tabs button[aria-selected="true"] { color: #fff; background: var(--orange); border-color: var(--orange); }
+  .tour-tabs button .n { opacity: .7; margin-right: 6px; }
+  .tour .shot img { display: block; width: 100%; height: auto; }
+  .tour .shot img.tour-panel[hidden] { display: none; }
+  .tour-nav { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .tour-nav button { font: inherit; font-size: 14px; font-weight: 600; color: var(--ink); background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; cursor: pointer; white-space: nowrap; }
+  .tour-nav button:hover { border-color: var(--orange); color: var(--orange); }
+  @media (max-width: 640px) { .tour-tabs button { font-size: 13px; padding: 6px 12px; } .tour-tabs button .n { display: none; } .tour-nav { flex-wrap: wrap; } .tour-cap { order: -1; flex-basis: 100%; } }
+
+  /* security + use cases */
+  .checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 28px; margin: 0; padding: 0; list-style: none; }
+  @media (max-width: 640px) { .checks { grid-template-columns: 1fr; } }
+  .checks li { display: grid; grid-template-columns: 22px 1fr; gap: 10px; font-size: 15px; }
+  .checks li::before { content: ""; width: 20px; height: 20px; margin-top: 2px; border-radius: 6px; background: rgba(20,154,146,.14) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23149a92' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12l5 5L20 7'/%3E%3C/svg%3E") center/13px no-repeat; }
+  .checks b { color: var(--ink); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+  .chat { background: var(--navy); border-radius: 20px; padding: 22px; color: #dbe4f0; font-size: 14.5px; box-shadow: var(--shadow); }
+  .msg { padding: 12px 14px; border-radius: 14px; margin-bottom: 12px; max-width: 92%; }
+  .msg.user { background: var(--orange); color: #fff; margin-left: auto; border-bottom-right-radius: 4px; }
+  .msg.bot { background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); border-bottom-left-radius: 4px; }
+  .msg code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12.5px; color: var(--teal-2); }
+  .msg .ok { color: #5eead4; } .msg .warn { color: #fdba74; }
+
+  /* cta */
+  .cta { background: radial-gradient(800px 400px at 50% 0%, rgba(239,138,43,.25), transparent 70%), linear-gradient(160deg, var(--navy) 0%, var(--navy-2) 100%); color: #b6c2d6; text-align: center; border-radius: 28px; padding: 64px 28px; }
+  .cta h2 { color: #fff; }
+  .cta .lead { margin: 14px auto 0; color: #b6c2d6; }
+  .cta .hero-ctas { justify-content: center; }
+  footer { padding: 40px 0; font-size: 14px; color: var(--muted); border-top: 1px solid var(--line); }
+  footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<!-- ───────────────────────── Nav ───────────────────────── -->
+<nav class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="assets/logo-mark.png" alt="Hyper CDC Orchestrator logo" width="38" height="38" /><b><span>Hyper</span> CDC Orchestrator</b></a>
+    <div class="nav-links">
+      <a href="#platform">Platform</a>
+      <a href="#benefits">Benefits</a>
+      <a href="#topology">Topology</a>
+      <a href="#why">Why Hyper CDC</a>
+      <a href="#ai">AI operations</a>
+      <a href="#security">Security</a>
+    </div>
+    <a class="btn btn-primary" href="#contact">Request a demo</a>
+  </div>
+</nav>
+
+<!-- ───────────────────────── Hero ───────────────────────── -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <div>
+      <span class="pill"><i></i>Change Data Capture Control Plane</span>
+      <h1>Every database change, <em>in real time</em>, without risking production.</h1>
+      <p class="lead">Hyper CDC Orchestrator captures inserts, updates and deletes from PostgreSQL, MySQL, SQL Server and Oracle, and delivers them to replicas, event streams and lakehouses. Set it up in a guided UI, keep it inside your network, and operate it from your AI assistant.</p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="#contact">Request a demo
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 5l7 7-7 7"/></svg></a>
+        <a class="btn btn-ghost" href="#topology">See how it works</a>
+      </div>
+    </div>
+
+    <!-- hero visual -->
+    <div class="hero-visual" aria-hidden="true">
+      <svg viewBox="0 0 560 360" width="100%" role="img">
+        <defs>
+          <linearGradient id="hcard" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#1b335f"/><stop offset="1" stop-color="#152a50"/></linearGradient>
+          <linearGradient id="hcore" x1="0" x2="1"><stop offset="0" stop-color="#ef8a2b"/><stop offset="1" stop-color="#149a92"/></linearGradient>
+        </defs>
+        <!-- sources -->
+        <g font-family="Inter" font-size="12" font-weight="600" fill="#dbe4f0">
+          <g><rect x="12" y="34" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="36" cy="61" r="9" fill="#ef8a2b"/><text x="52" y="58">PostgreSQL</text><text x="52" y="74" font-size="10.5" fill="#8fa3c2" font-weight="500">WAL · logical</text></g>
+          <g><rect x="12" y="104" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="36" cy="131" r="9" fill="#ef8a2b"/><text x="52" y="128">MySQL</text><text x="52" y="144" font-size="10.5" fill="#8fa3c2" font-weight="500">binlog · ROW</text></g>
+          <g><rect x="12" y="174" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="36" cy="201" r="9" fill="#ef8a2b"/><text x="52" y="198">SQL Server</text><text x="52" y="214" font-size="10.5" fill="#8fa3c2" font-weight="500">CDC tables</text></g>
+          <g><rect x="12" y="244" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="36" cy="271" r="9" fill="#ef8a2b"/><text x="52" y="268">Oracle</text><text x="52" y="284" font-size="10.5" fill="#8fa3c2" font-weight="500">LogMiner · polling</text></g>
+        </g>
+        <!-- flows in -->
+        <g fill="none" stroke="#f5a352" stroke-width="2.2">
+          <path class="flow" d="M144 61 C 190 61, 190 150, 222 166"/>
+          <path class="flow" d="M144 131 C 180 131, 190 160, 222 172"/>
+          <path class="flow" d="M144 201 C 180 201, 190 185, 222 180"/>
+          <path class="flow" d="M144 271 C 190 271, 190 196, 222 188"/>
+        </g>
+        <!-- core -->
+        <g>
+          <rect x="222" y="110" width="132" height="136" rx="20" fill="#0b1830" stroke="url(#hcore)" stroke-width="2"/>
+          <circle class="pulse" cx="288" cy="160" r="30" fill="url(#hcore)" opacity=".9"/>
+          <text x="288" y="166" text-anchor="middle" font-family="Inter" font-weight="800" font-size="18" fill="#fff">H</text>
+          <text x="288" y="212" text-anchor="middle" font-family="Inter" font-weight="700" font-size="12" fill="#fff">Hyper CDC</text>
+          <text x="288" y="228" text-anchor="middle" font-family="Inter" font-size="10.5" fill="#8fa3c2">capture · stream · deliver</text>
+        </g>
+        <!-- flows out -->
+        <g fill="none" stroke="#2dd4bf" stroke-width="2.2">
+          <path class="flow" d="M354 166 C 386 160, 386 72, 416 72"/>
+          <path class="flow" d="M354 174 C 390 170, 390 142, 416 142"/>
+          <path class="flow" d="M354 182 C 390 186, 390 212, 416 212"/>
+          <path class="flow" d="M354 190 C 386 196, 386 282, 416 282"/>
+        </g>
+        <!-- targets -->
+        <g font-family="Inter" font-size="12" font-weight="600" fill="#dbe4f0">
+          <g><rect x="416" y="45" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="440" cy="72" r="9" fill="#149a92"/><text x="456" y="69">Replica</text><text x="456" y="85" font-size="10.5" fill="#8fa3c2" font-weight="500">PostgreSQL</text></g>
+          <g><rect x="416" y="115" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="440" cy="142" r="9" fill="#149a92"/><text x="456" y="139">Event streams</text><text x="456" y="155" font-size="10.5" fill="#8fa3c2" font-weight="500">Kafka · Redpanda</text></g>
+          <g><rect x="416" y="185" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="440" cy="212" r="9" fill="#149a92"/><text x="456" y="209">Lakehouse</text><text x="456" y="225" font-size="10.5" fill="#8fa3c2" font-weight="500">Apache Iceberg</text></g>
+          <g><rect x="416" y="255" width="132" height="54" rx="12" fill="url(#hcard)" stroke="#2b4675"/><circle cx="440" cy="282" r="9" fill="#149a92"/><text x="456" y="279">AI search</text><text x="456" y="295" font-size="10.5" fill="#8fa3c2" font-weight="500">pgvector</text></g>
+        </g>
+        <text x="78" y="22" text-anchor="middle" font-family="Inter" font-size="11" font-weight="700" fill="#f5a352" letter-spacing="1.5">SOURCES</text>
+        <text x="482" y="22" text-anchor="middle" font-family="Inter" font-size="11" font-weight="700" fill="#2dd4bf" letter-spacing="1.5">DESTINATIONS</text>
+        <text x="288" y="336" text-anchor="middle" font-family="Inter" font-size="11" fill="#8fa3c2">Inserts · updates · deletes, in commit order, resumed from the exact log position</text>
+      </svg>
+    </div>
+  </div>
+
+  <div class="wrap stats-wrap">
+    <div class="stats">
+      <div><b>5</b><span>Source engines for continuous capture (PostgreSQL, MySQL, MariaDB, SQL Server, Oracle), log-based or polling</span></div>
+      <div><b>0</b><span>Database ports to open: reach sites over SSH, Cloudflare Zero Trust or WireGuard</span></div>
+      <div><b>80</b><span>AI-assistant tools (MCP) for Claude, ChatGPT and Cursor</span></div>
+      <div><b>6</b><span>Alert channels: Webhook, Email, LINE, Slack, Discord, Teams</span></div>
+    </div>
+  </div>
+</header>
+
+<!-- ───────────────────────── Engines ───────────────────────── -->
+<div class="engines">
+  <div class="wrap">
+    <small>Works with</small>
+    <span class="chip src">PostgreSQL</span><span class="chip src">MySQL</span><span class="chip src">MariaDB</span><span class="chip src">SQL Server</span><span class="chip src">Oracle</span><span class="chip src">MongoDB</span><span class="chip src">Redis</span><span class="chip src">SQLite · CSV</span>
+    <span class="chip dst">Kafka · Redpanda</span><span class="chip dst">Apache Iceberg</span><span class="chip dst">pgvector</span><span class="chip dst">Amazon RDS · Aurora</span><span class="chip dst">Google Cloud SQL</span><span class="chip dst">Azure</span>
+  </div>
+</div>
+
+<!-- ───────────────────────── Platform at a glance (cover) ───────────────────────── -->
+<section id="platform" style="padding-bottom:40px">
+  <div class="wrap overview">
+    <div>
+      <span class="eyebrow">Platform at a glance</span>
+      <h2 style="margin-top:12px">One control plane for every change in your data</h2>
+      <p class="lead" style="margin-top:16px">Hyper CDC Orchestrator sits between your databases and the systems that need their data. It configures the capture, runs it on a managed runtime, and watches it until you stop it.</p>
+      <div class="pillars">
+        <div class="pillar"><b>1</b><div><h3>Configure</h3><p>Sources, targets and secrets in a guided wizard, checked against the live database before anything starts.</p></div></div>
+        <div class="pillar"><b>2</b><div><h3>Orchestrate</h3><p>Connectors are created, started, paused, resumed and removed for you; their state is reconciled continuously.</p></div></div>
+        <div class="pillar"><b>3</b><div><h3>Observe</h3><p>Health, lag, latency and an audit timeline, with alerts and automatic recovery when something drifts.</p></div></div>
+      </div>
+    </div>
+    <figure class="overview-figure">
+      <img src="assets/platform-overview.png" width="1024" height="1024" alt="Hyper CDC Orchestrator: unified Change Data Capture control plane. CDC sources, the orchestrator with profile and secret management, connector lifecycle, reconciliation and audit, the managed runtime (Kafka Connect, Debezium, Kafka topics, schema registry, Redis) and CDC destinations and consumers." />
+    </figure>
+  </div>
+</section>
+
+<!-- ───────────────────────── Benefits ───────────────────────── -->
+<section id="benefits">
+  <div class="wrap">
+    <div class="section-head center">
+      <span class="eyebrow">Benefits</span>
+      <h2>Real-time data your teams can trust</h2>
+      <p class="lead">Replace nightly exports and fragile scripts with a governed, always-on data flow that a DBA is comfortable putting on a production database.</p>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <div class="icon i-o"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+        <h3>Real time, light on the source</h3>
+        <p>Streaming reads the transaction log the database already writes. No queries on your tables, no triggers required. The heavy first copy is planned for your night window.</p>
+      </div>
+      <div class="card">
+        <div class="icon i-t"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 14h8"/></svg></div>
+        <h3>Pipelines in minutes, not projects</h3>
+        <p>A guided wizard goes from database to database, with no connector JSON to write. Schema mapping, target table DDL and Oracle-to-PostgreSQL types are generated for you.</p>
+      </div>
+      <div class="card">
+        <div class="icon i-n"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg></div>
+        <h3>Large databases, no data gap</h3>
+        <p>Take the replication slot first, load with a parallel dump and restore, then stream from the exact log position. Built for databases too big for a simple snapshot, without losing a single change.</p>
+      </div>
+      <div class="card">
+        <div class="icon i-t"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
+        <h3>Proof, not hope</h3>
+        <p>A live readiness check names exactly what the source needs, with fixes for self-managed, RDS, Aurora, Cloud SQL and Azure. Verify Record compares source and target row by row.</p>
+      </div>
+      <div class="card">
+        <div class="icon i-o"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></div>
+        <h3>Self-healing operations</h3>
+        <p>Failed connector tasks restart automatically when the network is back, and real-time Redis syncs recover inside your night window. Every action is alerted and audited.</p>
+      </div>
+      <div class="card">
+        <div class="icon i-n"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></div>
+        <h3>Your data never leaves</h3>
+        <p>Self-hosted on your servers or cloud account. Secrets are encrypted at rest and never shown back. SSO, a full audit trail and per-client AI access keys come built in.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Topology ───────────────────────── -->
+<section id="topology" class="soft">
+  <div class="wrap">
+    <div class="section-head center">
+      <span class="eyebrow">User topology</span>
+      <h2>How Hyper CDC fits into your landscape</h2>
+      <p class="lead">Sources stay where they are: on-premises, in a branch office, or in the cloud. Hyper CDC reaches them over the connection you allow, streams every change through a durable event backbone, and delivers it where your teams need it.</p>
+    </div>
+
+    <div class="topo">
+      <svg viewBox="0 0 1200 700" role="img" aria-labelledby="topoTitle">
+        <title id="topoTitle">Hyper CDC Orchestrator user topology</title>
+        <defs>
+          <marker id="aO" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ef8a2b"/></marker>
+          <marker id="aT" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#149a92"/></marker>
+          <marker id="aN" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker>
+          <linearGradient id="plat" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#13284f"/><stop offset="1" stop-color="#0e1d3a"/></linearGradient>
+          <filter id="sh" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0f172a" flood-opacity=".12"/></filter>
+        </defs>
+        <style>
+          .t { font-family: Inter, sans-serif; }
+          .h { font-weight: 800; font-size: 13px; letter-spacing: .12em; }
+          .n { font-weight: 700; font-size: 14px; fill: #0f172a; }
+          .s { font-size: 11.5px; fill: #64748b; }
+          .w { fill: #fff; }
+          .ws { fill: #9fb0c8; font-size: 11.5px; }
+        </style>
+
+        <!-- ── Operators (top) ── -->
+        <g class="t">
+          <rect x="300" y="18" width="600" height="92" rx="16" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/>
+          <text x="320" y="44" class="h" fill="#0e1d3a">OPERATE</text>
+          <g transform="translate(320,58)">
+            <rect width="176" height="40" rx="10" fill="#f6f8fb" stroke="#e2e8f0"/><text x="14" y="18" class="n" font-size="13">Web console</text><text x="14" y="32" class="s">wizard · SSO · audit</text>
+          </g>
+          <g transform="translate(512,58)">
+            <rect width="176" height="40" rx="10" fill="#fff7ef" stroke="#f5c99a"/><text x="14" y="18" class="n" font-size="13">AI assistants (MCP)</text><text x="14" y="32" class="s">Claude · ChatGPT · Cursor</text>
+          </g>
+          <g transform="translate(704,58)">
+            <rect width="176" height="40" rx="10" fill="#eefaf8" stroke="#a7e3dc"/><text x="14" y="18" class="n" font-size="13">Alerts</text><text x="14" y="32" class="s">LINE · Slack · Teams · Email</text>
+          </g>
+        </g>
+        <path d="M600 110 L600 156" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#aN)" class="flow-slow"/>
+        <text x="610" y="138" class="t s">REST · MCP · notifications</text>
+
+        <!-- ── Sources (left) ── -->
+        <g class="t">
+          <text x="30" y="186" class="h" fill="#ef8a2b">SOURCES</text>
+          <g transform="translate(30,200)"><rect width="220" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#ef8a2b"/><text x="48" y="32" class="n">Head-office ERP</text><text x="48" y="50" class="s">PostgreSQL · Oracle</text></g>
+          <g transform="translate(30,292)"><rect width="220" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#ef8a2b"/><text x="48" y="32" class="n">Branch / partner site</text><text x="48" y="50" class="s">No open DB port, SSH only</text></g>
+          <g transform="translate(30,384)"><rect width="220" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#ef8a2b"/><text x="48" y="32" class="n">Cloud databases</text><text x="48" y="50" class="s">RDS · Cloud SQL · Azure</text></g>
+          <g transform="translate(30,476)"><rect width="220" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#ef8a2b"/><text x="48" y="32" class="n">App caches & stores</text><text x="48" y="50" class="s">Redis · MongoDB · MySQL</text></g>
+        </g>
+
+        <!-- ── Secure connectivity band ── -->
+        <g class="t">
+          <rect x="282" y="200" width="122" height="352" rx="14" fill="#fff" stroke="#cbd5e1" stroke-dasharray="5 5"/>
+          <text x="343" y="226" text-anchor="middle" class="h" fill="#0e1d3a" font-size="11.5">SECURE</text>
+          <text x="343" y="241" text-anchor="middle" class="h" fill="#0e1d3a" font-size="11.5">CONNECT</text>
+          <g transform="translate(294,262)"><rect width="98" height="56" rx="10" fill="#f6f8fb" stroke="#e2e8f0"/><text x="49" y="25" text-anchor="middle" class="n" font-size="12.5">Direct</text><text x="49" y="42" text-anchor="middle" class="s" font-size="10.5">TLS · LAN · VPN</text></g>
+          <g transform="translate(294,332)"><rect width="98" height="70" rx="10" fill="#fff7ef" stroke="#f5c99a"/><text x="49" y="24" text-anchor="middle" class="n" font-size="12.5">SSH tunnel</text><text x="49" y="41" text-anchor="middle" class="s" font-size="10.5">Cloudflare</text><text x="49" y="55" text-anchor="middle" class="s" font-size="10.5">Zero Trust</text></g>
+          <g transform="translate(294,416)"><rect width="98" height="56" rx="10" fill="#eefaf8" stroke="#a7e3dc"/><text x="49" y="25" text-anchor="middle" class="n" font-size="12.5">WireGuard</text><text x="49" y="42" text-anchor="middle" class="s" font-size="10.5">site tunnel</text></g>
+          <text x="343" y="500" text-anchor="middle" class="s" font-size="10.5">pinned host keys</text>
+          <text x="343" y="515" text-anchor="middle" class="s" font-size="10.5">encrypted secrets</text>
+          <text x="343" y="530" text-anchor="middle" class="s" font-size="10.5">no inbound ports</text>
+        </g>
+        <!-- source → connect -->
+        <g fill="none" stroke="#ef8a2b" stroke-width="2.2">
+          <path class="flow" d="M250 238 L282 290"/>
+          <path class="flow" d="M250 330 L282 366"/>
+          <path class="flow" d="M250 422 L282 400"/>
+          <path class="flow" d="M250 514 L282 446"/>
+        </g>
+        <path class="flow" d="M404 376 L452 376" stroke="#ef8a2b" stroke-width="3" fill="none" marker-end="url(#aO)"/>
+
+        <!-- ── Platform (center) ── -->
+        <g class="t">
+          <rect x="456" y="160" width="408" height="420" rx="22" fill="url(#plat)" filter="url(#sh)"/>
+          <text x="480" y="192" class="h w" font-size="13">HYPER CDC PLATFORM</text>
+          <text x="480" y="210" class="ws">self-hosted · Docker · amd64 / arm64</text>
+
+          <g transform="translate(480,226)"><rect width="360" height="64" rx="12" fill="rgba(255,255,255,.06)" stroke="rgba(255,255,255,.14)"/>
+            <rect x="12" y="14" width="36" height="36" rx="9" fill="#ef8a2b"/><text x="30" y="38" text-anchor="middle" class="w" font-weight="800" font-size="15">H</text>
+            <text x="60" y="28" class="w" font-weight="700" font-size="14">Orchestrator control plane</text><text x="60" y="46" class="ws">profiles · readiness · start position · watchers</text></g>
+
+          <g transform="translate(480,302)"><rect width="174" height="74" rx="12" fill="rgba(239,138,43,.14)" stroke="rgba(239,138,43,.45)"/>
+            <text x="14" y="26" class="w" font-weight="700" font-size="13.5">Capture</text><text x="14" y="44" class="ws">Kafka Connect</text><text x="14" y="60" class="ws">Debezium · JDBC</text></g>
+          <g transform="translate(666,302)"><rect width="174" height="74" rx="12" fill="rgba(20,154,146,.16)" stroke="rgba(45,212,191,.45)"/>
+            <text x="14" y="26" class="w" font-weight="700" font-size="13.5">Event backbone</text><text x="14" y="44" class="ws">Redpanda / Kafka</text><text x="14" y="60" class="ws">schema registry · DLQ</text></g>
+          <path class="flow" d="M654 339 L666 339" stroke="#f5a352" stroke-width="2.5" fill="none"/>
+
+          <g transform="translate(480,388)"><rect width="174" height="74" rx="12" fill="rgba(255,255,255,.06)" stroke="rgba(255,255,255,.14)"/>
+            <text x="14" y="26" class="w" font-weight="700" font-size="13.5">Copy &amp; Sync</text><text x="14" y="44" class="ws">pg_dump · pgcopydb</text><text x="14" y="60" class="ws">pgloader · Mongo · Redis</text></g>
+          <g transform="translate(666,388)"><rect width="174" height="74" rx="12" fill="rgba(255,255,255,.06)" stroke="rgba(255,255,255,.14)"/>
+            <text x="14" y="26" class="w" font-weight="700" font-size="13.5">Transform</text><text x="14" y="44" class="ws">mapping · field filtering</text><text x="14" y="60" class="ws">event processing</text></g>
+
+          <g transform="translate(480,474)"><rect width="360" height="84" rx="12" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.12)"/>
+            <text x="14" y="26" class="w" font-weight="700" font-size="13.5">Trust &amp; operations</text>
+            <text x="14" y="46" class="ws">Verify Record · latency alerts · auto-recover · slot guard</text>
+            <text x="14" y="64" class="ws">audit trail · SSO · encrypted secrets · MCP access keys</text></g>
+        </g>
+
+        <!-- platform → destinations -->
+        <g fill="none" stroke="#149a92" stroke-width="2.2">
+          <path class="flow" d="M864 300 C 900 300, 900 238, 936 238"/>
+          <path class="flow" d="M864 330 C 905 330, 905 330, 936 330"/>
+          <path class="flow" d="M864 380 C 905 380, 905 422, 936 422"/>
+          <path class="flow" d="M864 430 C 900 440, 900 514, 936 514"/>
+        </g>
+
+        <!-- ── Destinations (right) ── -->
+        <g class="t">
+          <text x="936" y="186" class="h" fill="#149a92">DESTINATIONS</text>
+          <g transform="translate(936,200)"><rect width="236" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#149a92"/><text x="48" y="32" class="n">Reporting replica</text><text x="48" y="50" class="s">PostgreSQL · always current</text></g>
+          <g transform="translate(936,292)"><rect width="236" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#149a92"/><text x="48" y="32" class="n">Microservices &amp; APIs</text><text x="48" y="50" class="s">event-driven consumers</text></g>
+          <g transform="translate(936,384)"><rect width="236" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#149a92"/><text x="48" y="32" class="n">Lakehouse &amp; BI</text><text x="48" y="50" class="s">Apache Iceberg · object storage</text></g>
+          <g transform="translate(936,476)"><rect width="236" height="76" rx="14" fill="#fff" stroke="#e2e8f0" filter="url(#sh)"/><circle cx="26" cy="38" r="12" fill="#149a92"/><text x="48" y="32" class="n">AI &amp; caches</text><text x="48" y="50" class="s">pgvector search · Redis replica</text></g>
+        </g>
+
+        <!-- ── Users (bottom) ── -->
+        <g class="t">
+          <rect x="30" y="612" width="1142" height="66" rx="16" fill="#fff" stroke="#e2e8f0"/>
+          <text x="54" y="640" class="h" fill="#0e1d3a" font-size="11.5">WHO USES IT</text>
+          <text x="54" y="660" class="s" font-size="12">Data &amp; platform teams</text>
+          <g class="s" font-size="12.5">
+            <text x="250" y="652"><tspan class="n" font-size="13">DBA</tspan> · readiness, slots, night-window loads</text>
+            <text x="560" y="652"><tspan class="n" font-size="13">Data engineer</tspan> · pipelines, mapping, lakehouse</text>
+            <text x="900" y="652"><tspan class="n" font-size="13">Ops / on-call</tspan> · alerts, AI checks</text>
+          </g>
+        </g>
+      </svg>
+      <div class="legend">
+        <span><i style="border-color:#ef8a2b"></i>Captured changes</span>
+        <span><i style="border-color:#149a92"></i>Delivered data</span>
+        <span><i style="border-color:#64748b"></i>Control &amp; monitoring</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── How it works ───────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="section-head center">
+      <span class="eyebrow">How it works</span>
+      <h2>From first check to live stream in four steps</h2>
+    </div>
+    <div class="steps">
+      <div class="step"><h3>Check the source</h3><p>A read-only readiness check reads WAL, binlog or CDC settings, permissions and keys, and gives the exact fix for your platform.</p></div>
+      <div class="step"><h3>Connect securely</h3><p>Direct, SSH tunnel (including Cloudflare Zero Trust) or WireGuard. Host keys are pinned and secrets encrypted.</p></div>
+      <div class="step"><h3>Load, then stream</h3><p>Snapshot small databases automatically. For large ones, take the slot first, load in parallel at night, then stream from the exact position.</p></div>
+      <div class="step"><h3>Verify &amp; operate</h3><p>Verify Record proves source and target match. Latency, alerts, auto-recovery and AI-assistant checks keep it that way.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Differentiators ───────────────────────── -->
+<section id="why" class="diff">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Why Hyper CDC</span>
+      <h2>What makes it different in the market</h2>
+      <p class="lead">Built from real production rollouts: the things other tools leave to scripts, runbooks and luck are built in.</p>
+    </div>
+    <div class="diff-list">
+      <div class="diff-item"><div class="num">01</div><div><h3>Reaches databases nobody exposes</h3><p>Connect through an SSH tunnel, even behind Cloudflare Zero Trust, or a WireGuard site tunnel. No inbound database port, with stable tunnel addresses that survive restarts.</p></div></div>
+      <div class="diff-item"><div class="num">02</div><div><h3>AI-native operations</h3><p>80 MCP tools let Claude, ChatGPT or Cursor answer "is the source healthy?" or "is the slot holding WAL?", with read-only keys for users and every action audited.</p></div></div>
+      <div class="diff-item"><div class="num">03</div><div><h3>Production-safe by design</h3><p>Read-only readiness checks, night-window restarts, and a slot guard: deleting a pipeline drops its replication slot, so WAL can never quietly fill the source disk.</p></div></div>
+      <div class="diff-item"><div class="num">04</div><div><h3>Large-database onboarding without a gap</h3><p>Slot-first initial loads with parallel dump and restore, then streaming from the exact LSN, binlog or SCN. Built for databases too big for a simple snapshot.</p></div></div>
+      <div class="diff-item"><div class="num">05</div><div><h3>Verification built in</h3><p>Record-level diff between source and target by key, plus measured end-to-end latency per pipeline. Show auditors proof instead of row-count guesses.</p></div></div>
+      <div class="diff-item"><div class="num">06</div><div><h3>Read-only sources welcome</h3><p>When you may not change the source (no LogMiner grants, no triggers), rolling-window polling and streaming initial loads still keep the target in step.</p></div></div>
+      <div class="diff-item"><div class="num">07</div><div><h3>One platform for every data move</h3><p>Continuous CDC plus Copy &amp; Sync: PostgreSQL dump and restore, pgcopydb, pgloader, MongoDB copy, real-time Redis sync, file sync and AI vector sync.</p></div></div>
+      <div class="diff-item"><div class="num">08</div><div><h3>Yours to run, nothing to lock in</h3><p>Self-hosted on open foundations (Debezium, Kafka Connect, Redpanda, Apache Iceberg). Your data, your network, your infrastructure.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Comparison ───────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="section-head center">
+      <span class="eyebrow">Comparison</span>
+      <h2>Hyper CDC vs the usual options</h2>
+      <p class="lead">A general comparison with the typical approaches teams evaluate.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Capability</th><th class="us">Hyper CDC Orchestrator</th><th>Hosted SaaS replication</th><th>DIY Debezium + Kafka</th></tr></thead>
+        <tbody>
+          <tr><td>Data stays inside your network</td><td class="us"><span class="yes">✓</span>Self-hosted</td><td><span class="no">Usually passes through the vendor</span></td><td><span class="yes">✓</span></td></tr>
+          <tr><td>Sources with no open port</td><td class="us"><span class="yes">✓</span>SSH · Cloudflare Zero Trust · WireGuard</td><td><span class="no">Usually needs inbound access or an agent</span></td><td><span class="no">Build it yourself</span></td></tr>
+          <tr><td>Guided setup, no config files</td><td class="us"><span class="yes">✓</span>Wizard + live readiness check</td><td><span class="yes">✓</span></td><td><span class="no">Connector JSON by hand</span></td></tr>
+          <tr><td>Large-DB load without a data gap</td><td class="us"><span class="yes">✓</span>Slot-first + start from LSN</td><td><span class="no">Varies</span></td><td><span class="no">Manual runbook</span></td></tr>
+          <tr><td>Record-level verification</td><td class="us"><span class="yes">✓</span>Verify Record</td><td><span class="no">Varies</span></td><td><span class="no">Scripts</span></td></tr>
+          <tr><td>Self-healing and slot guard</td><td class="us"><span class="yes">✓</span>Auto-recover · WAL-safe delete</td><td><span class="no">Varies</span></td><td><span class="no">Manual</span></td></tr>
+          <tr><td>AI-assistant operations (MCP)</td><td class="us"><span class="yes">✓</span>80 tools, scoped keys, audit</td><td><span class="no">Rare</span></td><td><span class="no">No</span></td></tr>
+          <tr><td>Cost model</td><td class="us">Your infrastructure</td><td><span class="no">Often priced by data volume</span></td><td>Your infrastructure + engineering time</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── AI operations ───────────────────────── -->
+<section id="ai" class="soft">
+  <div class="wrap split">
+    <div class="section-head" style="margin:0">
+      <span class="eyebrow">AI operations</span>
+      <h2>Ask your data platform how it is doing</h2>
+      <p class="lead">Hyper CDC speaks the Model Context Protocol (MCP), so your team can check production from Claude, ChatGPT or Cursor in plain language.</p>
+      <ul class="checks" style="margin-top:8px">
+        <li><span><b>Read-only keys</b> for everyday users</span></li>
+        <li><span><b>Write tools</b> only with a write key and a server switch</span></li>
+        <li><span><b>Every action audited</b> per client</span></li>
+        <li><span><b>Daily check prompt</b> built in</span></li>
+      </ul>
+    </div>
+    <div class="chat" aria-label="Illustrative example conversation">
+      <div style="font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:#8fa3c2;margin-bottom:12px">Illustrative example</div>
+      <div class="msg user">Check production CDC. List only warnings, with what to do. Don't change anything.</div>
+      <div class="msg bot">Ran <code>cdc_source_health</code> on 3 running pipelines, <code>cdc_ssh_tunnels</code> and <code>cdc_redis_sync_status</code>.<br/><br/>
+        <span class="ok">✓ Orders Sync</span>: running, slot active, WAL held 210 MB.<br/>
+        <span class="ok">✓ Branch tunnel</span>: connected through Cloudflare Access.<br/>
+        <span class="warn">⚠ Session cache</span>: Redis sync stopped at 02:14. Auto-restart (night window) will take a full snapshot at the next check. No action needed unless it gives up.</div>
+      <div class="msg user">What should the DBA fix before we add the finance database?</div>
+      <div class="msg bot">From <code>cdc_source_readiness</code>: 1 problem. <b>pg.identity</b>: two tables have no primary key. Fix: <code>ALTER TABLE … REPLICA IDENTITY FULL;</code></div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Screenshots ───────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="section-head center">
+      <span class="eyebrow">Product</span>
+      <h2>Built for the people who run it</h2>
+      <p>Take a tour of the console, from the health overview to a pipeline built step by step: source, transform, target, table and column mapping, then review.</p>
+    </div>
+    <div class="tour" id="tour">
+      <div class="tour-tabs" role="tablist" aria-label="Product tour"></div>
+      <figure class="shot">
+        <div class="bar"><i></i><i></i><i></i></div>
+        <div class="tour-panels"></div>
+        <figcaption class="tour-nav">
+          <button type="button" data-step="-1" aria-label="Previous screen">← Prev</button>
+          <span class="tour-cap"></span>
+          <button type="button" data-step="1" aria-label="Next screen">Next →</button>
+        </figcaption>
+      </figure>
+    </div>
+    <script>
+      (() => {
+        const S = [
+          ["Overview", "01-overview", "<b>Health at a glance.</b> Runtime services, pipelines, connectors and topics, with the issues that need attention first."],
+          ["Pipelines", "02-pipelines", "<b>Every pipeline in one list.</b> Source to target, capture mode, latency and status, searchable by name, tag or host."],
+          ["Source", "03-edit-source", "<b>1 · Source.</b> Pick the database type and connect directly or through an SSH tunnel. Saved passwords stay hidden."],
+          ["Transform", "04-edit-transform", "<b>2 · Transform.</b> Optional built-in steps: mask PII or normalize names before the data lands."],
+          ["Target", "05-edit-target", "<b>3 · Target.</b> Choose the destination: a logical database replica today, event-first and analytics-first next."],
+          ["Map tables", "06-edit-map-tables", "<b>4 · Map tables.</b> Rename tables or schemas, check them against the live target catalog, and create missing tables in one click."],
+          ["Map columns", "07-edit-map-columns", "<b>5 · Map columns.</b> Match source to target columns with types and keys side by side."],
+          ["Review", "08-edit-review", "<b>6 · Review.</b> One summary of the source, transform, destination and table mapping before you save."],
+        ]
+        const root = document.getElementById("tour")
+        const tabs = root.querySelector(".tour-tabs"), panels = root.querySelector(".tour-panels"), cap = root.querySelector(".tour-cap")
+        S.forEach(([label, file], i) => {
+          const b = document.createElement("button")
+          b.type = "button"; b.role = "tab"; b.id = `tour-tab-${i}`
+          b.setAttribute("aria-controls", `tour-panel-${i}`)
+          b.innerHTML = `<span class="n">${i + 1}</span>${label}`
+          b.onclick = () => show(i)
+          tabs.appendChild(b)
+          const img = document.createElement("img")
+          img.className = "tour-panel"; img.id = `tour-panel-${i}`; img.role = "tabpanel"
+          img.setAttribute("aria-labelledby", b.id)
+          img.src = `assets/screens/web/${file}.jpg`; img.alt = `Hyper CDC console: ${label}`
+          img.width = 1920; img.height = 1094; img.loading = i ? "lazy" : "eager"
+          panels.appendChild(img)
+        })
+        let cur = 0
+        function show(i) {
+          cur = (i + S.length) % S.length
+          tabs.querySelectorAll("button").forEach((b, j) => { b.setAttribute("aria-selected", j === cur); b.tabIndex = j === cur ? 0 : -1 })
+          panels.querySelectorAll("img").forEach((p, j) => { p.hidden = j !== cur })
+          cap.innerHTML = S[cur][2]
+        }
+        root.querySelectorAll(".tour-nav button").forEach((b) => (b.onclick = () => show(cur + Number(b.dataset.step))))
+        tabs.addEventListener("keydown", (e) => {
+          if (e.key === "ArrowRight" || e.key === "ArrowLeft") { show(cur + (e.key === "ArrowRight" ? 1 : -1)); tabs.children[cur].focus() }
+        })
+        show(0)
+      })()
+    </script>
+    <div class="shots">
+      <figure class="shot"><div class="bar"><i></i><i></i><i></i></div><img src="assets/screen-ssh-tunnel.png" alt="SSH tunnel setup with Cloudflare Access in the Hyper CDC console (dark mode)" /><figcaption><b>Secure connectivity.</b> Reach a database behind Cloudflare Zero Trust with a pinned host key, then test the full path.</figcaption></figure>
+      <div class="stack">
+        <figure class="shot"><div class="bar"><i></i><i></i><i></i></div><img src="assets/screen-mcp-tools.png" alt="MCP tools catalog in the Hyper CDC console" /><figcaption><b>AI tools catalog.</b> Every tool a chat client can call, with read and write access marked.</figcaption></figure>
+        <figure class="shot"><div class="bar"><i></i><i></i><i></i></div><img class="pad" src="assets/screen-redis.png" alt="Real-time Redis sync with auto-restart in a night window" /><figcaption><b>Self-healing sync.</b> Real-time Redis sync that recovers by itself, only in your night window.</figcaption></figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Use cases + security ───────────────────────── -->
+<section id="security" class="soft">
+  <div class="wrap">
+    <div class="grid-2">
+      <div class="card">
+        <span class="eyebrow">Use cases</span>
+        <h2 style="font-size:28px;margin:10px 0 20px">Where teams use it</h2>
+        <ul class="checks" style="grid-template-columns:1fr">
+          <li><span><b>Zero-downtime migration</b>: move on-premises or Oracle data to PostgreSQL or the cloud while the old system keeps running.</span></li>
+          <li><span><b>Real-time reporting</b>: an always-current replica for BI, so heavy reports stay off production.</span></li>
+          <li><span><b>Event-driven services</b>: publish every change to Kafka or Redpanda for microservices.</span></li>
+          <li><span><b>Lakehouse ingestion</b>: land changes in Apache Iceberg for analytics.</span></li>
+          <li><span><b>AI search</b>: keep pgvector embeddings in step with the source data.</span></li>
+          <li><span><b>Cache and branch sync</b>: real-time Redis and multi-site database copies.</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="eyebrow">Security &amp; governance</span>
+        <h2 style="font-size:28px;margin:10px 0 20px">Enterprise-ready controls</h2>
+        <ul class="checks" style="grid-template-columns:1fr">
+          <li><span><b>Self-hosted</b>: runs in your data center or cloud account; data never passes through a vendor.</span></li>
+          <li><span><b>Secrets protected</b>: encrypted at rest, never returned by the API, and reused only for the same login.</span></li>
+          <li><span><b>Identity</b>: single sign-on, plus a local break-glass admin bound to the server only.</span></li>
+          <li><span><b>Audit trail</b>: every action by people, automation and AI clients, with outcome and actor.</span></li>
+          <li><span><b>Network</b>: no inbound database ports; pinned SSH host keys; WireGuard without extra privileges.</span></li>
+          <li><span><b>Quality gate</b>: every release passes automated tests and static analysis before it ships.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── CTA ───────────────────────── -->
+<section id="contact">
+  <div class="wrap">
+    <div class="cta">
+      <span class="eyebrow" style="color:#2dd4bf">Get started</span>
+      <h2 style="margin-top:10px">See your own database streaming, live</h2>
+      <p class="lead">We run the readiness check on your source with you, plan a no-gap initial load, and show the first changes arriving, in your environment.</p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="https://aiitworks.tech/contact">Request a demo</a>
+        <a class="btn btn-ghost" href="https://aiitworks.tech">Talk to AI IT Works</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>© 2026 AI IT Works Company Limited. Hyper CDC Orchestrator.</span>
+    <span>Product and company names mentioned are trademarks of their respective owners.</span>
+  </div>
+</footer>
+</body>
+</html>
